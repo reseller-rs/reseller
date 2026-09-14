@@ -6,6 +6,7 @@ CREATE TABLE accounts (
  markup_pct TEXT, debt_micro INTEGER NOT NULL DEFAULT 0 CHECK(debt_micro>=0),
  created_at INTEGER NOT NULL, created_ip TEXT NOT NULL
 ) STRICT;
+CREATE INDEX accounts_status_created ON accounts(status,created_at DESC);
 CREATE TABLE api_keys (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), parent_key_id TEXT REFERENCES api_keys(id),
  key_hash TEXT NOT NULL UNIQUE, dash_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
@@ -16,6 +17,7 @@ CREATE TABLE api_keys (
 ) STRICT;
 CREATE INDEX keys_account ON api_keys(account_id);
 CREATE INDEX keys_ip_time ON api_keys(created_ip,created_at);
+CREATE INDEX keys_status_created ON api_keys(status,created_at DESC);
 CREATE TABLE credits (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), source TEXT NOT NULL,
  amount_micro INTEGER NOT NULL CHECK(amount_micro>0), remaining_micro INTEGER NOT NULL CHECK(remaining_micro>=0 AND remaining_micro<=amount_micro),
@@ -57,6 +59,7 @@ CREATE TABLE usage_buckets (
  PRIMARY KEY(hour,key_id,model)
 ) STRICT;
 CREATE INDEX usage_account_time ON usage_buckets(account_id,hour);
+CREATE INDEX usage_key_time ON usage_buckets(key_id,hour);
 CREATE TABLE totals (id INTEGER PRIMARY KEY CHECK(id=1), requests INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, upstream_micro INTEGER NOT NULL DEFAULT 0, billed_micro INTEGER NOT NULL DEFAULT 0) STRICT;
 INSERT INTO totals(id) VALUES (1);
 CREATE TABLE payments (
@@ -65,4 +68,6 @@ CREATE TABLE payments (
  session_id TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid')),
  created_at INTEGER NOT NULL, paid_at INTEGER
 ) STRICT;
+CREATE INDEX payments_created ON payments(created_at DESC);
+CREATE INDEX payments_account_created ON payments(account_id,created_at DESC);
 CREATE TABLE payment_events (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;

@@ -54,6 +54,13 @@ fn number(q: &Query, key: &str, default: i64, min: i64, max: i64) -> i64 {
         .unwrap_or(default)
         .clamp(min, max)
 }
+fn direction(q: &Query) -> &'static str {
+    if q.get("dir").is_some_and(|v| v.eq_ignore_ascii_case("asc")) {
+        "ASC"
+    } else {
+        "DESC"
+    }
+}
 fn text<'a>(b: &'a Value, k: &str) -> Result<&'a str> {
     b[k].as_str()
         .filter(|s| s.len() <= 4096)
@@ -108,15 +115,42 @@ fn row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
 async fn keys(app: &App, account: Option<&str>, q: &Query) -> Result<Value> {
     let search = format!("%{}%", q.get("q").map(String::as_str).unwrap_or(""));
     let status = q.get("status").map(String::as_str).unwrap_or("");
-    let rows=sqlx::query("SELECT * FROM api_keys WHERE (? IS NULL OR account_id=?) AND (?='' OR status=?) AND (name LIKE ? OR key_prefix LIKE ? OR id LIKE ?) ORDER BY created_at DESC LIMIT ? OFFSET ?")
- .bind(account).bind(account).bind(status).bind(status).bind(&search).bind(&search).bind(&search).bind(number(q,"limit",50,1,200)).bind(number(q,"offset",0,0,1_000_000)).fetch_all(&app.db).await?;
+    let total: i64=sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE (? IS NULL OR account_id=?) AND (?='' OR status=?) AND (name LIKE ? OR key_prefix LIKE ? OR id LIKE ?)")
+ .bind(account).bind(account).bind(status).bind(status).bind(&search).bind(&search).bind(&search).fetch_one(&app.db).await?;
+    let order = match q.get("sort").map(String::as_str) {
+        Some("name") => "name",
+        Some("status") => "status",
+        Some("account") => "account_id",
+        Some("last_used") => "last_used_at",
+        Some("usage") => "usage_30d_micro",
+        _ => "created_at",
+    };
+    let sql = format!(
+        "SELECT k.*,COALESCE((SELECT SUM(u.billed_micro) FROM usage_buckets u WHERE u.key_id=k.id AND u.hour>=?),0) AS usage_30d_micro FROM api_keys k WHERE (? IS NULL OR account_id=?) AND (?='' OR status=?) AND (name LIKE ? OR key_prefix LIKE ? OR id LIKE ?) ORDER BY {order} {} NULLS LAST,id DESC LIMIT ? OFFSET ?",
+        direction(q)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(now() - 30 * 86400)
+        .bind(account)
+        .bind(account)
+        .bind(status)
+        .bind(status)
+        .bind(&search)
+        .bind(&search)
+        .bind(&search)
+        .bind(number(q, "limit", 50, 1, 200))
+        .bind(number(q, "offset", 0, 0, 1_000_000))
+        .fetch_all(&app.db)
+        .await?;
     let mut items = Vec::new();
     for r in rows {
         let mut v = identity::key_json(&r);
-        v["usage_30d"] = stats::usage(app, account, Some(r.get("id")), 30).await?;
+        v["usage_30d_usd"] = json!(money::display(r.get("usage_30d_micro")));
         items.push(v);
     }
-    Ok(json!({"keys":items}))
+    Ok(
+        json!({"keys":items,"total":total,"limit":number(q,"limit",50,1,200),"offset":number(q,"offset",0,0,1_000_000)}),
+    )
 }
 async fn owned_key(app: &App, kid: &str, account: Option<&str>) -> Result<sqlx::sqlite::SqliteRow> {
     sqlx::query("SELECT * FROM api_keys WHERE id=? AND (? IS NULL OR account_id=?)")
@@ -250,16 +284,49 @@ pub async fn admin(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["accounts"], "GET") => {
             let search = format!("%{}%", q.get("q").map(String::as_str).unwrap_or(""));
             let status = q.get("status").map(String::as_str).unwrap_or("");
-            let ids=sqlx::query_scalar::<_,String>("SELECT id FROM accounts WHERE (id LIKE ? OR contact LIKE ?) AND (?='' OR status=?) ORDER BY created_at DESC LIMIT ? OFFSET ?").bind(&search).bind(&search).bind(status).bind(status).bind(number(&q,"limit",50,1,200)).bind(number(&q,"offset",0,0,1_000_000)).fetch_all(&app.db).await?;
-            let mut accounts = vec![];
-            for a in ids {
-                accounts.push(billing::account(app, &a).await?["account"].clone());
-            }
-            Ok(json!({"accounts":accounts}))
+            let total:i64=sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE (id LIKE ? OR contact LIKE ?) AND (?='' OR status=?)").bind(&search).bind(&search).bind(status).bind(status).fetch_one(&app.db).await?;
+            let order = match q.get("sort").map(String::as_str) {
+                Some("contact") => "contact",
+                Some("status") => "status",
+                Some("balance") => "balance_micro",
+                Some("keys") => "key_count",
+                _ => "created_at",
+            };
+            let sql = format!(
+                "SELECT a.*,COALESCE((SELECT SUM(c.remaining_micro) FROM credits c WHERE c.account_id=a.id AND c.remaining_micro>0 AND (c.expires_at IS NULL OR c.expires_at>?)),0) AS balance_micro,(SELECT COUNT(*) FROM api_keys k WHERE k.account_id=a.id) AS key_count,(SELECT s.plan_code FROM subscriptions s WHERE s.account_id=a.id AND s.expires_at>? ORDER BY s.expires_at DESC LIMIT 1) AS plan_code FROM accounts a WHERE (id LIKE ? OR contact LIKE ?) AND (?='' OR status=?) ORDER BY {order} {},id DESC LIMIT ? OFFSET ?",
+                direction(&q)
+            );
+            let rows = sqlx::query(&sql)
+                .bind(now())
+                .bind(now())
+                .bind(&search)
+                .bind(&search)
+                .bind(status)
+                .bind(status)
+                .bind(number(&q, "limit", 50, 1, 200))
+                .bind(number(&q, "offset", 0, 0, 1_000_000))
+                .fetch_all(&app.db)
+                .await?;
+            Ok(
+                json!({"accounts":rows.iter().map(row_json).collect::<Vec<_>>(),"total":total,"limit":number(&q,"limit",50,1,200),"offset":number(&q,"offset",0,0,1_000_000)}),
+            )
         }
         (["accounts", aid], "GET") => {
             let mut v = billing::account(app, aid).await?;
-            v["keys"] = keys(app, Some(aid), &Query::new()).await?["keys"].clone();
+            let mut key_query = Query::new();
+            for (source, target) in [
+                ("key_limit", "limit"),
+                ("key_offset", "offset"),
+                ("key_sort", "sort"),
+                ("key_dir", "dir"),
+            ] {
+                if let Some(value) = q.get(source) {
+                    key_query.insert(target.into(), value.clone());
+                }
+            }
+            let key_page = keys(app, Some(aid), &key_query).await?;
+            v["keys"] = key_page["keys"].clone();
+            v["key_total"] = key_page["total"].clone();
             v["usage"] = stats::usage(app, Some(aid), None, 30).await?;
             Ok(v)
         }
@@ -302,10 +369,33 @@ pub async fn admin(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["codes", cid], "PATCH") => patch_code(app, cid, body(req).await?).await,
         (["codes", cid], "DELETE") => delete_code(app, cid).await,
         (["payments"], "GET") => {
-            let r = sqlx::query("SELECT * FROM payments ORDER BY created_at DESC LIMIT 200")
+            let status = q.get("status").map(String::as_str).unwrap_or("");
+            let search = format!("%{}%", q.get("q").map(String::as_str).unwrap_or(""));
+            let total:i64=sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE (?='' OR status=?) AND (id LIKE ? OR account_id LIKE ? OR plan_code LIKE ?)").bind(status).bind(status).bind(&search).bind(&search).bind(&search).fetch_one(&app.db).await?;
+            let order = match q.get("sort").map(String::as_str) {
+                Some("status") => "status",
+                Some("account") => "account_id",
+                Some("plan") => "plan_code",
+                Some("amount") => "price_micro",
+                _ => "created_at",
+            };
+            let sql = format!(
+                "SELECT * FROM payments WHERE (?='' OR status=?) AND (id LIKE ? OR account_id LIKE ? OR plan_code LIKE ?) ORDER BY {order} {},id DESC LIMIT ? OFFSET ?",
+                direction(&q)
+            );
+            let r = sqlx::query(&sql)
+                .bind(status)
+                .bind(status)
+                .bind(&search)
+                .bind(&search)
+                .bind(&search)
+                .bind(number(&q, "limit", 50, 1, 200))
+                .bind(number(&q, "offset", 0, 0, 1_000_000))
                 .fetch_all(&app.db)
                 .await?;
-            Ok(json!({"payments":r.iter().map(row_json).collect::<Vec<_>>()}))
+            Ok(
+                json!({"payments":r.iter().map(row_json).collect::<Vec<_>>(),"total":total,"limit":number(&q,"limit",50,1,200),"offset":number(&q,"offset",0,0,1_000_000)}),
+            )
         }
         (["requests"], "GET") => requests(app, None, &q, false).await,
         (["requests", "groups"], "GET") => requests(app, None, &q, true).await,

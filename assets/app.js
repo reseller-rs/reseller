@@ -17,7 +17,13 @@ if (workspace && fragment.has('token')) {
 /* Helpers -------------------------------------------------------------------- */
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const usd = v => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 6 }).format(Number(v || 0));
-const date = v => v ? new Date(v * 1000).toLocaleString() : 'Never';
+const date = v => v ? new Date(v * 1000).toLocaleString(undefined, { hour12: false }) : 'Never';
+const localDateTime = v => {
+  if (!v) return '';
+  const d = new Date(Number(v) * 1000);
+  d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+  return d.toISOString().slice(0, 16);
+};
 const count = v => Number(v || 0).toLocaleString();
 const planRate = p => Number(p.price_usd) / Number(p.duration_days || 1);
 const bestCode = plans => plans.slice().sort((a, b) => planRate(a) - planRate(b))[0]?.code;
@@ -88,20 +94,32 @@ function flashCopied(button) {
   }, 1400);
 }
 
-async function api(path, method = 'GET', data) {
+async function api(path, method = 'GET', data, options = {}) {
   const headers = {};
   if (token) headers[admin ? 'x-admin-token' : 'authorization'] = admin ? token : `Bearer ${token}`;
   if (data !== undefined) headers['content-type'] = 'application/json';
-  const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data) });
+  const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data), signal: options.signal });
   const v = await r.json();
   if (!r.ok) throw new Error(v.error?.message || `Request failed (${r.status})`);
   return v;
 }
 const endpoint = name => admin ? `/admin/api/${name}` : `/v1/${name}`;
+const get = (path, signal) => api(path, 'GET', undefined, { signal });
 
-function table(columns, rows) {
+function table(columns, rows, group) {
   if (!rows.length) return emptyState('Nothing here yet', 'Activity will appear here as it happens.');
-  return `<div class="table-wrap"><table><thead><tr>${columns.map(c => `<th scope="col">${esc(c[0])}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${columns.map(c => `<td>${c[1](r)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  const row = r => `<tr>${columns.map(c => `<td>${c[1](r)}</td>`).join('')}</tr>`;
+  let body = `<tbody>${rows.map(row).join('')}</tbody>`;
+  if (group?.value) {
+    const buckets = new Map();
+    rows.forEach(r => {
+      const value = group.value(r) || 'Unassigned';
+      if (!buckets.has(value)) buckets.set(value, []);
+      buckets.get(value).push(r);
+    });
+    body = [...buckets].map(([label, items]) => `<tbody><tr class="group-row"><th colspan="${columns.length}" scope="rowgroup">${esc(label)} <span>${count(items.length)}</span></th></tr>${items.map(row).join('')}</tbody>`).join('');
+  }
+  return `<div class="table-wrap"><table><thead><tr>${columns.map(c => `<th scope="col">${esc(c[0])}</th>`).join('')}</tr></thead>${body}</table></div>`;
 }
 function metric(label, value, hint) {
   return `<div class="card metric-card"><div class="label">${esc(label)}</div><div class="metric">${esc(value)}</div>${hint ? `<div class="hint">${esc(hint)}</div>` : ''}</div>`;
@@ -116,13 +134,44 @@ function loading(text = 'Loading…') {
 function modal(title, content, setup, className) {
   const d = document.createElement('dialog');
   if (className) d.classList.add(className);
-  d.innerHTML = `<div class="row"><h2>${esc(title)}</h2><button data-close aria-label="Close dialog">✕</button></div>${content}`;
+  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button data-close aria-label="Close dialog">✕</button></div><div class="dialog-content">${content}</div>`;
   document.body.append(d);
   d.querySelector('[data-close]').onclick = () => d.close();
   d.addEventListener('close', () => d.remove());
   d.showModal();
   setup?.(d);
   return d;
+}
+
+const listStates = {
+  keys: { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 },
+  accounts: { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 },
+  payments: { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 },
+};
+const listParams = state => {
+  const params = new URLSearchParams({ limit: state.limit, offset: state.offset, sort: state.sort, dir: state.dir });
+  if (state.q) params.set('q', state.q);
+  if (state.status) params.set('status', state.status);
+  return params;
+};
+function listToolbar(id, state, { placeholder, statuses, sorts, groups }) {
+  const options = (items, selected) => items.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`).join('');
+  return `<form class="list-toolbar" data-list-form="${id}">
+    <input name="q" type="search" value="${esc(state.q)}" aria-label="Search" placeholder="${esc(placeholder)}">
+    <select name="status" aria-label="Filter by status"><option value="">All statuses</option>${options(statuses, state.status)}</select>
+    <select name="sort" aria-label="Sort by">${options(sorts, state.sort)}</select>
+    <select name="dir" aria-label="Sort direction"><option value="desc"${state.dir === 'desc' ? ' selected' : ''}>Descending</option><option value="asc"${state.dir === 'asc' ? ' selected' : ''}>Ascending</option></select>
+    <select name="group" aria-label="Group by"><option value="">No grouping</option>${options(groups, state.group)}</select>
+    <button type="submit">Apply</button><button type="button" class="ghost" data-list-clear="${id}">Clear</button>
+  </form>`;
+}
+function listPager(id, state, total, shown) {
+  const start = total ? state.offset + 1 : 0;
+  const end = state.offset + shown;
+  return `<div class="pager">
+    <span class="hint">Showing ${count(start)}–${count(end)} of ${count(total)}</span>
+    <div class="actions"><label class="inline" for="${id}-size">Rows</label><select id="${id}-size" data-list-size="${id}">${[20, 50, 100].map(n => `<option${state.limit === n ? ' selected' : ''}>${n}</option>`).join('')}</select><button type="button" class="ghost" data-list-prev="${id}"${state.offset === 0 ? ' disabled' : ''}>← Previous</button><button type="button" class="ghost" data-list-next="${id}"${end >= total ? ' disabled' : ''}>Next →</button></div>
+  </div>`;
 }
 function bindForm(form, handler) {
   form.addEventListener('submit', async e => {
@@ -159,9 +208,28 @@ function planCard(p, best, cta) {
     ${featured ? '<span class="plan-flag">Best value</span>' : ''}
     <div class="plan-name">${esc(p.name)}</div>
     <div class="plan-price">${esc(usd(p.price_usd))}<small> / ${count(p.duration_days)} days</small></div>
+    ${p.credit_usd ? `<div class="plan-credit"><span>API credit</span><strong>${esc(usd(p.credit_usd))}</strong></div>` : ''}
     <p class="plan-desc">${esc(p.description || 'Prepaid API credit.')}</p>
     <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/">Choose plan →</a>`}</div>
   </article>`;
+}
+
+function redeemForm() {
+  modal('Redeem a credit code', `
+    <form>
+      <div class="redeem-intro"><span class="redeem-icon" aria-hidden="true">◇</span><div><h3>Apply credit to your balance</h3><p>Enter the single-use code supplied by your operator. Credit is available immediately after redemption.</p></div></div>
+      <label for="redeem-code">Credit code</label>
+      <input id="redeem-code" name="code" autocomplete="off" required placeholder="RES-…">
+      <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary">Redeem credit</button></div>
+    </form>`, d => {
+    d.querySelector('[data-cancel]').onclick = () => d.close();
+    bindForm(d.querySelector('form'), async b => {
+      await api('/v1/account/redeem', 'POST', b);
+      d.close();
+      notice('Credit applied');
+      await load();
+    });
+  });
 }
 
 function secrets(v) {
@@ -224,37 +292,43 @@ function keyForm() {
 /* Account management modals -------------------------------------------------- */
 
 function manageAccount(aid) {
-  const d = modal('Manage account', `<div class="manage-body">${loading('Loading account…')}</div>`, null, 'wide');
+  const d = modal('Manage account', `<div class="manage-body">${loading('Loading account…')}</div>`, null, 'large');
   const body = d.querySelector('.manage-body');
+  let keyOffset = 0;
+  const keyLimit = 10;
+  let hasPlans;
   const refresh = async () => {
     try {
-      render(await api(endpoint(`accounts/${aid}`)));
+      const [account, planData] = await Promise.all([
+        api(endpoint(`accounts/${aid}?key_limit=${keyLimit}&key_offset=${keyOffset}`)),
+        hasPlans === undefined ? api(endpoint('plans')) : Promise.resolve(null),
+      ]);
+      if (planData) hasPlans = planData.plans.some(p => p.active);
+      render(account, hasPlans);
     } catch (e) {
       body.innerHTML = `<div class="card error">${esc(e.message)}</div>`;
     }
   };
-  const render = v => {
+  const render = (v, hasPlans) => {
     const a = v.account;
     const sub = a.subscription;
     const keys = v.keys || [];
+    const keyTotal = Number(v.key_total ?? keys.length);
     const credits = v.credits || [];
     const billed = (v.usage?.series || []).reduce((sum, s) => sum + Number(s.billed_cost_usd), 0);
     const now = Date.now() / 1000;
     body.innerHTML = `
-      <div class="account-head">
+      <div class="account-head account-identity">
         <div class="account-id">
           <span class="cred-label">Account</span>
           <code title="${esc(a.id)} — click to copy" data-copy-id="${esc(a.id)}">${esc(a.id.slice(0, 8))}…</code>
         </div>
-        <div class="actions">
-          ${pill(a.status)}
-          ${a.status === 'active' ? '<button class="danger small" data-suspend>Suspend</button>' : '<button class="small" data-activate>Reactivate</button>'}
-        </div>
+        ${pill(a.status)}
       </div>
       <div class="account-summary">
         <span><strong>${esc(usd(a.balance_usd))}</strong> balance</span>
         ${a.debt_usd !== '0' ? `<span class="warn"><strong>${esc(usd(a.debt_usd))}</strong> debt</span>` : ''}
-        <span><strong>${count(keys.length)}</strong> keys</span>
+        <span><strong>${count(keyTotal)}</strong> keys</span>
         <span><strong>${sub ? esc(sub.plan_code) : '—'}</strong> plan${sub ? ` · expires ${esc(date(sub.expires_at))}` : ''}</span>
       </div>
       <div class="account-meta">
@@ -267,16 +341,18 @@ function manageAccount(aid) {
       ${a.note ? `<p class="account-note">Note: ${esc(a.note)}</p>` : ''}
       <div class="actions account-actions">
         <button class="primary small" data-credit>Add credit</button>
-        <button class="small" data-sub>Grant plan</button>
+        ${hasPlans ? '<button class="small" data-sub>Grant plan</button>' : ''}
         <button class="small" data-key>Create key</button>
         <button class="small" data-edit>Edit account</button>
+        ${a.status === 'active' ? '<button class="danger small account-status-action" data-suspend>Suspend account</button>' : '<button class="small account-status-action" data-activate>Reactivate account</button>'}
       </div>
       <div class="account-lists">
-        <section>
-          <h3>Keys · ${count(keys.length)}</h3>
+        <section class="account-keys">
+          <h3>Keys · ${count(keyTotal)}</h3>
           ${keys.length
-            ? `<ul class="mini-list">${keys.slice(0, 5).map(k => `<li>${pill(k.status)}<strong>${esc(k.name)}</strong><code>${esc(k.key_prefix)}…</code></li>`).join('')}${keys.length > 5 ? `<li class="hint">+${count(keys.length - 5)} more</li>` : ''}</ul>`
+            ? `<ul class="mini-list">${keys.map(k => `<li>${pill(k.status)}<strong>${esc(k.name)}</strong><code>${esc(k.key_prefix)}…</code><span class="hint">${esc(date(k.last_used_at))}</span></li>`).join('')}</ul>`
             : '<p class="hint">No keys.</p>'}
+          ${keyTotal > keyLimit ? `<div class="mini-pager"><span class="hint">${count(keyOffset + 1)}–${count(Math.min(keyOffset + keys.length, keyTotal))} of ${count(keyTotal)}</span><div class="actions"><button class="ghost small" data-key-prev${keyOffset === 0 ? ' disabled' : ''}>← Previous</button><button class="ghost small" data-key-next${keyOffset + keys.length >= keyTotal ? ' disabled' : ''}>Next →</button></div></div>` : ''}
         </section>
         <section>
           <h3>Credit lots · ${count(credits.length)}</h3>
@@ -287,9 +363,11 @@ function manageAccount(aid) {
       </div>`;
     body.querySelector('[data-copy-id]').onclick = () => copyText(a.id, 'Account ID').then(ok => ok && flash(body.querySelector('[data-copy-id]')));
     body.querySelector('[data-credit]').onclick = () => creditForm(aid, refresh);
-    body.querySelector('[data-sub]').onclick = () => grantForm(aid, refresh);
+    body.querySelector('[data-sub]')?.addEventListener('click', () => grantForm(aid, refresh));
     body.querySelector('[data-key]').onclick = () => createAccountKeyForm(aid, refresh);
     body.querySelector('[data-edit]').onclick = () => editAccountForm(a, refresh);
+    body.querySelector('[data-key-prev]')?.addEventListener('click', () => { keyOffset = Math.max(0, keyOffset - keyLimit); refresh(); });
+    body.querySelector('[data-key-next]')?.addEventListener('click', () => { keyOffset += keyLimit; refresh(); });
     body.querySelector('[data-suspend]')?.addEventListener('click', async () => {
       if (!(await confirmModal('Suspend account?', 'All of its keys stop proxying and workspace sign-in is blocked until the account is reactivated.', 'Suspend', true))) return;
       try {
@@ -526,10 +604,6 @@ async function shell() {
   if (tabs.includes(requested)) tab = requested;
   else history.replaceState(null, '', `#${tab}`);
   main.innerHTML = `
-    <div class="page-head">
-      <div class="eyebrow">${admin ? 'OPERATOR CONSOLE' : 'YOUR WORKSPACE'}</div>
-      <h2>${admin ? 'Make every request count.' : 'Build more. Stay in control.'}</h2>
-    </div>
     <div class="tabs" role="tablist">
       ${tabs.map(t => `<button role="tab" data-tab="${t}" aria-selected="${t === tab}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}
     </div>
@@ -554,16 +628,21 @@ async function shell() {
 }
 
 let generation = 0;
+let loadController;
 async function load() {
   const gen = ++generation;
+  loadController?.abort();
+  const controller = new AbortController();
+  loadController = controller;
   const content = document.querySelector('#content');
   content.innerHTML = loading();
   try {
-    const html = await views[tab]();
+    const html = await views[tab](controller.signal);
     if (gen !== generation) return;
     content.innerHTML = html;
     wire(content);
   } catch (e) {
+    if (e.name === 'AbortError') return;
     if (gen === generation) {
       content.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p><div class="actions"><button data-refresh class="ghost">Try again</button></div></div>`;
       wire(content);
@@ -574,35 +653,76 @@ async function load() {
 let chartSeq = 0;
 function chart(series) {
   const days = new Map();
-  for (const r of series) days.set(r.day, (days.get(r.day) || 0) + Number(r.billed_cost_usd));
-  const entries = [...days.entries()];
+  for (const r of series) {
+    const current = days.get(r.day) || { cost: 0, requests: 0, tokens: 0 };
+    current.cost += Number(r.billed_cost_usd);
+    current.requests += Number(r.requests || 0);
+    current.tokens += Number(r.tokens || 0);
+    days.set(r.day, current);
+  }
+  const entries = [...days.entries()].sort((a, b) => Number(a[0]) - Number(b[0]));
   if (!entries.length) return emptyState('No usage yet', 'Make your first API request to see usage here.');
-  const max = Math.max(...entries.map(([, v]) => v), 0.000001);
-  const W = 600, H = 150, base = H - 10, top = 16;
+  const totalCost = entries.reduce((sum, [, v]) => sum + v.cost, 0);
+  const mode = totalCost > 0 ? 'cost' : 'requests';
+  const value = v => mode === 'cost' ? v.cost : v.requests;
+  const max = Math.max(...entries.map(([, v]) => value(v)), 1e-12);
+  const W = 600, H = 170, base = H - 18, top = 18;
+  const step = W / entries.length;
+  const barWidth = Math.max(4, Math.min(28, step * .58));
   const points = entries.map(([, v], i) => [
-    entries.length === 1 ? W / 2 : (i / (entries.length - 1)) * W,
-    base - (v / max) * (base - top)
+    step * i + step / 2,
+    base - (value(v) / max) * (base - top)
   ]);
   const line = points.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
   const area = `${points[0][0].toFixed(1)},${base} ${line} ${points[points.length - 1][0].toFixed(1)},${base}`;
   const id = `usage-${++chartSeq}`;
-  const last = entries[entries.length - 1][1];
+  const bars = entries.map(([day, v], i) => {
+    const height = value(v) > 0 ? Math.max(3, base - points[i][1]) : 1;
+    const summary = `${new Date(Number(day) * 1000).toLocaleDateString()}|${usd(v.cost)} billed|${count(v.requests)} request${v.requests === 1 ? '' : 's'}|${count(v.tokens)} tokens`;
+    return `<g class="chart-column" tabindex="0" data-chart-summary="${esc(summary)}"><rect class="chart-hit" x="${(step * i).toFixed(1)}" y="0" width="${step.toFixed(1)}" height="${base}"/><rect class="chart-bar" x="${(points[i][0] - barWidth / 2).toFixed(1)}" y="${(base - height).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${height.toFixed(1)}" rx="3"/><circle class="chart-dot" cx="${points[i][0].toFixed(1)}" cy="${points[i][1].toFixed(1)}" r="3"/><title>${esc(summary.replaceAll('|', ' · '))}</title></g>`;
+  }).join('');
   return `<div class="chart-wrap">
-    <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Daily billed usage">
+    <div class="chart-legend"><span><i></i>${mode === 'cost' ? 'Daily billed cost' : 'Daily requests (no billed cost)'}</span><strong>${mode === 'cost' ? esc(usd(totalCost)) : count(entries.reduce((sum, [, v]) => sum + v.requests, 0))}</strong></div>
+    <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${mode === 'cost' ? 'Daily billed cost' : 'Daily request count'}">
       <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0%" stop-color="#c7f590" stop-opacity=".32"/>
         <stop offset="100%" stop-color="#c7f590" stop-opacity="0"/>
       </linearGradient></defs>
       <line x1="0" y1="${base}" x2="${W}" y2="${base}"/>
       <polygon points="${area}" fill="url(#${id})"/>
+      ${bars}
       <polyline points="${line}"/>
     </svg>
-    <div class="chart-foot"><span>${entries.length} active day${entries.length === 1 ? '' : 's'}</span><span>Last billed ${esc(usd(last))}</span></div>
+    <div class="chart-tooltip" role="status" aria-live="polite" hidden></div>
+    <div class="chart-foot"><span>${esc(new Date(Number(entries[0][0]) * 1000).toLocaleDateString())}</span><span>${esc(new Date(Number(entries[entries.length - 1][0]) * 1000).toLocaleDateString())}</span></div>
   </div>`;
+}
+
+function wireCharts(root) {
+  root.querySelectorAll('.chart-wrap').forEach(wrap => {
+    const tooltip = wrap.querySelector('.chart-tooltip');
+    const show = column => {
+      const [heading, ...lines] = column.dataset.chartSummary.split('|');
+      tooltip.innerHTML = `<strong>${esc(heading)}</strong>${lines.map(line => `<span>${esc(line)}</span>`).join('')}`;
+      tooltip.hidden = false;
+      column.classList.add('active');
+    };
+    const hide = column => {
+      tooltip.hidden = true;
+      column.classList.remove('active');
+    };
+    wrap.querySelectorAll('.chart-column').forEach(column => {
+      column.addEventListener('mouseenter', () => show(column));
+      column.addEventListener('focus', () => show(column));
+      column.addEventListener('mouseleave', () => hide(column));
+      column.addEventListener('blur', () => hide(column));
+    });
+  });
 }
 
 const requestIndex = new Map();
 const requestTable = rows => {
+  requestIndex.clear();
   rows.forEach(r => requestIndex.set(r.id, r));
   return table([
     ['Time', r => esc(date(r.created_at))],
@@ -617,41 +737,47 @@ const requestTable = rows => {
 };
 
 function requestDetails(r) {
+  document.querySelector('dialog[data-request-dialog]')?.close();
   const cell = (label, value) => `<div><span class="label">${esc(label)}</span><div class="kv-value">${value}</div></div>`;
   const ref = value => value
     ? `<code title="${esc(value)} — click to copy" data-copy-value="${esc(value)}">${esc(value.slice(0, 13))}…</code>`
     : '<span class="muted">—</span>';
-  modal('Request details', `
-    <div class="request-head">
-      <div>${requestPill(r)}<div class="hint">${esc(date(r.created_at))}</div></div>
-      <code>${esc(r.method)} ${esc(r.path)}</code>
+  const d = modal('Request details', `
+    <div class="request-summary">
+      <div><span class="label">Route</span><div class="request-route"><strong>${esc(r.method)}</strong><code>${esc(r.path)}</code></div></div>
+      <div><span class="label">Status</span>${requestPill(r)}</div>
+      <div><span class="label">Started</span><div class="kv-value nowrap">${esc(date(r.created_at))}</div></div>
+      <div><span class="label">Duration</span><div class="kv-value num">${count(r.duration_ms)} ms</div></div>
     </div>
-    <div class="kv section">
+    <section class="detail-section"><h3>Identity</h3><div class="kv">
       ${cell('Request ID', ref(r.id))}
       ${cell('Model', esc(r.model || '—'))}
       ${cell('Kind', esc(r.kind || '—'))}
       ${cell('Account', ref(r.account_id))}
       ${cell('Key', ref(r.key_id))}
       ${cell('IP', esc(r.ip || '—'))}
+    </div></section>
+    <section class="detail-section"><h3>Usage & transfer</h3><div class="kv">
       ${cell('Tokens', `<span class="num">${count(r.tokens)}</span>`)}
       ${cell('Upstream cost', `<span class="num">${esc(usd(r.upstream_usd))}</span>`)}
       ${cell('Billed', `<span class="num">${esc(usd(r.billed_usd))}</span>`)}
-      ${cell('Duration', `<span class="num">${count(r.duration_ms)} ms</span>`)}
       ${cell('Bytes in', `<span class="num">${count(r.bytes_in)}</span>`)}
       ${cell('Bytes out', `<span class="num">${count(r.bytes_out)}</span>`)}
       ${cell('Finished', r.finished ? 'Yes' : '<span class="pill tone-info">In progress</span>')}
-      ${cell('Error', r.error ? `<span class="error">${esc(r.error)}</span>` : '<span class="muted">—</span>')}
-    </div>`, d => {
+    </div></section>
+    ${r.error ? `<section class="detail-section detail-error"><h3>Error</h3><p>${esc(r.error)}</p></section>` : ''}`, d => {
     d.querySelectorAll('[data-copy-value]').forEach(el => {
       el.onclick = () => copyText(el.dataset.copyValue, 'Value').then(ok => ok && flash(el));
     });
   }, 'wide');
+  d.dataset.requestDialog = '';
 }
 
+let requestModelCache = { values: [], expiresAt: 0 };
 const views = {
-  async overview() {
+  async overview(signal) {
     if (admin) {
-      const [v, u] = await Promise.all([api(endpoint('overview')), api(endpoint('usage'))]);
+      const [v, u] = await Promise.all([get(endpoint('overview'), signal), get(endpoint('usage'), signal)]);
       return `<div class="stats">
           ${metric('Total requests', count(v.requests))}
           ${metric('API revenue', usd(v.billed_cost_usd))}
@@ -669,7 +795,7 @@ const views = {
           ${metric('Outstanding credit', usd(v.outstanding_usd))}
         </div>`;
     }
-    const [v, u, r] = await Promise.all([api('/v1/account'), api('/v1/account/usage'), api('/v1/account/requests?limit=5')]);
+    const [v, u, r] = await Promise.all([get('/v1/account', signal), get('/v1/account/usage', signal), get('/v1/account/requests?limit=5', signal)]);
     const sub = v.account.subscription;
     return `<div class="banner">
         <div>
@@ -693,8 +819,9 @@ const views = {
         ${requestTable(r.requests)}
       </div>`;
   },
-  async keys() {
-    const v = await api(endpoint('keys'));
+  async keys(signal) {
+    const state = listStates.keys;
+    const v = await get(`${endpoint('keys')}?${listParams(state)}`, signal);
     const limits = l => {
       const parts = [];
       if (l.rpm) parts.push(`${count(l.rpm)} rpm`);
@@ -705,7 +832,7 @@ const views = {
       if (l.max_children) parts.push(`${count(l.max_children)} children`);
       return parts.length ? `<span class="hint">${parts.join('<br>')}</span>` : '<span class="muted">Account default</span>';
     };
-    const used = r => (r.usage_30d?.series || []).reduce((a, s) => a + Number(s.billed_cost_usd), 0);
+    const used = r => Number(r.usage_30d_usd ?? 0);
     const columns = [
       ['Key', r => `<strong>${esc(r.name)}</strong><br><code class="muted">${esc(r.key_prefix)}…</code>`],
       ['Status', r => `${pill(r.status)}${r.expires_at ? `<br><span class="hint">expires ${esc(date(r.expires_at))}</span>` : ''}`],
@@ -722,23 +849,40 @@ const views = {
         ${admin ? `<button class="danger" data-revoke="${r.id}"${r.status === 'revoked' ? ' disabled' : ''}>Revoke</button>` : ''}
       </div>`]
     );
-    return `<div class="card-head"><h3>API keys</h3>${admin ? '' : '<button class="primary" data-create>+ Create key</button>'}</div>
-      ${table(columns, v.keys)}`;
+    const toolbar = listToolbar('keys', state, {
+      placeholder: 'Search key name, prefix, or ID…',
+      statuses: [['active', 'Active'], ['blocked', 'Blocked'], ['revoked', 'Revoked']],
+      sorts: [['created', 'Newest'], ['name', 'Name'], ['status', 'Status'], ...(admin ? [['account', 'Account']] : []), ['usage', '30-day usage'], ['last_used', 'Last used']],
+      groups: [['status', 'Group by status'], ...(admin ? [['account', 'Group by account']] : [])],
+    });
+    const group = state.group === 'status' ? { value: r => r.status } : state.group === 'account' ? { value: r => r.account_id } : null;
+    return `<div class="card-head"><div><h3>API keys</h3><span class="muted">${count(v.total)} total</span></div>${admin ? '' : '<button class="primary" data-create>+ Create key</button>'}</div>
+      ${toolbar}${table(columns, v.keys, group)}${listPager('keys', state, Number(v.total || 0), v.keys.length)}`;
   },
-  async accounts() {
-    const v = await api(endpoint('accounts'));
-    return `<div class="card-head"><h3>Customer accounts</h3><span class="muted">${count(v.accounts.length)} shown</span></div>
-      ${table([
+  async accounts(signal) {
+    const state = listStates.accounts;
+    const v = await get(`${endpoint('accounts')}?${listParams(state)}`, signal);
+    const toolbar = listToolbar('accounts', state, {
+      placeholder: 'Search account ID or contact…',
+      statuses: [['active', 'Active'], ['suspended', 'Suspended']],
+      sorts: [['created', 'Newest'], ['contact', 'Contact'], ['balance', 'Balance'], ['keys', 'Key count'], ['status', 'Status']],
+      groups: [['status', 'Group by status'], ['plan', 'Group by plan']],
+    });
+    const group = state.group === 'status' ? { value: r => r.status } : state.group === 'plan' ? { value: r => r.plan_code || 'No active plan' } : null;
+    return `<div class="card-head"><div><h3>Customer accounts</h3><span class="muted">${count(v.total)} total</span></div></div>
+      ${toolbar}${table([
         ['Account', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}…</code>`],
         ['Contact', r => esc(r.contact || '—')],
         ['Balance', r => `<strong class="num">${esc(usd(r.balance_usd))}</strong>`],
+        ['Keys', r => `<span class="num">${count(r.key_count)}</span>`],
+        ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : '<span class="muted">—</span>'],
         ['Status', r => pill(r.status)],
         ['Created', r => esc(date(r.created_at))],
         ['Actions', r => `<button data-account="${r.id}">Manage</button>`]
-      ], v.accounts)}`;
+      ], v.accounts, group)}${listPager('accounts', state, Number(v.total || 0), v.accounts.length)}`;
   },
-  async plans() {
-    const v = await api(endpoint('plans'));
+  async plans(signal) {
+    const v = await get(endpoint('plans'), signal);
     const best = bestCode(v.plans.filter(p => p.active));
     return `<div class="card-head"><h3>Plans</h3><button class="primary" data-plan>+ Create plan</button></div>
       <p class="muted">Deactivate a plan to hide it from customers. Plans referenced by subscriptions, payments, or redeem codes cannot be deleted, only retired.</p>
@@ -755,8 +899,8 @@ const views = {
         </div>`]
       ], v.plans)}`;
   },
-  async codes() {
-    const v = await api(endpoint('codes'));
+  async codes(signal) {
+    const v = await get(endpoint('codes'), signal);
     const now = Date.now() / 1000;
     const state = r => r.redeemed_at ? pill('redeemed', 'info') : r.expires_at && r.expires_at < now ? pill('expired', 'warn') : pill('available', 'ok');
     return `<div class="card-head"><h3>Prepaid redeem codes</h3><button class="primary" data-code>+ Issue code</button></div>
@@ -774,30 +918,45 @@ const views = {
         </div>`]
       ], v.codes)}`;
   },
-  async payments() {
-    const v = await api(endpoint('payments'));
-    return `<div class="card-head"><h3>Payment orders</h3><span class="muted">Stripe Checkout history</span></div>
-      ${table([
+  async payments(signal) {
+    const state = listStates.payments;
+    const v = await get(`${endpoint('payments')}?${listParams(state)}`, signal);
+    const toolbar = listToolbar('payments', state, {
+      placeholder: 'Search order, account, or plan…',
+      statuses: [['pending', 'Pending'], ['paid', 'Paid']],
+      sorts: [['created', 'Newest'], ['status', 'Status'], ['account', 'Account'], ['plan', 'Plan'], ['amount', 'Amount']],
+      groups: [['status', 'Group by status'], ['plan', 'Group by plan'], ['account', 'Group by account']],
+    });
+    const group = state.group ? { value: r => state.group === 'plan' ? r.plan_code : state.group === 'account' ? r.account_id : r.status } : null;
+    return `<div class="card-head"><div><h3>Payment orders</h3><span class="muted">${count(v.total)} Stripe Checkout orders</span></div></div>
+      ${toolbar}${table([
         ['Created', r => esc(date(r.created_at))],
+        ['Order', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}…</code>`],
         ['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}…</code>`],
         ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
         ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`],
         ['Credit', r => `<span class="num">${esc(usd(r.credit_usd))}</span>`],
-        ['Status', r => pill(r.status)]
-      ], v.payments)}`;
+        ['Status', r => pill(r.status)],
+        ['Paid', r => esc(date(r.paid_at))]
+      ], v.payments, group)}${listPager('payments', state, Number(v.total || 0), v.payments.length)}`;
   },
-  async requests() {
-    let models = [];
+  async requests(signal) {
+    let models = requestModelCache.expiresAt > Date.now() ? requestModelCache.values : [];
     if (admin) {
-      try {
-        models = (await api(endpoint('requests/groups?field=model&limit=200'))).groups.map(g => g.label).filter(Boolean);
-      } catch {
-        models = [];
+      if (!requestModelCache.expiresAt || requestModelCache.expiresAt <= Date.now()) {
+        try {
+          models = (await get(endpoint('requests/groups?field=model&limit=200'), signal)).groups.map(g => g.label).filter(Boolean);
+          requestModelCache = { values: models, expiresAt: Date.now() + 60_000 };
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          models = [];
+        }
       }
     }
     return `<div class="card-head"><h3>Request history</h3><button data-refresh class="ghost small">Refresh</button></div>
-      <form id="request-filter" class="filters">
-        <input name="q" aria-label="Search model, route, or request id" placeholder="Search model, route, or request id…">
+      <form id="request-filter" class="request-filters${admin ? ' admin' : ''}">
+        <input class="request-search" name="q" type="search" list="request-models" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID…">
+        <datalist id="request-models">${models.map(m => `<option value="${esc(m)}"></option>`).join('')}</datalist>
         <select name="kind" aria-label="Kind">
           <option value="">All kinds</option>
           <option value="llm">LLM</option>
@@ -811,14 +970,11 @@ const views = {
           <option value="5xx">5xx upstream error</option>
           <option value="pending">In progress</option>
         </select>
-        <input name="model" list="request-models" aria-label="Exact model" placeholder="Exact model">
-        <datalist id="request-models">${models.map(m => `<option value="${esc(m)}"></option>`).join('')}</datalist>
-        ${admin ? '<input name="account" aria-label="Account id" placeholder="Account id"><input name="key" aria-label="Key id" placeholder="Key id">' : ''}
-        <button type="submit">Apply</button>
-        <button type="button" class="ghost" data-clear>Clear</button>
+        ${admin ? '<input name="account" aria-label="Account ID" placeholder="Account ID"><input name="key" aria-label="Key ID" placeholder="Key ID">' : ''}
+        <div class="filter-actions"><button type="submit" class="primary">Apply filters</button><button type="button" class="ghost" data-clear>Clear</button></div>
       </form>
       <div id="request-results">${loading('Loading requests…')}</div>
-      <div class="pager section">
+      <div class="pager">
         <span class="hint" id="request-range"></span>
         <div class="actions">
           <label class="inline" for="request-size">Rows</label>
@@ -828,8 +984,8 @@ const views = {
         </div>
       </div>`;
   },
-  async usage() {
-    const v = await api('/v1/account/usage');
+  async usage(signal) {
+    const v = await get('/v1/account/usage', signal);
     return `<div class="card"><div class="card-head"><h3>Usage · last 30 days</h3></div>${chart(v.series)}</div>
       ${table([
         ['Day', r => esc(new Date(r.day * 1000).toLocaleDateString())],
@@ -839,24 +995,16 @@ const views = {
         ['Billed', r => `<span class="num">${esc(usd(r.billed_cost_usd))}</span>`]
       ], v.series)}`;
   },
-  async billing() {
-    const [v, p] = await Promise.all([api('/v1/account'), api('/v1/plans')]);
+  async billing(signal) {
+    const [v, p] = await Promise.all([get('/v1/account', signal), get('/v1/plans', signal)]);
     const now = Date.now() / 1000;
     const best = bestCode(p.plans);
-    return `<div class="split">
-        <div>
-          <div class="card-head"><h3>Add API credit</h3><span class="muted">Prepaid, non-renewing packages</span></div>
-          <div class="plans">${p.plans.length
+    return `<section class="billing-catalog">
+          <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.</p></div><button class="ghost" data-redeem>Have a credit code?</button></div>
+          <div class="plans plan-catalog" style="--plan-count:${p.plans.length}">${p.plans.length
             ? p.plans.map(plan => planCard(plan, best, `<button class="primary" data-buy="${esc(plan.code)}">Pay with Stripe ↗</button>`)).join('')
             : emptyState('No plans available', 'Ask the operator for a redeem code instead.')}</div>
-        </div>
-        <form id="redeem" class="card redeem-card">
-          <h3>Have a credit code?</h3>
-          <label for="redeem-code">Redeem code</label>
-          <input id="redeem-code" name="code" required placeholder="RES-…">
-          <div class="actions"><button type="submit" class="primary">Redeem credit</button></div>
-        </form>
-      </div>
+      </section>
       <h3 class="section">Your credit ledger</h3>
       ${table([
         ['Source', r => esc(r.source)],
@@ -865,8 +1013,8 @@ const views = {
         ['Expires', r => r.expires_at && r.expires_at < now ? pill('expired', 'warn') : esc(date(r.expires_at))]
       ], v.credits)}`;
   },
-  async settings() {
-    const v = await api(endpoint('settings'));
+  async settings(signal) {
+    const v = await get(endpoint('settings'), signal);
     return `<div class="card-head"><h3>Runtime settings</h3><span class="muted">Stored in SQLite</span></div>
       <p class="muted">Secret fields are redacted; leave them blank to keep their current values. USD amounts and percentages are decimal strings. CORS changes require a restart.</p>
       <form id="settings" class="card">
@@ -877,12 +1025,87 @@ const views = {
   }
 };
 
-function jsonEditor(title, initial, save, hint) {
-  modal(title, `<form>${hint ? `<p class="muted">${esc(hint)}</p>` : ''}<label for="editor">Fields (JSON)</label><textarea id="editor" name="json" rows="14" spellcheck="false">${esc(JSON.stringify(initial, null, 2))}</textarea><div class="actions"><button class="primary" type="submit">Save</button></div></form>`, d => bindForm(d.querySelector('form'), async b => {
-    const result = await save(JSON.parse(b.json));
+async function editKeyForm(button) {
+  const key = admin ? (await api(endpoint(`keys/${button.dataset.editKey}`))).key : { name: button.dataset.keyName || 'My key' };
+  const limits = key.limits || {};
+  const windowFields = (name, label, value, placeholder, step = '1') => `<div><label for="key-${name}-max">${label}</label><input id="key-${name}-max" name="${name}_max" type="number" min="${step === '1' ? '1' : '0.000001'}" step="${step}" value="${esc(value?.max || '')}" placeholder="No limit"></div><div><label for="key-${name}-window">Window (hours)</label><input id="key-${name}-window" name="${name}_window" type="number" min="1" value="${esc(value?.window_hours || '')}" placeholder="${placeholder}"></div>`;
+  modal('Edit API key', `<form>
+    <label for="edit-key-name">Key name</label><input id="edit-key-name" name="name" maxlength="80" value="${esc(key.name)}" required>
+    ${admin ? `<div class="form-grid"><div><label for="edit-key-status">Status</label><select id="edit-key-status" name="status">${key.status === 'revoked' ? '<option value="revoked">Revoked (permanent)</option>' : `<option value="active"${key.status === 'active' ? ' selected' : ''}>Active</option><option value="blocked"${key.status === 'blocked' ? ' selected' : ''}>Blocked</option>`}</select></div><div><label for="edit-key-markup">Markup %</label><input id="edit-key-markup" name="markup_pct" type="number" step="0.000001" value="${esc(key.markup_pct || '')}" placeholder="Account default"></div><div><label for="edit-key-expiry">Expires</label><input id="edit-key-expiry" name="expires_at" type="datetime-local" value="${esc(localDateTime(key.expires_at))}"></div><div><label for="edit-key-rpm">Requests per minute</label><input id="edit-key-rpm" name="rpm" type="number" min="1" value="${esc(limits.rpm || '')}" placeholder="No limit"></div></div>
+    <details class="advanced-fields"><summary>Usage limits and models</summary><div class="form-grid">${windowFields('requests', 'Request limit', limits.requests, '24')}${windowFields('tokens', 'Token limit', limits.tokens, '720')}${windowFields('spend', 'Spend limit (USD)', limits.spend && { max: limits.spend.max_usd, window_hours: limits.spend.window_hours }, '720', '0.000001')}<div><label for="edit-key-children">Maximum child keys</label><input id="edit-key-children" name="max_children" type="number" min="1" value="${esc(limits.max_children || '')}" placeholder="No limit"></div></div><label for="edit-key-models">Allowed models</label><textarea id="edit-key-models" name="allowed_models" rows="4" placeholder="One model per line; blank allows all">${esc((limits.allowed_models || []).join('\n'))}</textarea></details>` : ''}
+    <div class="actions"><button class="primary" type="submit">Save changes</button></div>
+  </form>`, d => bindForm(d.querySelector('form'), async b => {
+    const payload = { name: b.name };
+    if (admin) {
+      const bounded = (name, fallback) => b[`${name}_max`] ? { max: Number(b[`${name}_max`]), window_hours: Number(b[`${name}_window`]) || fallback } : null;
+      Object.assign(payload, {
+        status: b.status,
+        markup_pct: b.markup_pct || null,
+        expires_at: b.expires_at ? Math.floor(new Date(b.expires_at).getTime() / 1000) : null,
+        limits: {
+          rpm: b.rpm ? Number(b.rpm) : null,
+          requests: bounded('requests', 24),
+          tokens: bounded('tokens', 720),
+          spend: b.spend_max ? { max_usd: b.spend_max, window_hours: Number(b.spend_window) || 720 } : null,
+          max_children: b.max_children ? Number(b.max_children) : null,
+          allowed_models: b.allowed_models.split(/[\n,]/).map(v => v.trim()).filter(Boolean),
+        },
+      });
+    }
+    await api(endpoint(`keys/${button.dataset.editKey}`), 'PATCH', payload);
     d.close();
-    notice('Saved');
-    if (result?.key) secrets(result);
+    notice('Key updated');
+    await load();
+  }), 'wide');
+}
+
+function planForm(initial = {}) {
+  const editing = Boolean(initial.code);
+  modal(editing ? `Edit plan · ${initial.code}` : 'Create plan', `<form><div class="form-grid"><div><label for="plan-code">Code</label><input id="plan-code" name="code" value="${esc(initial.code || '')}" placeholder="starter" maxlength="80" pattern="[A-Za-z0-9_-]+" ${editing ? 'readonly' : 'required'}></div><div><label for="plan-name">Name</label><input id="plan-name" name="name" value="${esc(initial.name || '')}" placeholder="Starter" required></div><div><label for="plan-price">Price (USD)</label><input id="plan-price" name="price_usd" type="number" min="0.50" step="0.01" value="${esc(initial.price_usd || '10')}" required></div><div><label for="plan-credit">API credit (USD)</label><input id="plan-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="${esc(initial.credit_usd || '10')}" required></div><div><label for="plan-days">Duration (days)</label><input id="plan-days" name="duration_days" type="number" min="1" max="3650" value="${esc(initial.duration_days || 30)}" required></div></div><label for="plan-description">Description</label><input id="plan-description" name="description" value="${esc(initial.description || '')}" maxlength="4096" placeholder="Thirty days of API credit"><label class="inline check-line"><input type="checkbox" name="active"${initial.active !== false ? ' checked' : ''}> Visible to customers</label><div class="actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Create plan'}</button></div></form>`, d => bindForm(d.querySelector('form'), async b => {
+    await api(endpoint('plans'), 'POST', { ...b, duration_days: Number(b.duration_days), active: b.active === 'on' });
+    d.close();
+    notice(editing ? 'Plan updated' : 'Plan created');
+    await load();
+  }), 'wide');
+}
+
+function showIssuedCodes(v) {
+  const codes = v.codes || [v.code];
+  const list = codes.join('\n');
+  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'} — shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button class="primary" data-copy-codes>Copy ${codes.length === 1 ? 'code' : 'all'}</button></div>`, d => {
+    const button = d.querySelector('[data-copy-codes]');
+    button.onclick = () => copyText(list, 'Redeem codes').then(ok => ok && flashCopied(button));
+  }, 'wide');
+}
+
+async function codeForm() {
+  const plans = (await api(endpoint('plans'))).plans.filter(p => p.active);
+  modal('Issue redeem codes', `<form><div class="form-grid"><div><label for="code-plan">Credit source</label><select id="code-plan" name="plan_code"><option value="">Fixed credit amount</option>${plans.map(p => `<option value="${esc(p.code)}">Plan · ${esc(p.name)}</option>`).join('')}</select></div><div><label for="code-credit">Credit (USD)</label><input id="code-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="10" required></div><div><label for="code-count">Number of codes</label><input id="code-count" name="count" type="number" min="1" max="100" value="1" required></div><div><label for="code-expiry">Expires (optional)</label><input id="code-expiry" name="expires_at" type="datetime-local"></div></div><label for="code-note">Internal note (optional)</label><input id="code-note" name="note" maxlength="4096" placeholder="Campaign or customer reference"><p class="field-help">Codes are single use and only displayed once after creation.</p><div class="actions"><button class="primary" type="submit">Issue codes</button></div></form>`, d => {
+    const form = d.querySelector('form');
+    const plan = form.querySelector('[name=plan_code]');
+    const credit = form.querySelector('[name=credit_usd]');
+    plan.onchange = () => {
+      credit.disabled = Boolean(plan.value);
+      credit.required = !plan.value;
+    };
+    bindForm(form, async b => {
+      const item = { note: b.note, expires_at: b.expires_at ? Math.floor(new Date(b.expires_at).getTime() / 1000) : null };
+      if (b.plan_code) item.plan_code = b.plan_code;
+      else item.credit_usd = b.credit_usd;
+      const amount = Number(b.count);
+      const result = await api(endpoint('codes'), 'POST', amount === 1 ? item : Array.from({ length: amount }, () => ({ ...item })));
+      d.close();
+      showIssuedCodes(result);
+      await load();
+    });
+  }, 'wide');
+}
+
+function editCodeForm(button) {
+  modal('Edit redeem code', `<form><label for="edit-code-expiry">Expires (optional)</label><input id="edit-code-expiry" name="expires_at" type="datetime-local" value="${esc(localDateTime(button.dataset.codeExpires))}"><label for="edit-code-note">Internal note</label><input id="edit-code-note" name="note" value="${esc(button.dataset.codeNote || '')}" maxlength="4096"><div class="actions"><button class="primary" type="submit">Save changes</button></div></form>`, d => bindForm(d.querySelector('form'), async b => {
+    await api(endpoint(`codes/${button.dataset.editCode}`), 'PATCH', { expires_at: b.expires_at ? Math.floor(new Date(b.expires_at).getTime() / 1000) : null, note: b.note });
+    d.close();
+    notice('Code updated');
     await load();
   }));
 }
@@ -892,6 +1115,43 @@ function jsonEditor(title, initial, save, hint) {
 function wire(root) {
   root.querySelectorAll('[data-refresh]').forEach(b => b.onclick = load);
   root.querySelectorAll('[data-create]').forEach(b => b.onclick = keyForm);
+  wireCharts(root);
+  // `#content` survives view renders, so replace its delegated handler instead
+  // of accumulating one listener on every refresh/navigation.
+  root.onclick = e => {
+    const button = e.target.closest('[data-request-details]');
+    if (!button || !root.contains(button)) return;
+    const request = requestIndex.get(button.dataset.requestDetails);
+    if (request) requestDetails(request);
+    else notice('Request details are no longer available. Refresh the list.', true);
+  };
+  root.querySelectorAll('[data-list-form]').forEach(form => {
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      Object.assign(listStates[form.dataset.listForm], Object.fromEntries(new FormData(form)), { offset: 0 });
+      load();
+    });
+  });
+  root.querySelectorAll('[data-list-clear]').forEach(button => button.onclick = () => {
+    Object.assign(listStates[button.dataset.listClear], { q: '', status: '', sort: 'created', dir: 'desc', group: '', offset: 0 });
+    load();
+  });
+  root.querySelectorAll('[data-list-size]').forEach(select => select.onchange = () => {
+    const state = listStates[select.dataset.listSize];
+    state.limit = Number(select.value);
+    state.offset = 0;
+    load();
+  });
+  root.querySelectorAll('[data-list-prev]').forEach(button => button.onclick = () => {
+    const state = listStates[button.dataset.listPrev];
+    state.offset = Math.max(0, state.offset - state.limit);
+    load();
+  });
+  root.querySelectorAll('[data-list-next]').forEach(button => button.onclick = () => {
+    const state = listStates[button.dataset.listNext];
+    state.offset += state.limit;
+    load();
+  });
 
   const action = (selector, fn) => root.querySelectorAll(selector).forEach(b => b.onclick = async () => {
     b.disabled = true;
@@ -921,16 +1181,11 @@ function wire(root) {
     await load();
   });
   action('[data-edit-key]', async b => {
-    let initial = { name: b.dataset.keyName || 'My key' };
-    if (admin) {
-      const v = await api(endpoint(`keys/${b.dataset.editKey}`));
-      initial = { name: v.key.name, status: v.key.status, limits: v.key.limits, markup_pct: v.key.markup_pct, expires_at: v.key.expires_at };
-    }
-    jsonEditor('Edit key', initial, v => api(endpoint(`keys/${b.dataset.editKey}`), 'PATCH', v));
+    await editKeyForm(b);
   });
   action('[data-account]', async b => manageAccount(b.dataset.account));
-  action('[data-plan]', async () => jsonEditor('Create plan', { code: 'starter', name: 'Starter', price_usd: '10', credit_usd: '10', duration_days: 30, active: true, description: '' }, b => api(endpoint('plans'), 'POST', b)));
-  action('[data-edit-plan]', async b => jsonEditor(`Edit plan · ${b.dataset.editPlan}`, {
+  action('[data-plan]', async () => planForm());
+  action('[data-edit-plan]', async b => planForm({
     code: b.dataset.editPlan,
     name: b.dataset.planName,
     price_usd: b.dataset.planPrice,
@@ -938,7 +1193,7 @@ function wire(root) {
     duration_days: Number(b.dataset.planDays),
     active: b.dataset.planActive === 'true',
     description: b.dataset.planDescription,
-  }, v => api(endpoint('plans'), 'POST', v)));
+  }));
   action('[data-delete-plan]', async b => {
     const code = b.dataset.deletePlan;
     if (!(await confirmModal('Delete plan?', `Delete "${code}"? This cannot be undone. Plans with subscriptions, payments, or codes can only be deactivated.`, 'Delete plan', true))) return;
@@ -946,47 +1201,14 @@ function wire(root) {
     notice('Plan deleted');
     await load();
   });
-  action('[data-edit-code]', async b => jsonEditor('Edit redeem code', {
-    expires_at: b.dataset.codeExpires ? Number(b.dataset.codeExpires) : null,
-    note: b.dataset.codeNote,
-  }, v => api(endpoint(`codes/${b.dataset.editCode}`), 'PATCH', v)));
+  action('[data-edit-code]', async b => editCodeForm(b));
   action('[data-delete-code]', async b => {
     if (!(await confirmModal('Delete code?', 'Cancel this redeem code? Anyone holding it will no longer be able to redeem it.', 'Delete code', true))) return;
     await api(endpoint(`codes/${b.dataset.deleteCode}`), 'DELETE');
     notice('Code deleted');
     await load();
   });
-  action('[data-request-details]', async b => {
-    const r = requestIndex.get(b.dataset.requestDetails);
-    if (r) requestDetails(r);
-  });
-  action('[data-code]', async () => jsonEditor('Issue redeem code', { credit_usd: '10', expires_at: null, note: '' }, async b => {
-    const v = await api(endpoint('codes'), 'POST', b);
-    if (v.codes) {
-      const list = v.codes.join('\n');
-      modal('Save your redeem codes', `
-        <p class="muted">${count(v.codes.length)} single-use codes — shown only once. Copy them now.</p>
-        <pre class="code-list secret">${esc(list)}</pre>
-        <div class="actions section"><button class="primary" data-copy-codes>Copy all</button></div>`, d => {
-        const button = d.querySelector('[data-copy-codes]');
-        button.onclick = () => copyText(list, 'Redeem codes').then(ok => ok && flashCopied(button));
-      }, 'wide');
-    } else {
-      modal('Save your redeem code', `<p class="muted">Shown once. Share with the intended customer.</p><div class="cred-row"><span class="cred-label">Code</span><code class="cred-value secret" title="${esc(v.code)}">${esc(v.code)}</code><button class="small" data-copy-code>Copy</button></div>`, d => {
-        const button = d.querySelector('[data-copy-code]');
-        const row = button.closest('.cred-row');
-        const copy = () => copyText(v.code, 'Redeem code').then(ok => {
-          if (ok) {
-            flashCopied(button);
-            flash(row);
-          }
-        });
-        button.onclick = copy;
-        row.querySelector('.cred-value').onclick = copy;
-      }, 'wide');
-    }
-    return v;
-  }, 'One object issues one code. Paste an array of objects to issue up to 100 single-use codes in one batch.'));
+  action('[data-code]', async () => codeForm());
   action('[data-buy]', async b => {
     const v = await api('/v1/account/checkout', 'POST', { plan_code: b.dataset.buy });
     const url = new URL(v.url);
@@ -994,11 +1216,7 @@ function wire(root) {
     location.href = url.href;
   });
 
-  if (root.querySelector('#redeem')) bindForm(root.querySelector('#redeem'), async b => {
-    await api('/v1/account/redeem', 'POST', b);
-    notice('Credit applied');
-    await load();
-  });
+  root.querySelectorAll('[data-redeem]').forEach(b => b.onclick = redeemForm);
   if (root.querySelector('#settings')) bindForm(root.querySelector('#settings'), async b => {
     const updates = JSON.parse(b.json);
     await api(endpoint('settings'), 'PATCH', updates);
@@ -1021,6 +1239,7 @@ function wire(root) {
       try {
         const v = await api(endpoint(admin ? 'requests' : 'account/requests') + `?${params}`);
         if (seq !== sequence) return;
+        if (!root.isConnected) return;
         root.querySelector('#request-results').innerHTML = requestTable(v.requests);
         const total = Number(v.total || 0);
         const shown = v.requests.length;
