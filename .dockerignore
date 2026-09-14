@@ -1,0 +1,11 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!src/**
+!assets
+!assets/**
+!migrations
+!migrations/**
+!README.md
+!LICENSE

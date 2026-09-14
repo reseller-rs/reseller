@@ -1,0 +1,23 @@
+services:
+  reseller:
+    image: ghcr.io/reseller-rs/reseller:latest
+    restart: unless-stopped
+    ports:
+      - "56787:56787"
+    environment:
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:56787}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    volumes:
+      - reseller-data:/data
+    stop_grace_period: 330s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  reseller-data:

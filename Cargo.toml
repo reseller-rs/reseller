@@ -1,0 +1,51 @@
+[package]
+name = "reseller"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Self-hosted OpenAI-compatible API reseller: streaming proxy, metering, billing, and dashboards"
+license = "MIT"
+repository = "https://github.com/reseller-rs/reseller"
+readme = "README.md"
+keywords = ["openai", "proxy", "billing", "llm", "cli"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+include = ["src/**", "assets/**", "migrations/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

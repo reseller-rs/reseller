@@ -1,0 +1,47 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo package --locked
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98
+      - run: cargo check --locked
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: reseller:test
+      - name: Container smoke test
+        run: |
+          docker run -d --name reseller-test -p 56787:56787 reseller:test
+          curl --retry 20 --retry-connrefused --retry-delay 1 --fail http://localhost:56787/readyz
+          docker exec reseller-test /usr/local/bin/reseller --version
+          docker exec reseller-test /usr/local/bin/reseller healthcheck
+          test "$(docker inspect -f '{{.Config.User}}' reseller-test)" = "10001:10001"
+          docker stop reseller-test

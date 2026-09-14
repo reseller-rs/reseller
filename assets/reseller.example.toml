@@ -1,0 +1,205 @@
+# =============================================================================
+#  reseller — starter configuration
+# =============================================================================
+#
+#  HOW THIS FILE IS USED
+#  ---------------------
+#  This file seeds the SQLite database on the first start only. Afterwards the
+#  database is authoritative: change settings in Admin -> Settings (or with the
+#  API), not here. `reseller init` never overwrites an existing file.
+#
+#  WHAT TO EDIT
+#  ------------
+#  Set [llm].api_key (and base_url/model if you do not use OpenAI). Everything
+#  else has a working default and is commented out; remove the leading "#" to
+#  activate a setting. Uncommenting a table header such as [tts] activates the
+#  whole block, so uncomment its keys too.
+#
+#  BOOTSTRAP ENVIRONMENT VARIABLES (first start only)
+#  --------------------------------------------------
+#  OPENAI_BASE_URL OPENAI_API_KEY OPENAI_MODEL OPENAI_MODEL_FALLBACKS
+#  TTS_BASE_URL TTS_API_KEY TTS_MODEL TTS_MODEL_FALLBACKS TTS_VOICE
+#  STT_BASE_URL STT_API_KEY STT_MODEL STT_MODEL_FALLBACKS
+#  ADMIN_TOKEN KEY_PEPPER MARKUP_PCT FREE_CREDIT_USD PUBLIC_URL
+#  STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET
+#
+#  Always-runtime environment variables (also available as CLI flags):
+#  HOST PORT DB_FILE RESELLER_CONFIG RUST_LOG.
+#
+#  FORMATS
+#  -------
+#  Money and percentages are decimal STRINGS: markup_pct = "30",
+#  max_usd = "5", input = "0.5". Negative values, NaN and Infinity are
+#  rejected. Byte sizes and durations are integers; expiry inputs accept Unix
+#  seconds or RFC3339 timestamps. Booleans are true/false.
+#
+#  SECURITY
+#  --------
+#  This file and the database hold credentials. Keep both private (`reseller
+#  init` writes mode 0600) and protect database backups.
+# =============================================================================
+
+# Display name shown in dashboards and page titles.
+site_name = "Reseller"
+
+# Externally reachable origin. Used for dashboard links, API hints, and Stripe
+# redirects. Must be an absolute http(s) URL without query or fragment.
+public_url = "http://localhost:56787"
+
+# --- credentials -------------------------------------------------------------
+# Administrator token for /admin. Leave empty (or commented) to have a
+# secure token generated and printed on first start. Minimum 24 characters.
+# admin_token = ""
+
+# HMAC pepper used to hash API keys, dashboard tokens, and redeem codes. Leave
+# empty (or commented) to generate one on first start. Minimum 24 characters.
+# WARNING: changing this invalidates every customer credential and every
+# unredeemed code.
+# key_pepper = ""
+
+# --- request rewriting policies ----------------------------------------------
+# How the model field is handled for llm requests (and voice for tts).
+# Options:
+#   "default"     fill it from the upstream config only when the client omits it
+#   "force"       always overwrite whatever the client sent
+#   "passthrough" never modify the client's value
+# model_policy = "default"
+# voice_policy = "default"
+
+# --- billing -----------------------------------------------------------------
+# Markup over upstream cost, as a percentage decimal string. Resolution order
+# is key -> account -> this global default. "0" bills at upstream cost.
+# markup_pct = "30"
+
+# Credit granted to every new self-service account, and how many days it stays
+# spendable. Use "0" for no trial credit; 0 days means it never expires.
+# free_credit_usd = "0.25"
+# free_credit_expiry_days = 30
+
+# --- access control ----------------------------------------------------------
+# Require a valid API key on proxy routes. When false, requests without
+# credentials are served anonymously and are not billed.
+# require_key = true
+
+# Only meaningful with require_key = false: treat any non-empty token as an
+# anonymous request instead of rejecting unknown credentials.
+# accept_any_token = false
+
+# Self-service key creation guards. Setting a guard to 0 disables it.
+#   ip_limit_per_month   new keys allowed per source IP per calendar month
+#   cooldown_seconds     minimum wait between key creations from one IP
+#   global_hourly_limit  new keys allowed per hour across all accounts
+#   max_keys_per_account active keys allowed per account (must be greater than 0)
+# ip_limit_per_month = 2
+# cooldown_seconds = 30
+# global_hourly_limit = 100
+# max_keys_per_account = 10
+
+# Trust CF-Connecting-IP / X-Forwarded-For for client IPs, key allowances, and
+# request logs. Enable only when the app is reachable exclusively through a
+# proxy that overwrites those headers.
+# trust_proxy = false
+
+# CORS for browser clients: "" disables CORS, "*" allows any origin, and any
+# other value is used verbatim (for example "https://app.example.com").
+# Changes require a restart.
+# cors_origin = ""
+
+# --- HTTP, timeouts, retention ----------------------------------------------
+# Request body limits in bytes. Defaults: 50 MiB JSON, 512 MiB streamed
+# uploads. Maximums: 512 MiB JSON, 2 GiB streamed uploads.
+# max_json_body_bytes = 52428800
+# max_stream_body_bytes = 536870912
+
+# Upstream connect/stream timeout in seconds (must be greater than 0).
+# upstream_timeout_seconds = 300
+
+# Delete finished request logs older than this many days while keeping at most
+# max_log_entries rows. Both values must be greater than 0.
+# log_retention_days = 30
+# max_log_entries = 5000
+
+# --- payments (optional) -----------------------------------------------------
+# Set both values to enable Stripe Checkout for prepaid plans. Register
+# {public_url}/webhooks/stripe for checkout.session.completed and
+# checkout.session.async_payment_succeeded.
+# stripe_secret_key = ""
+# stripe_webhook_secret = ""
+
+# =============================================================================
+#  UPSTREAMS
+#  Each upstream is configured independently. base_url must be an http(s) URL
+#  without credentials, query, or fragment. fallbacks are ordered model names
+#  tried after availability errors (400/402/404/408/429/5xx) for JSON requests;
+#  at most 10, and each fallback must also pass the key's allowed_models list.
+# =============================================================================
+
+# Language models. Required for /v1/chat/completions and other JSON routes.
+[llm]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-replace-with-your-upstream-key"
+# Model sent when the client omits one, and always with model_policy = "force".
+# Leave the string empty to require clients to choose a model.
+model = "gpt-4o-mini"
+# Ordered fallback models, for example ["gpt-4o", "gpt-4o-mini"].
+# fallbacks = []
+
+# Text-to-speech. Required only for /v1/audio/speech.
+# [tts]
+# base_url = "https://api.openai.com/v1"
+# api_key = "sk-replace-with-your-upstream-key"
+# model = "gpt-4o-mini-tts"
+# Voice sent when the client omits one, and always with voice_policy = "force".
+# voice = ""
+# fallbacks = []
+
+# Speech-to-text. Required only for /v1/audio/transcriptions and
+# /v1/audio/translations.
+# [stt]
+# base_url = "https://api.openai.com/v1"
+# api_key = "sk-replace-with-your-upstream-key"
+# model = "whisper-1"
+# fallbacks = []
+
+# =============================================================================
+#  PRICE TABLE
+#  USD per 1,000,000 input/output tokens and USD per second of audio. The
+#  "default" entry covers models without their own section. Provider-reported
+#  usage.cost always takes precedence, including an explicit zero.
+# =============================================================================
+
+# [prices.default]
+# input = "0.5"
+# output = "1.5"
+# audio_second = "0"
+
+# Per-model override example. Quote model names containing dots, slashes, or
+# colons.
+# [prices."my-model"]
+# input = "0.25"
+# output = "1"
+# audio_second = "0"
+
+# =============================================================================
+#  DEFAULT KEY LIMITS
+#  Copied onto every newly minted key; existing keys keep the limits they were
+#  created with. Omit entries you do not want. Window hours must be 1-8760.
+# =============================================================================
+
+# [default_limits]
+# rpm = 60
+# requests = { max = 2000, window_hours = 24 }
+# tokens = { max = 1000000, window_hours = 720 }
+# spend = { max_usd = "5", window_hours = 720 }
+# max_children = 2
+# allowed_models = []
+
+# =============================================================================
+#  PER-IP CREATION OVERRIDES
+#  Replace ip_limit_per_month for specific addresses. 0 or a negative value
+#  means unlimited creations from that address.
+# =============================================================================
+
+# [ip_overrides]
+# "203.0.113.7" = 10
+# "198.51.100.9" = 0
