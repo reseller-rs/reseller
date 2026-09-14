@@ -149,7 +149,7 @@ curl http://localhost:56787/v1/chat/completions \
   -d '{"model":"your-model","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Omit `model` to use the configured `[llm].model` under `model_policy = "default"`. `passthrough` forwards the client's value unchanged (a wrong model fails upstream), and `force` always uses the configured model. Fallbacks only apply when the final model equals `[llm].model`.
+Omit `model` to use the configured `[llm].model` under `model_policy = "default"`. `passthrough` forwards the client's value unchanged (a wrong model fails upstream), and `force` always uses the configured model. The same policy governs the multipart `model` field on uploads: `force` replaces it, `default` fills it only when missing, and the audio payload still streams without buffering. Fallbacks only apply when the final model equals `[llm].model`.
 
 The API key and dashboard token are shown only once and stored as HMAC-SHA256 hashes. Dashboard tokens manage accounts but **cannot call the proxy**. Blocked API keys retain workspace access; revoked credentials do not. All keys on an account share credit.
 
@@ -159,9 +159,9 @@ Routing replaces `/v1` with the configured base path and preserves query strings
 - `/v1/audio/transcriptions`, `/v1/audio/translations` → STT
 - All other `/v1/*` proxy routes → LLM
 
-JSON requests apply model/voice policies; chat streams request usage reporting. Multipart bodies stream unchanged with bounded upload size. A key with a model allowlist cannot send an opaque multipart body because its model cannot be verified. WebSocket model checks use the query-string model or configured default.
+JSON requests apply model/voice policies; chat streams request usage reporting. Multipart uploads stream with bounded size while the `model` form field alone is rewritten by the policy, so with `force` (or `default` plus a configured model) the request is admitted and metered against the configured model rather than an unknown one. WebSocket model checks use the query-string model or configured default.
 
-Fallbacks apply only to JSON requests using the configured model, and only before forwarding response headers. Availability errors (`400/402/404/408/429/5xx`) and connection/timeouts can trigger the next model. Fallback models must also be allowed by the key. Client-selected models and non-replayable multipart streams are not replaced. Redirects are not followed. Hop-by-hop headers and local credentials are removed before forwarding.
+Fallbacks apply only to JSON requests using the configured model, and only before forwarding response headers. Availability errors (`400/402/404/408/429/5xx`) and connection/timeouts can trigger the next model. Fallback models must also be allowed by the key. Client-selected models are not replaced by fallbacks, and multipart uploads get a single forward attempt because the payload cannot be replayed. Redirects are not followed. Hop-by-hop headers and local credentials are removed before forwarding.
 
 Responses include `X-Request-Id`, `X-Key-Prefix`, `X-Account-Balance-USD` (pre-request snapshot), and `X-Model-Fallback` when applicable. Failures use `{ "error": { "code": "...", "message": "..." } }`: `401` credentials, `402` balance, `403` policy, `429` limits, `413` body size, `502/504` upstream failure.
 

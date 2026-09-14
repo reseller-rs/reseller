@@ -58,7 +58,9 @@ public_url = "http://localhost:56787"
 # key_pepper = ""
 
 # --- request rewriting policies ----------------------------------------------
-# How the model field is handled for llm requests (and voice for tts).
+# How the model field is handled for llm requests (and voice for tts). The
+# multipart model field on uploads (for example STT) follows the same policy
+# while the audio payload streams through untouched.
 # Options:
 #   "default"     fill it from the upstream config only when the client omits it
 #   "force"       always overwrite whatever the client sent
@@ -154,7 +156,8 @@ model = "gpt-4o-mini"
 # fallbacks = []
 
 # Speech-to-text. Required only for /v1/audio/transcriptions and
-# /v1/audio/translations.
+# /v1/audio/translations. With model_policy = "force" (or "default" plus a
+# configured model), the multipart model field is rewritten to this value.
 # [stt]
 # base_url = "https://api.openai.com/v1"
 # api_key = "sk-replace-with-your-upstream-key"

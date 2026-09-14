@@ -802,6 +802,80 @@ async fn multipart_is_streamed_unchanged_to_stt() {
     to_bytes(r.into_body(), 10000).await.unwrap();
     task.abort();
 }
+/// A multipart STT upload obeys model_policy = "force" like JSON routes: the
+/// body's model field is replaced, the audio payload streams through, the
+/// request is admitted against the configured model (not ""), and the metered
+/// model is the configured one.
+#[tokio::test]
+async fn multipart_stt_model_follows_force_policy() {
+    let t = Test::new().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+    let (base, task) = upstream(Router::new().fallback(any(move |req: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            assert_eq!(req.uri().path(), "/api/audio/transcriptions");
+            let b = to_bytes(req.into_body(), 10_000_000).await.unwrap();
+            tx.send(b).await.unwrap();
+            axum::Json(json!({"text":"hello","usage":{"cost":"0"}}))
+        }
+    })))
+    .await;
+    {
+        let mut c = t.app.config.write().await;
+        c.stt.base_url = format!("{base}/api");
+        c.stt.api_key = "stt-secret".into();
+        c.stt.model = "configured-stt".into();
+        c.model_policy = Policy::Force;
+    }
+    let k = t.key().await;
+    // Allowlist only the configured model: before the rewrite, opaque
+    // multipart bodies were admitted with model = "" and would 403 here.
+    let (s, v) = t
+        .call(
+            "PATCH",
+            &format!("/admin/api/keys/{}", k["id"].as_str().unwrap()),
+            Some(ADMIN),
+            json!({"limits":{"allowed_models":["configured-stt"]}}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+
+    let payload = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n\x00\x01AUDIO\xff\r\n--b--\r\n".to_vec();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/audio/transcriptions")
+        .header(
+            "authorization",
+            format!("Bearer {}", k["key"].as_str().unwrap()),
+        )
+        .header("content-type", "multipart/form-data; boundary=b")
+        .body(Body::from(payload))
+        .unwrap();
+    let r = reseller::proxy::handle(t.app.clone(), req, "127.0.0.1".into())
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    to_bytes(r.into_body(), 10000).await.unwrap();
+
+    let forwarded = rx.recv().await.unwrap();
+    let s = String::from_utf8_lossy(&forwarded);
+    assert!(
+        s.contains("name=\"model\"\r\n\r\nconfigured-stt\r\n"),
+        "{s}"
+    );
+    assert!(!s.contains("whisper-1"), "{s}");
+    assert!(
+        forwarded.windows(8).any(|w| w == &b"\x00\x01AUDIO\xff"[..]),
+        "audio payload must stream through"
+    );
+    let metered: String =
+        sqlx::query_scalar("SELECT model FROM requests ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(metered, "configured-stt");
+    task.abort();
+}
 #[tokio::test]
 async fn request_body_limit_is_enforced_before_upstream() {
     let t = Test::new().await;
