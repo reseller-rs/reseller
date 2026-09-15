@@ -395,6 +395,228 @@ async fn repeat_plan_grants_have_independent_expiry_windows() {
     assert_eq!(balance(&t, &aid).await, "19");
 }
 
+/// Full billing scenario: a customer holds $10 of perpetual credit, buys a
+/// Yearly plan, then buys a $5 plan that expires after 30 days. The admin tries
+/// to delete the Yearly plan while the customer is subscribed, then deactivates
+/// it instead, and time passes.
+///
+/// Grants are decoupled from the plan catalog: deleting or deactivating a plan
+/// never changes customer credit, because `credits` rows are the ledger and
+/// plans are only templates. Deletion is refused while any subscription,
+/// payment, or redeem code references the plan. Expired remainders leave the
+/// spendable balance but stay in the ledger for audit, and the perpetual lot
+/// survives both windows.
+#[tokio::test]
+async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    let aid = k["account_id"].as_str().unwrap().to_owned();
+    let token = k["dashboard_token"].as_str().unwrap().to_owned();
+    sqlx::query("DELETE FROM credits")
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+
+    // 1) $10 of purchased credit, no expiry.
+    let code = issue_credit_code(&t, "10").await;
+    let (s, v) = redeem(&t, &token, &code).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["account"]["balance_usd"], "10");
+
+    // 2) Yearly plan (seeded as $160 of credit over 360 days).
+    let code = issue_plan_code(&t, "year").await;
+    let (s, v) = redeem(&t, &token, &code).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["account"]["balance_usd"], "170");
+    assert_eq!(v["account"]["subscription"]["plan_code"], "year");
+
+    // 3) A $5 plan expiring after 30 days.
+    let (s, _) = t
+        .admin(
+            "POST",
+            "plans",
+            json!({"code":"trial5","name":"Trial 5","price_usd":"5","credit_usd":"5","duration_days":30,"description":"Thirty days"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let code = issue_plan_code(&t, "trial5").await;
+    let (s, v) = redeem(&t, &token, &code).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["account"]["balance_usd"], "175");
+
+    // Each grant carries its own window; the yearly plan is 360 days, not 365.
+    let year_exp: i64 = sqlx::query_scalar("SELECT expires_at FROM credits WHERE note='year'")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    let trial_exp: i64 = sqlx::query_scalar("SELECT expires_at FROM credits WHERE note='trial5'")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert!((db::now() + 360 * 86400 - 5..=db::now() + 360 * 86400).contains(&year_exp));
+    assert!((db::now() + 30 * 86400 - 5..=db::now() + 30 * 86400).contains(&trial_exp));
+
+    // 4) Admin deletes the Yearly plan while the subscription is live: refused.
+    // Deactivating it instead must not touch granted credit or the subscription.
+    let (s, v) = t.admin("DELETE", "plans/year", json!({})).await;
+    assert_eq!(s, 409, "{v}");
+    assert_eq!(v["error"]["code"], "plan_in_use");
+    // Even a direct SQL delete is refused by the foreign key, so a referenced
+    // plan can never be torn out from under a subscription or payment.
+    assert!(
+        sqlx::query("DELETE FROM plans WHERE code='year'")
+            .execute(&t.app.db)
+            .await
+            .is_err()
+    );
+    let (s, _) = t
+        .admin(
+            "POST",
+            "plans",
+            json!({"code":"year","name":"Yearly","price_usd":"160","credit_usd":"160","duration_days":360,"active":false}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(balance(&t, &aid).await, "175");
+    let (s, v) = t.customer("GET", "account", &token, json!({})).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["account"]["balance_usd"], "175");
+    assert_eq!(v["account"]["subscription"]["plan_code"], "year");
+    assert_eq!(
+        v["account"]["subscription"]["expires_at"].as_i64().unwrap(),
+        year_exp
+    );
+    // The deactivated plan accepts neither new codes nor new checkouts.
+    let (s, _) = t.admin("POST", "codes", json!({"plan_code":"year"})).await;
+    assert_eq!(s, 400);
+
+    // 5) Spending $3 drains the soonest-expiring lot first.
+    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    billing::debit(&mut tx, &aid, 3_000_000).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(balance(&t, &aid).await, "172");
+    let trial_left: i64 =
+        sqlx::query_scalar("SELECT remaining_micro FROM credits WHERE note='trial5'")
+            .fetch_one(&t.app.db)
+            .await
+            .unwrap();
+    let year_left: i64 =
+        sqlx::query_scalar("SELECT remaining_micro FROM credits WHERE note='year'")
+            .fetch_one(&t.app.db)
+            .await
+            .unwrap();
+    assert_eq!((trial_left, year_left), (2_000_000, 160_000_000));
+
+    // 6) One month later the $5 lot's remainder expires out of the spendable
+    // balance; the yearly window and the perpetual $10 are untouched, and the
+    // ledger still shows the expired remainder for audit.
+    sqlx::query("UPDATE credits SET expires_at=? WHERE note='trial5'")
+        .bind(db::now() - 1)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    // The credit lot and the subscription row share the same expiry instant.
+    sqlx::query("UPDATE subscriptions SET expires_at=? WHERE plan_code='trial5'")
+        .bind(db::now() - 1)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(balance(&t, &aid).await, "170");
+    let v = billing::account(&t.app, &aid).await.unwrap();
+    let expired = v["credits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["source"] == "subscription" && c["remaining_usd"] == "2")
+        .expect("expired remainder is kept in the ledger");
+    assert!(expired["expires_at"].as_i64().unwrap() < db::now());
+
+    // 7) Around one year later the yearly lot expires too: only the perpetual
+    // $10 remains, the subscription badge disappears, and the account can still
+    // proxy and spend.
+    sqlx::query("UPDATE credits SET expires_at=? WHERE note='year'")
+        .bind(db::now() - 1)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    // The credit lot and the subscription row share the same expiry instant.
+    sqlx::query("UPDATE subscriptions SET expires_at=? WHERE plan_code='year'")
+        .bind(db::now() - 1)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(balance(&t, &aid).await, "10");
+    let (s, v) = t.customer("GET", "account", &token, json!({})).await;
+    assert_eq!(s, 200);
+    assert!(v["account"]["subscription"].is_null());
+    let task = mock_llm(&t, "0", 0).await;
+    let (s, v) = t
+        .customer(
+            "POST",
+            "chat/completions",
+            k["key"].as_str().unwrap(),
+            json!({"messages":[]}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    task.abort();
+    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    billing::debit(&mut tx, &aid, 4_000_000).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(balance(&t, &aid).await, "6");
+    let lots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credits")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(lots, 3, "every lot is kept as an audit record");
+    let debt: i64 = sqlx::query_scalar("SELECT debt_micro FROM accounts WHERE id=?")
+        .bind(&aid)
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(debt, 0);
+
+    // 8) A plan that only left history behind (redeemed code, expired grant) is
+    // still undeletable; a never-referenced plan deletes normally.
+    let (s, v) = t.admin("DELETE", "plans/trial5", json!({})).await;
+    assert_eq!(s, 409, "{v}");
+    let (s, _) = t
+        .admin(
+            "POST",
+            "plans",
+            json!({"code":"ghost","name":"Ghost","price_usd":"1","credit_usd":"1","duration_days":1}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (s, v) = t.admin("DELETE", "plans/ghost", json!({})).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        !v["plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["code"] == "ghost")
+    );
+
+    // 9) An in-flight Stripe order pins its plan too.
+    let (s, _) = t
+        .admin(
+            "POST",
+            "plans",
+            json!({"code":"pending","name":"Pending","price_usd":"20","credit_usd":"20","duration_days":30}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order_pending',?,'pending',20000000,20000000,30,'cs_pending',?)")
+        .bind(&aid)
+        .bind(db::now())
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let (s, v) = t.admin("DELETE", "plans/pending", json!({})).await;
+    assert_eq!(s, 409, "{v}");
+}
+
 // ---------------------------------------------------------------------------
 // Key lifecycle: create, block, rotate, revoke
 // ---------------------------------------------------------------------------
