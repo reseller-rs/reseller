@@ -845,7 +845,7 @@ const views = {
       ['Actions', r => `<div class="actions">
         <button data-edit-key="${r.id}" data-key-name="${esc(r.name)}">Edit</button>
         <button data-rotate="${r.id}"${r.status !== 'active' ? ' disabled' : ''}>Rotate</button>
-        <button class="danger" data-block="${r.id}"${r.status !== 'active' ? ' disabled' : ''}>Block</button>
+        ${admin ? `<button class="danger" data-block="${r.id}"${r.status !== 'active' ? ' disabled' : ''}>Block</button>` : ''}
         ${admin ? `<button class="danger" data-revoke="${r.id}"${r.status === 'revoked' ? ' disabled' : ''}>Revoke</button>` : ''}
       </div>`]
     );
@@ -1001,7 +1001,7 @@ const views = {
     const best = bestCode(p.plans);
     return `<section class="billing-catalog">
           <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.</p></div><button class="ghost" data-redeem>Have a credit code?</button></div>
-          <div class="plans plan-catalog" style="--plan-count:${p.plans.length}">${p.plans.length
+          <div class="plans plan-catalog">${p.plans.length
             ? p.plans.map(plan => planCard(plan, best, `<button class="primary" data-buy="${esc(plan.code)}">Pay with Stripe ↗</button>`)).join('')
             : emptyState('No plans available', 'Ask the operator for a redeem code instead.')}</div>
       </section>

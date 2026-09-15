@@ -467,10 +467,7 @@ pre {
 /* ---------- plan cards ---------- */
 
 .plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px; }
-.plan-catalog { grid-template-columns: 1fr; }
-@media (min-width: 801px) {
-  .plan-catalog { grid-template-columns: repeat(min(max(1, var(--plan-count, 1)), 4), minmax(0, 1fr)); }
-}
+.plan-catalog { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); align-items: stretch; }
 .plan-card {
   display: flex;
   flex-direction: column;
@@ -521,7 +518,6 @@ pre {
 .catalog-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
 .catalog-head h3 { margin-bottom: 4px; }
 .catalog-head p { margin: 0; color: var(--muted); font-size: 13px; max-width: 650px; }
-.plan-catalog { align-items: stretch; }
 .plan-catalog .plan-card { margin: 0; min-height: 285px; }
 .redeem-intro { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 22px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-soft); }
 .redeem-intro h3 { margin: 0 0 4px; font-size: 15px; }
