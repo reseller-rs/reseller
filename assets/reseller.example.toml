@@ -97,9 +97,9 @@ public_url = "http://localhost:56787"
 # global_hourly_limit = 100
 # max_keys_per_account = 10
 
-# Trust CF-Connecting-IP / X-Forwarded-For for client IPs, key allowances, and
-# request logs. Enable only when the app is reachable exclusively through a
-# proxy that overwrites those headers.
+# Trust CF-Connecting-IP, else the last X-Forwarded-For entry, for client IPs,
+# key allowances, and request logs. Enable only when the app is reachable
+# exclusively through a proxy that sets those headers.
 # trust_proxy = false
 
 # CORS for browser clients: "" disables CORS, "*" allows any origin, and any
@@ -167,8 +167,9 @@ model = "gpt-4o-mini"
 # =============================================================================
 #  PRICE TABLE
 #  USD per 1,000,000 input/output tokens and USD per second of audio. The
-#  "default" entry covers models without their own section. Provider-reported
-#  usage.cost always takes precedence, including an explicit zero.
+#  "default" entry covers models without their own section; model names match
+#  case-insensitively. Provider-reported usage.cost always takes precedence,
+#  including an explicit zero.
 # =============================================================================
 
 # [prices.default]
@@ -199,10 +200,10 @@ model = "gpt-4o-mini"
 
 # =============================================================================
 #  PER-IP CREATION OVERRIDES
-#  Replace ip_limit_per_month for specific addresses. 0 or a negative value
-#  means unlimited creations from that address.
+#  Replace ip_limit_per_month for specific addresses. 0 means unlimited
+#  creations from that address.
 # =============================================================================
 
 # [ip_overrides]
 # "203.0.113.7" = 10
-# "198.51.100.9" = 0
+# "198.51.100.9" = 0   # unlimited

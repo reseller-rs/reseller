@@ -15,7 +15,7 @@ use axum::{
 use reseller::{
     App, billing,
     config::{Config, Policy},
-    db, identity,
+    db, identity, keys,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -47,9 +47,14 @@ impl Test {
         }
     }
     async fn key(&self) -> Value {
-        identity::create(&self.app, None, None, "127.0.0.1", &json!({"name":"test"}))
-            .await
-            .unwrap()
+        keys::create(
+            &self.app,
+            keys::Requester::Public(None),
+            "127.0.0.1",
+            &json!({"name":"test"}),
+        )
+        .await
+        .unwrap()
     }
     async fn call(
         &self,
@@ -120,7 +125,7 @@ async fn mock_llm(t: &Test, cost: &'static str, tokens: i64) -> tokio::task::Joi
         },
     )))
     .await;
-    let mut c = t.app.config.write().await;
+    let mut c = t.app.config_mut().await;
     c.llm.base_url = format!("{base}/v1");
     c.llm.api_key = "upstream-secret".into();
     c.llm.model = "configured".into();
@@ -951,7 +956,7 @@ async fn block_and_reactivate_cycle_is_enforced_across_accounts() {
 #[tokio::test]
 async fn account_key_cap_counts_active_keys_and_rotation_respects_it() {
     let t = Test::new().await;
-    t.app.config.write().await.max_keys_per_account = 2;
+    t.app.config_mut().await.max_keys_per_account = 2;
     let k1 = t.key().await;
     let token = k1["dashboard_token"].as_str().unwrap();
     let (s, k2) = t
@@ -1628,7 +1633,7 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
-    t.app.config.write().await.stripe_webhook_secret = "whsec_test".into();
+    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
     sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order_snap',?,'monthly',20000000,25000000,40,'cs_snap',?)")
         .bind(aid)
         .bind(db::now())
@@ -1683,7 +1688,7 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
 }
 
 fn signature(secret: &str, body: &[u8], timestamp: i64) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     m.update(format!("{timestamp}.").as_bytes());
     m.update(body);
@@ -2206,7 +2211,7 @@ async fn overspend_via_proxy_creates_debt_settled_by_admin_topup() {
 #[tokio::test]
 async fn concurrent_rotations_are_serialized_and_only_active_keys_rotate() {
     let t = Test::new().await;
-    t.app.config.write().await.max_keys_per_account = 3;
+    t.app.config_mut().await.max_keys_per_account = 3;
     let k1 = t.key().await;
     let dash = k1["dashboard_token"].as_str().unwrap().to_owned();
     let (s, k2) = t
@@ -2226,9 +2231,9 @@ async fn concurrent_rotations_are_serialized_and_only_active_keys_rotate() {
     for kid in &ids {
         let app = t.app.clone();
         let kid = kid.clone();
-        tasks.push(tokio::spawn(async move {
-            identity::rotate(&app, &kid, None).await
-        }));
+        tasks.push(tokio::spawn(
+            async move { keys::rotate(&app, &kid, None).await },
+        ));
     }
     let mut successes = 0;
     for task in tasks {
@@ -2243,7 +2248,7 @@ async fn concurrent_rotations_are_serialized_and_only_active_keys_rotate() {
         .unwrap();
     assert_eq!(active, 3, "the account cap is preserved");
     // Retrying against a replaced (blocked) original is refused and mints nothing.
-    assert!(identity::rotate(&t.app, &ids[0], None).await.is_err());
+    assert!(keys::rotate(&t.app, &ids[0], None).await.is_err());
     let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE status='active'")
         .fetch_one(&t.app.db)
         .await
@@ -2498,7 +2503,7 @@ async fn webhook_ignores_unpaid_and_unknown_orders_without_side_effects() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
-    t.app.config.write().await.stripe_webhook_secret = "whsec_test".into();
+    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
     let send = |event: Value| {
         let app = t.app.clone();
         async move {
@@ -3077,7 +3082,7 @@ async fn model_policy_default_force_and_passthrough() {
     })))
     .await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.llm.base_url = format!("{base}/v1");
         c.llm.api_key = "upstream".into();
         c.llm.model = "configured".into();
@@ -3111,7 +3116,7 @@ async fn model_policy_default_force_and_passthrough() {
     assert_eq!(v["model"], "your-model");
 
     // passthrough + explicit model -> untouched.
-    t.app.config.write().await.model_policy = Policy::Passthrough;
+    t.app.config_mut().await.model_policy = Policy::Passthrough;
     let (s, v) = t
         .call(
             "POST",
@@ -3136,7 +3141,7 @@ async fn model_policy_default_force_and_passthrough() {
     assert!(v["model"].is_null(), "{v}");
 
     // force + explicit model -> always the configured model.
-    t.app.config.write().await.model_policy = Policy::Force;
+    t.app.config_mut().await.model_policy = Policy::Force;
     let (s, v) = t
         .call(
             "POST",

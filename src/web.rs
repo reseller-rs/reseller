@@ -1,124 +1,261 @@
+//! HTTP router: health probes, embedded dashboards, and dispatch to the
+//! management APIs, the Stripe webhook, and the upstream proxy.
 use crate::{
-    App,
+    App, api,
     error::{Error, Result},
+    identity, payments, proxy, stats,
 };
 use axum::{
-    Router,
+    Json, Router,
     body::{Body, to_bytes},
     extract::{ConnectInfo, State},
-    http::{HeaderValue, Request},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, header},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::get,
 };
-use std::{convert::Infallible, net::SocketAddr, time::Duration};
-use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer};
+use serde_json::json;
+use std::{convert::Infallible, net::IpAddr, net::SocketAddr, time::Duration};
+use tower_http::{
+    cors::{AllowOrigin, Any, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+};
 
+const WEBHOOK_BODY_LIMIT: usize = 1024 * 1024;
+const EVENTS_INTERVAL: Duration = Duration::from_secs(5);
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+     connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; \
+     form-action 'self'";
+
+/// Builds the application router. CORS is read once here, so CORS changes
+/// require a restart.
 pub async fn router(app: App) -> Router {
-    let origin = app.config.read().await.cors_origin.clone();
-    let mut router=Router::new()
- .route("/healthz",get(||async {axum::Json(serde_json::json!({"status":"ok","service":"reseller"}))}))
- .route("/readyz",get(ready))
- .route("/",get(page)).route("/workspace",get(page)).route("/workspace/",get(page)).route("/admin",get(page)).route("/admin/",get(page))
- .route("/assets/app.js",get(||async {([("content-type","text/javascript; charset=utf-8")],include_str!("../assets/app.js"))}))
- .route("/assets/style.css",get(||async {([("content-type","text/css; charset=utf-8")],include_str!("../assets/style.css"))}))
- .route("/assets/favicon.svg",get(||async {([("content-type","image/svg+xml")],include_str!("../assets/favicon.svg"))}))
- .route("/assets/favicon-32.png",get(||async {([("content-type","image/png")],include_bytes!("../assets/favicon-32.png").as_slice())}))
- .route("/v1",get(||async {axum::Json(serde_json::json!({"service":"reseller","api_base":"/v1","keys":"/v1/keys","workspace":"/workspace/","admin":"/admin/"}))}))
- .fallback(dispatch).with_state(app)
- .layer(SetResponseHeaderLayer::overriding(axum::http::header::CACHE_CONTROL,HeaderValue::from_static("no-store")))
- .layer(SetResponseHeaderLayer::overriding(axum::http::header::X_CONTENT_TYPE_OPTIONS,HeaderValue::from_static("nosniff")))
- .layer(SetResponseHeaderLayer::overriding(axum::http::header::REFERRER_POLICY,HeaderValue::from_static("no-referrer")))
- .layer(SetResponseHeaderLayer::overriding(axum::http::header::CONTENT_SECURITY_POLICY,HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")));
-    if !origin.is_empty() {
-        let cors = CorsLayer::new()
-            .allow_methods(tower_http::cors::Any)
-            .allow_headers([
-                axum::http::header::AUTHORIZATION,
-                axum::http::header::CONTENT_TYPE,
-                "x-api-key".parse().unwrap(),
-                "x-admin-token".parse().unwrap(),
-            ])
-            .expose_headers([
-                "x-request-id".parse().unwrap(),
-                "x-key-prefix".parse().unwrap(),
-                "x-account-balance-usd".parse().unwrap(),
-                "x-model-fallback".parse().unwrap(),
-            ]);
-        router = router.layer(if origin == "*" {
-            cors.allow_origin(tower_http::cors::Any)
-        } else {
-            cors.allow_origin(origin.parse::<HeaderValue>().expect("validated CORS"))
-        });
+    let cors_origin = app.config().await.cors_origin.clone();
+    let mut router = Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(ready))
+        .route("/v1", get(discovery))
+        .route("/", get(page))
+        .route("/workspace", get(page))
+        .route("/workspace/", get(page))
+        .route("/admin", get(page))
+        .route("/admin/", get(page))
+        .route(
+            "/assets/app.js",
+            get(|| {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_bytes!("../assets/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/assets/style.css",
+            get(|| {
+                asset(
+                    "text/css; charset=utf-8",
+                    include_bytes!("../assets/style.css"),
+                )
+            }),
+        )
+        .route(
+            "/assets/favicon.svg",
+            get(|| asset("image/svg+xml", include_bytes!("../assets/favicon.svg"))),
+        )
+        .route(
+            "/assets/favicon-32.png",
+            get(|| asset("image/png", include_bytes!("../assets/favicon-32.png"))),
+        )
+        .fallback(dispatch)
+        .with_state(app);
+    for (name, value) in [
+        (header::CACHE_CONTROL, "no-store"),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+    ] {
+        router = router.layer(SetResponseHeaderLayer::overriding(
+            name,
+            HeaderValue::from_static(value),
+        ));
+    }
+    if !cors_origin.is_empty() {
+        router = router.layer(cors(&cors_origin));
     }
     router
 }
+
+fn cors(origin: &str) -> CorsLayer {
+    let origin = if origin == "*" {
+        AllowOrigin::from(Any)
+    } else {
+        AllowOrigin::exact(origin.parse().expect("cors_origin is validated at load"))
+    };
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods(Any)
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("x-admin-token"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("x-request-id"),
+            HeaderName::from_static("x-key-prefix"),
+            HeaderName::from_static("x-account-balance-usd"),
+            HeaderName::from_static("x-model-fallback"),
+        ])
+}
+
+async fn asset(content_type: &'static str, bytes: &'static [u8]) -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, content_type)], bytes)
+}
+
 async fn page() -> Html<&'static str> {
     Html(include_str!("../assets/index.html"))
 }
-async fn ready(State(app): State<App>) -> Result<axum::Json<serde_json::Value>> {
-    sqlx::query("SELECT 1").execute(&app.db).await?;
-    Ok(axum::Json(serde_json::json!({"status":"ready"})))
+
+async fn health() -> Json<serde_json::Value> {
+    Json(json!({"status": "ok", "service": "reseller"}))
 }
+
+async fn discovery() -> Json<serde_json::Value> {
+    Json(json!({
+        "service": "reseller",
+        "api_base": "/v1",
+        "keys": "/v1/keys",
+        "workspace": "/workspace/",
+        "admin": "/admin/",
+    }))
+}
+
+async fn ready(State(app): State<App>) -> Result<Json<serde_json::Value>> {
+    sqlx::query("SELECT 1").execute(&app.db).await?;
+    Ok(Json(json!({"status": "ready"})))
+}
+
+/// Client address. Behind a trusted proxy, `CF-Connecting-IP` wins, then the
+/// rightmost `X-Forwarded-For` entry — the one appended by the proxy itself;
+/// entries further left are client-controlled.
+fn client_ip(peer: SocketAddr, headers: &HeaderMap, trust_proxy: bool) -> IpAddr {
+    if !trust_proxy {
+        return peer.ip();
+    }
+    let parse = |v: &str| v.trim().parse::<IpAddr>().ok();
+    headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse)
+        .or_else(|| {
+            headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .last()
+                .and_then(parse)
+        })
+        .unwrap_or_else(|| peer.ip())
+}
+
 async fn dispatch(
     State(app): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response {
-    match route(app, peer, req).await {
-        Ok(r) => r,
-        Err(e) => e.into_response(),
-    }
+    route(app, peer, req)
+        .await
+        .unwrap_or_else(IntoResponse::into_response)
 }
+
 async fn route(app: App, peer: SocketAddr, req: Request<Body>) -> Result<Response> {
     let path = req.uri().path().to_owned();
-    let mut ip = peer.ip().to_string();
-    if app.config.read().await.trust_proxy
-        && let Some(v) = req
-            .headers()
-            .get("cf-connecting-ip")
-            .or_else(|| req.headers().get("x-forwarded-for"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
-    {
-        ip = v.to_string();
-    }
-    if path == "/webhooks/stripe" && req.method() == "POST" {
+    let method = req.method().clone();
+    let ip = client_ip(peer, req.headers(), app.config().await.trust_proxy).to_string();
+    let is_api = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
+
+    if path == "/webhooks/stripe" && method == Method::POST {
         let (parts, body) = req.into_parts();
-        let b = to_bytes(body, 1024 * 1024)
+        let body = to_bytes(body, WEBHOOK_BODY_LIMIT)
             .await
-            .map_err(|_| Error::new(413, "request_too_large", "Webhook too large"))?;
-        return Ok(
-            axum::Json(crate::payments::webhook(&app, &parts.headers, &b).await?).into_response(),
-        );
+            .map_err(|_| Error::too_large("Webhook too large"))?;
+        return Ok(Json(payments::webhook(&app, &parts.headers, &body).await?).into_response());
     }
-    if path == "/admin/api/events" && req.method() == "GET" {
-        crate::identity::admin(&app, req.headers()).await?;
-        let headers = req.headers().clone();
-        let stream = async_stream::stream! {
-         let mut interval=tokio::time::interval(Duration::from_secs(5));
-         loop {interval.tick().await;if crate::identity::admin(&app,&headers).await.is_err(){break;}
-          match crate::stats::overview(&app).await {Ok(v)=>yield Ok::<_,Infallible>(Event::default().event("snapshot").data(v.to_string())),Err(_)=>break}
-         }
-        };
-        return Ok(Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response());
+    if path == "/admin/api/events" && method == Method::GET {
+        return admin_events(app, req.headers().clone()).await;
     }
     if path.starts_with("/admin/api/") {
-        return Ok(axum::Json(crate::api::admin(&app, req, &ip).await?).into_response());
+        return Ok(Json(api::admin(&app, req, &ip).await?).into_response());
     }
     if ["/v1/keys", "/v1/account", "/v1/plans"]
-        .iter()
-        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+        .into_iter()
+        .any(is_api)
     {
-        return Ok(axum::Json(crate::api::customer(&app, req, &ip).await?).into_response());
+        return Ok(Json(api::customer(&app, req, &ip).await?).into_response());
     }
     if path.starts_with("/v1/") {
-        return crate::proxy::handle(app, req, ip).await;
+        return proxy::handle(app, req, ip).await;
     }
-    Err(Error::new(404, "not_found", "Endpoint not found"))
+    Err(Error::not_found("not_found", "Endpoint not found"))
+}
+
+/// Server-sent overview snapshots for the console. The token is re-checked
+/// on every tick so a rotated administrator token ends open streams.
+async fn admin_events(app: App, headers: HeaderMap) -> Result<Response> {
+    identity::admin(&app, &headers).await?;
+    let stream = async_stream::stream! {
+        let mut interval = tokio::time::interval(EVENTS_INTERVAL);
+        loop {
+            interval.tick().await;
+            if identity::admin(&app, &headers).await.is_err() {
+                break;
+            }
+            match stats::overview(&app).await {
+                Ok(snapshot) => {
+                    yield Ok::<_, Infallible>(Event::default().event("snapshot").data(snapshot.to_string()));
+                }
+                Err(_) => break,
+            }
+        }
+    };
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn client_ip_ignores_spoofable_forwarded_entries() {
+        let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let spoofed = headers(&[("x-forwarded-for", "1.1.1.1, 203.0.113.9")]);
+        assert_eq!(client_ip(peer, &spoofed, false), peer.ip());
+        assert_eq!(
+            client_ip(peer, &spoofed, true),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        let cloudflare = headers(&[
+            ("cf-connecting-ip", "198.51.100.4"),
+            ("x-forwarded-for", "1.1.1.1"),
+        ]);
+        assert_eq!(
+            client_ip(peer, &cloudflare, true),
+            "198.51.100.4".parse::<IpAddr>().unwrap()
+        );
+        let garbage = headers(&[("x-forwarded-for", "not-an-ip")]);
+        assert_eq!(client_ip(peer, &garbage, true), peer.ip());
+    }
 }

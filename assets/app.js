@@ -7,16 +7,33 @@ const workspace = location.pathname.startsWith('/workspace');
 const store = admin ? 'reseller.admin' : 'reseller.customer';
 let token = sessionStorage.getItem(store) || '';
 let tab = 'overview';
-const fragment = new URLSearchParams(location.hash.slice(1));
-if (workspace && fragment.has('token')) {
-  token = fragment.get('token');
-  sessionStorage.setItem(store, token);
-  history.replaceState(null, '', location.pathname + location.search);
+
+// The operator-issued workspace link carries the dashboard token as `#token=...`.
+// Move it into sessionStorage and strip it from the URL right away so it does not
+// linger in history, screenshots or referrers.
+if (workspace) {
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  if (fragment.has('token')) {
+    const fromLink = fragment.get('token').trim();
+    if (fromLink) {
+      token = fromLink;
+      sessionStorage.setItem(store, token);
+    }
+    history.replaceState(null, '', location.pathname + location.search);
+  }
 }
 
 /* Helpers -------------------------------------------------------------------- */
-const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const usd = v => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 6 }).format(Number(v || 0));
+// Every server- or user-supplied value interpolated into an HTML string must go
+// through esc() (text and quoted attribute values). Never build `style=` or
+// `on*=` attributes: the CSP forbids them.
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => HTML_ESCAPES[c]);
+const usdFormat = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 6 });
+const usd = v => usdFormat.format(Number(v || 0));
+// Money arrives as decimal strings such as "0" or "0.000000".
+const isPositive = v => Number(v) > 0;
+const toUnix = local => local ? Math.floor(new Date(local).getTime() / 1000) : null;
 const date = v => v ? new Date(v * 1000).toLocaleString(undefined, { hour12: false }) : 'Never';
 const localDateTime = v => {
   if (!v) return '';
@@ -27,8 +44,8 @@ const localDateTime = v => {
 const count = v => Number(v || 0).toLocaleString();
 const planRate = p => Number(p.price_usd) / Number(p.duration_days || 1);
 const bestCode = plans => plans.slice().sort((a, b) => planRate(a) - planRate(b))[0]?.code;
-const TONES = { active:'ok', paid:'ok', available:'ok', completed:'ok', blocked:'warn', suspended:'warn', expired:'warn', pending:'info', redeemed:'info', revoked:'danger', failed:'danger', cancelled:'danger' };
-const pill = (value, t) => `<span class="pill tone-${t || TONES[String(value).toLowerCase()] || 'muted'}">${esc(value)}</span>`;
+const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', pending: 'info', redeemed: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger' }));
+const pill = (value, tone) => `<span class="pill tone-${tone || TONES.get(String(value).toLowerCase()) || 'muted'}">${esc(value)}</span>`;
 const requestPill = r => r.status >= 400 ? pill(r.status, 'danger') : r.status ? pill(r.status, 'ok') : pill('In progress', 'info');
 const KEY_NAMES = [
   'My application', 'Production', 'Staging', 'Development', 'Mobile app',
@@ -38,18 +55,30 @@ const KEY_NAMES = [
 ];
 const suggestedName = () => KEY_NAMES[Math.floor(Math.random() * KEY_NAMES.length)];
 
+function signOut() {
+  // Stop in-flight work and drop cached data so nothing from this session leaks
+  // into the next one or renders into a view that no longer exists.
+  loadController?.abort();
+  generation++;
+  window.onhashchange = null;
+  document.querySelectorAll('dialog').forEach(d => d.close());
+  sessionStorage.removeItem(store);
+  token = '';
+  tab = 'overview';
+  requestIndex.clear();
+  requestModelCache = { values: [], expiresAt: 0 };
+  for (const state of Object.values(listStates)) Object.assign(state, DEFAULT_LIST_STATE);
+  history.replaceState(null, '', location.pathname);
+  renderHeader();
+  if (workspace || admin) login();
+}
+
 function renderHeader() {
   const el = document.querySelector('#header-actions');
   if (!el) return;
   if (token) {
-    el.innerHTML = '<button id="header-logout" class="ghost">Sign out</button>';
-    el.querySelector('#header-logout').onclick = () => {
-      sessionStorage.removeItem(store);
-      token = '';
-      history.replaceState(null, '', location.pathname);
-      renderHeader();
-      if (workspace || admin) login();
-    };
+    el.innerHTML = '<button type="button" id="header-logout" class="ghost">Sign out</button>';
+    el.querySelector('#header-logout').onclick = signOut;
   } else {
     el.innerHTML = '<a class="button" href="/workspace/">Workspace →</a>';
   }
@@ -99,8 +128,10 @@ async function api(path, method = 'GET', data, options = {}) {
   if (token) headers[admin ? 'x-admin-token' : 'authorization'] = admin ? token : `Bearer ${token}`;
   if (data !== undefined) headers['content-type'] = 'application/json';
   const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data), signal: options.signal });
-  const v = await r.json();
-  if (!r.ok) throw new Error(v.error?.message || `Request failed (${r.status})`);
+  // Proxies and crashes can return non-JSON bodies; surface the status instead of a parse error.
+  const v = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(v?.error?.message || `Request failed (${r.status})`);
+  if (v === null) throw new Error(`Unexpected response from server (${r.status})`);
   return v;
 }
 const endpoint = name => admin ? `/admin/api/${name}` : `/v1/${name}`;
@@ -134,7 +165,7 @@ function loading(text = 'Loading…') {
 function modal(title, content, setup, className) {
   const d = document.createElement('dialog');
   if (className) d.classList.add(className);
-  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button data-close aria-label="Close dialog">✕</button></div><div class="dialog-content">${content}</div>`;
+  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button type="button" data-close aria-label="Close dialog">✕</button></div><div class="dialog-content">${content}</div>`;
   document.body.append(d);
   d.querySelector('[data-close]').onclick = () => d.close();
   d.addEventListener('close', () => d.remove());
@@ -143,10 +174,11 @@ function modal(title, content, setup, className) {
   return d;
 }
 
+const DEFAULT_LIST_STATE = { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 };
 const listStates = {
-  keys: { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 },
-  accounts: { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 },
-  payments: { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 },
+  keys: { ...DEFAULT_LIST_STATE },
+  accounts: { ...DEFAULT_LIST_STATE },
+  payments: { ...DEFAULT_LIST_STATE },
 };
 const listParams = state => {
   const params = new URLSearchParams({ limit: state.limit, offset: state.offset, sort: state.sort, dir: state.dir });
@@ -192,8 +224,8 @@ function confirmModal(title, message, confirmLabel = 'Confirm', danger = false) 
     const d = modal(title, `
       <p class="muted">${esc(message)}</p>
       <div class="actions section">
-        <button data-cancel class="ghost">Cancel</button>
-        <button data-confirm class="${danger ? 'danger-solid' : 'primary'}">${esc(confirmLabel)}</button>
+        <button type="button" data-cancel class="ghost">Cancel</button>
+        <button type="button" data-confirm class="${danger ? 'danger-solid' : 'primary'}">${esc(confirmLabel)}</button>
       </div>`, el => {
       el.querySelector('[data-cancel]').onclick = () => d.close();
       el.querySelector('[data-confirm]').onclick = () => { d.close(); resolve(true); };
@@ -238,16 +270,16 @@ function secrets(v) {
     <div class="cred-row">
       <span class="cred-label">API key</span>
       <code class="cred-value secret" title="${esc(v.key)}">${esc(v.key)}</code>
-      <button class="small" data-copy="key">Copy</button>
+      <button type="button" class="small" data-copy="key">Copy</button>
     </div>
     <div class="cred-row">
       <span class="cred-label" title="Dashboard token">Dashboard</span>
       <code class="cred-value" title="${esc(v.dashboard_token)}">${esc(v.dashboard_token)}</code>
-      <button class="small" data-copy="token">Copy</button>
+      <button type="button" class="small" data-copy="token">Copy</button>
     </div>
     <div class="actions section">
-      <button data-copy-all class="primary">Copy both</button>
-      ${admin ? '' : '<button data-open class="ghost">Open workspace →</button>'}
+      <button type="button" data-copy-all class="primary">Copy both</button>
+      ${admin ? '' : '<button type="button" data-open class="ghost">Open workspace →</button>'}
     </div>`, d => {
     const wire = (selector, text, label) => {
       const button = d.querySelector(selector);
@@ -297,15 +329,19 @@ function manageAccount(aid) {
   let keyOffset = 0;
   const keyLimit = 10;
   let hasPlans;
+  let refreshSeq = 0;
   const refresh = async () => {
+    const seq = ++refreshSeq;
     try {
       const [account, planData] = await Promise.all([
         api(endpoint(`accounts/${aid}?key_limit=${keyLimit}&key_offset=${keyOffset}`)),
         hasPlans === undefined ? api(endpoint('plans')) : Promise.resolve(null),
       ]);
+      if (seq !== refreshSeq || !body.isConnected) return; // newer refresh or dialog closed
       if (planData) hasPlans = planData.plans.some(p => p.active);
       render(account, hasPlans);
     } catch (e) {
+      if (seq !== refreshSeq || !body.isConnected) return;
       body.innerHTML = `<div class="card error">${esc(e.message)}</div>`;
     }
   };
@@ -327,7 +363,7 @@ function manageAccount(aid) {
       </div>
       <div class="account-summary">
         <span><strong>${esc(usd(a.balance_usd))}</strong> balance</span>
-        ${a.debt_usd !== '0' ? `<span class="warn"><strong>${esc(usd(a.debt_usd))}</strong> debt</span>` : ''}
+        ${isPositive(a.debt_usd) ? `<span class="warn"><strong>${esc(usd(a.debt_usd))}</strong> debt</span>` : ''}
         <span><strong>${count(keyTotal)}</strong> keys</span>
         <span><strong>${sub ? esc(sub.plan_code) : '—'}</strong> plan${sub ? ` · expires ${esc(date(sub.expires_at))}` : ''}</span>
       </div>
@@ -340,11 +376,11 @@ function manageAccount(aid) {
       </div>
       ${a.note ? `<p class="account-note">Note: ${esc(a.note)}</p>` : ''}
       <div class="actions account-actions">
-        <button class="primary small" data-credit>Add credit</button>
-        ${hasPlans ? '<button class="small" data-sub>Grant plan</button>' : ''}
-        <button class="small" data-key>Create key</button>
-        <button class="small" data-edit>Edit account</button>
-        ${a.status === 'active' ? '<button class="danger small account-status-action" data-suspend>Suspend account</button>' : '<button class="small account-status-action" data-activate>Reactivate account</button>'}
+        <button type="button" class="primary small" data-credit>Add credit</button>
+        ${hasPlans ? '<button type="button" class="small" data-sub>Grant plan</button>' : ''}
+        <button type="button" class="small" data-key>Create key</button>
+        <button type="button" class="small" data-edit>Edit account</button>
+        ${a.status === 'active' ? '<button type="button" class="danger small account-status-action" data-suspend>Suspend account</button>' : '<button type="button" class="small account-status-action" data-activate>Reactivate account</button>'}
       </div>
       <div class="account-lists">
         <section class="account-keys">
@@ -352,7 +388,7 @@ function manageAccount(aid) {
           ${keys.length
             ? `<ul class="mini-list">${keys.map(k => `<li>${pill(k.status)}<strong>${esc(k.name)}</strong><code>${esc(k.key_prefix)}…</code><span class="hint">${esc(date(k.last_used_at))}</span></li>`).join('')}</ul>`
             : '<p class="hint">No keys.</p>'}
-          ${keyTotal > keyLimit ? `<div class="mini-pager"><span class="hint">${count(keyOffset + 1)}–${count(Math.min(keyOffset + keys.length, keyTotal))} of ${count(keyTotal)}</span><div class="actions"><button class="ghost small" data-key-prev${keyOffset === 0 ? ' disabled' : ''}>← Previous</button><button class="ghost small" data-key-next${keyOffset + keys.length >= keyTotal ? ' disabled' : ''}>Next →</button></div></div>` : ''}
+          ${keyTotal > keyLimit ? `<div class="mini-pager"><span class="hint">${count(keyOffset + 1)}–${count(Math.min(keyOffset + keys.length, keyTotal))} of ${count(keyTotal)}</span><div class="actions"><button type="button" class="ghost small" data-key-prev${keyOffset === 0 ? ' disabled' : ''}>← Previous</button><button type="button" class="ghost small" data-key-next${keyOffset + keys.length >= keyTotal ? ' disabled' : ''}>Next →</button></div></div>` : ''}
         </section>
         <section>
           <h3>Credit lots · ${count(credits.length)}</h3>
@@ -409,7 +445,7 @@ function creditForm(aid, done) {
       <div class="actions"><button class="primary" type="submit">Add credit</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     const payload = { amount_usd: b.amount_usd, source: b.source, note: b.note };
-    if (b.expires_at) payload.expires_at = Math.floor(new Date(b.expires_at).getTime() / 1000);
+    if (b.expires_at) payload.expires_at = toUnix(b.expires_at);
     await api(endpoint(`accounts/${aid}/credits`), 'POST', payload);
     d.close();
     notice('Credit added');
@@ -500,7 +536,7 @@ async function landing() {
         <h1>Intelligence,<br>on your terms<span class="accent">.</span></h1>
         <p>Language, speech, and audio through one familiar API. Create a key, connect your app, and stay in control of every request.</p>
         <div class="actions section">
-          <button class="primary" id="create">Get an API key ↗</button>
+          <button type="button" class="primary" id="create">Get an API key ↗</button>
           <a class="button ghost" href="/workspace/">Open workspace</a>
         </div>
         <p class="section"><small>OpenAI-compatible · Usage-based billing · Live statistics</small></p>
@@ -579,7 +615,7 @@ function login() {
             <div class="label">New here?</div>
             <div class="hint">Create an account and get evaluation credit — no card required.</div>
           </div>
-          <button id="create" class="button ghost">Create a new account →</button>
+          <button type="button" id="create" class="button ghost">Create a new account →</button>
         </div>`}
       </section>
     </div>`;
@@ -605,16 +641,35 @@ async function shell() {
   else history.replaceState(null, '', `#${tab}`);
   main.innerHTML = `
     <div class="tabs" role="tablist">
-      ${tabs.map(t => `<button role="tab" data-tab="${t}" aria-selected="${t === tab}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}
+      ${tabs.map(t => `<button type="button" role="tab" id="tab-${t}" data-tab="${t}" aria-controls="content" aria-selected="${t === tab}" tabindex="${t === tab ? 0 : -1}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}
     </div>
-    <section id="content" aria-live="polite">${loading()}</section>`;
-  const select = () => main.querySelectorAll('[data-tab]').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === tab)));
-  main.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => {
-    if (tab === b.dataset.tab) return;
-    tab = b.dataset.tab;
-    location.hash = tab;
-    select();
-    load();
+    <section id="content" role="tabpanel">${loading()}</section>`;
+  const tabButtons = [...main.querySelectorAll('[data-tab]')];
+  const content = main.querySelector('#content');
+  const select = () => tabButtons.forEach(t => {
+    const selected = t.dataset.tab === tab;
+    t.setAttribute('aria-selected', String(selected));
+    t.tabIndex = selected ? 0 : -1;
+    if (selected) content.setAttribute('aria-labelledby', t.id);
+  });
+  select();
+  tabButtons.forEach((b, i) => {
+    b.onclick = () => {
+      if (tab === b.dataset.tab) return;
+      tab = b.dataset.tab;
+      location.hash = tab;
+      select();
+      load();
+    };
+    // Arrow/Home/End keys move between tabs (roving tabindex pattern).
+    b.onkeydown = e => {
+      const target = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabButtons.length - 1 }[e.key];
+      if (target === undefined) return;
+      e.preventDefault();
+      const next = tabButtons[(target + tabButtons.length) % tabButtons.length];
+      next.focus();
+      next.click();
+    };
   });
   window.onhashchange = () => {
     const next = location.hash.slice(1);
@@ -635,6 +690,8 @@ async function load() {
   const controller = new AbortController();
   loadController = controller;
   const content = document.querySelector('#content');
+  if (!content) return; // signed out or navigated away
+  content.setAttribute('aria-busy', 'true');
   content.innerHTML = loading();
   try {
     const html = await views[tab](controller.signal);
@@ -642,11 +699,11 @@ async function load() {
     content.innerHTML = html;
     wire(content);
   } catch (e) {
-    if (e.name === 'AbortError') return;
-    if (gen === generation) {
-      content.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p><div class="actions"><button data-refresh class="ghost">Try again</button></div></div>`;
-      wire(content);
-    }
+    if (e.name === 'AbortError' || gen !== generation) return;
+    content.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p><div class="actions"><button type="button" data-refresh class="ghost">Try again</button></div></div>`;
+    wire(content);
+  } finally {
+    if (gen === generation) content.removeAttribute('aria-busy');
   }
 }
 
@@ -732,7 +789,7 @@ const requestTable = rows => {
     ['Tokens', r => `<span class="num">${count(r.tokens)}</span>`],
     ['Billed', r => `<span class="num">${esc(usd(r.billed_usd))}</span>`],
     ['Latency', r => `<span class="num">${count(r.duration_ms)} ms</span>`],
-    ['', r => `<button class="small" data-request-details="${esc(r.id)}">View</button>`]
+    ['', r => `<button type="button" class="small" data-request-details="${esc(r.id)}">View</button>`]
   ], rows);
 };
 
@@ -785,7 +842,7 @@ const views = {
           ${metric('Active keys', count(v.active_keys))}
         </div>
         <div class="card">
-          <div class="card-head"><h3>Usage at a glance</h3><button data-refresh class="ghost small">Refresh</button></div>
+          <div class="card-head"><h3>Usage at a glance</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
           ${chart(u.series)}
         </div>
         <div class="stats">
@@ -801,9 +858,9 @@ const views = {
         <div>
           <div class="label">Available balance</div>
           <div class="metric">${esc(usd(v.account.balance_usd))}</div>
-          <div class="hint">${v.account.debt_usd !== '0' ? `Outstanding debt ${esc(usd(v.account.debt_usd))} settles from the next top-up.` : 'Ready to spend on any key on this account.'}</div>
+          <div class="hint">${isPositive(v.account.debt_usd) ? `Outstanding debt ${esc(usd(v.account.debt_usd))} settles from the next top-up.` : 'Ready to spend on any key on this account.'}</div>
         </div>
-        <div class="actions"><button class="primary" data-create>Create key</button></div>
+        <div class="actions"><button type="button" class="primary" data-create>Create key</button></div>
       </div>
       <div class="stats">
         ${metric('Account status', v.account.status)}
@@ -811,11 +868,11 @@ const views = {
         ${metric('Credit lots', count(v.credits.length), 'Soonest-expiring credit is spent first')}
       </div>
       <div class="card">
-        <div class="card-head"><h3>Your usage</h3><button data-refresh class="ghost small">Refresh</button></div>
+        <div class="card-head"><h3>Your usage</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
         ${chart(u.series)}
       </div>
       <div class="card">
-        <div class="card-head"><h3>Recent requests</h3><button data-refresh class="ghost small">Refresh</button></div>
+        <div class="card-head"><h3>Recent requests</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
         ${requestTable(r.requests)}
       </div>`;
   },
@@ -843,10 +900,10 @@ const views = {
       ['Used · 30d', r => `<span class="num">${esc(usd(used(r)))}</span>`],
       ['Last used', r => esc(date(r.last_used_at))],
       ['Actions', r => `<div class="actions">
-        <button data-edit-key="${r.id}" data-key-name="${esc(r.name)}">Edit</button>
-        <button data-rotate="${r.id}"${r.status !== 'active' ? ' disabled' : ''}>Rotate</button>
-        ${admin ? `<button class="danger" data-block="${r.id}"${r.status !== 'active' ? ' disabled' : ''}>Block</button>` : ''}
-        ${admin ? `<button class="danger" data-revoke="${r.id}"${r.status === 'revoked' ? ' disabled' : ''}>Revoke</button>` : ''}
+        <button type="button" data-edit-key="${esc(r.id)}" data-key-name="${esc(r.name)}">Edit</button>
+        <button type="button" data-rotate="${esc(r.id)}"${r.status !== 'active' ? ' disabled' : ''}>Rotate</button>
+        ${admin ? `<button type="button" class="danger" data-block="${esc(r.id)}"${r.status !== 'active' ? ' disabled' : ''}>Block</button>` : ''}
+        ${admin ? `<button type="button" class="danger" data-revoke="${esc(r.id)}"${r.status === 'revoked' ? ' disabled' : ''}>Revoke</button>` : ''}
       </div>`]
     );
     const toolbar = listToolbar('keys', state, {
@@ -856,7 +913,7 @@ const views = {
       groups: [['status', 'Group by status'], ...(admin ? [['account', 'Group by account']] : [])],
     });
     const group = state.group === 'status' ? { value: r => r.status } : state.group === 'account' ? { value: r => r.account_id } : null;
-    return `<div class="card-head"><div><h3>API keys</h3><span class="muted">${count(v.total)} total</span></div>${admin ? '' : '<button class="primary" data-create>+ Create key</button>'}</div>
+    return `<div class="card-head"><div><h3>API keys</h3><span class="muted">${count(v.total)} total</span></div>${admin ? '' : '<button type="button" class="primary" data-create>+ Create key</button>'}</div>
       ${toolbar}${table(columns, v.keys, group)}${listPager('keys', state, Number(v.total || 0), v.keys.length)}`;
   },
   async accounts(signal) {
@@ -878,13 +935,13 @@ const views = {
         ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : '<span class="muted">—</span>'],
         ['Status', r => pill(r.status)],
         ['Created', r => esc(date(r.created_at))],
-        ['Actions', r => `<button data-account="${r.id}">Manage</button>`]
+        ['Actions', r => `<button type="button" data-account="${esc(r.id)}">Manage</button>`]
       ], v.accounts, group)}${listPager('accounts', state, Number(v.total || 0), v.accounts.length)}`;
   },
   async plans(signal) {
     const v = await get(endpoint('plans'), signal);
     const best = bestCode(v.plans.filter(p => p.active));
-    return `<div class="card-head"><h3>Plans</h3><button class="primary" data-plan>+ Create plan</button></div>
+    return `<div class="card-head"><h3>Plans</h3><button type="button" class="primary" data-plan>+ Create plan</button></div>
       <p class="muted">Deactivate a plan to hide it from customers. Plans referenced by subscriptions, payments, or redeem codes cannot be deleted, only retired.</p>
       ${table([
         ['Code', r => `<code>${esc(r.code)}</code>`],
@@ -894,8 +951,8 @@ const views = {
         ['Days', r => count(r.duration_days)],
         ['Status', r => r.active ? pill(r.code === best ? 'best value' : 'active', 'ok') : pill('inactive', 'muted')],
         ['Actions', r => `<div class="actions">
-          <button data-edit-plan="${esc(r.code)}" data-plan-name="${esc(r.name)}" data-plan-price="${esc(r.price_usd)}" data-plan-credit="${esc(r.credit_usd)}" data-plan-days="${r.duration_days}" data-plan-active="${r.active}" data-plan-description="${esc(r.description)}">Edit</button>
-          <button class="danger" data-delete-plan="${esc(r.code)}">Delete</button>
+          <button type="button" data-edit-plan="${esc(r.code)}" data-plan-name="${esc(r.name)}" data-plan-price="${esc(r.price_usd)}" data-plan-credit="${esc(r.credit_usd)}" data-plan-days="${esc(r.duration_days)}" data-plan-active="${Boolean(r.active)}" data-plan-description="${esc(r.description)}">Edit</button>
+          <button type="button" class="danger" data-delete-plan="${esc(r.code)}">Delete</button>
         </div>`]
       ], v.plans)}`;
   },
@@ -903,7 +960,7 @@ const views = {
     const v = await get(endpoint('codes'), signal);
     const now = Date.now() / 1000;
     const state = r => r.redeemed_at ? pill('redeemed', 'info') : r.expires_at && r.expires_at < now ? pill('expired', 'warn') : pill('available', 'ok');
-    return `<div class="card-head"><h3>Prepaid redeem codes</h3><button class="primary" data-code>+ Issue code</button></div>
+    return `<div class="card-head"><h3>Prepaid redeem codes</h3><button type="button" class="primary" data-code>+ Issue code</button></div>
       <p class="muted">Codes are shown once and stored hashed. Unredeemed codes can be edited or cancelled; redeemed codes are kept as audit records.</p>
       ${table([
         ['Code prefix', r => `<code>${esc(r.code_prefix)}…</code>`],
@@ -913,8 +970,8 @@ const views = {
         ['Redeemed', r => esc(date(r.redeemed_at))],
         ['Expires', r => esc(date(r.expires_at))],
         ['Actions', r => `<div class="actions">
-          <button data-edit-code="${r.id}" data-code-expires="${r.expires_at ?? ''}" data-code-note="${esc(r.note)}"${r.redeemed_at ? ' disabled' : ''}>Edit</button>
-          <button class="danger" data-delete-code="${r.id}"${r.redeemed_at ? ' disabled' : ''}>Delete</button>
+          <button type="button" data-edit-code="${esc(r.id)}" data-code-expires="${esc(r.expires_at ?? '')}" data-code-note="${esc(r.note)}"${r.redeemed_at ? ' disabled' : ''}>Edit</button>
+          <button type="button" class="danger" data-delete-code="${esc(r.id)}"${r.redeemed_at ? ' disabled' : ''}>Delete</button>
         </div>`]
       ], v.codes)}`;
   },
@@ -941,19 +998,18 @@ const views = {
       ], v.payments, group)}${listPager('payments', state, Number(v.total || 0), v.payments.length)}`;
   },
   async requests(signal) {
-    let models = requestModelCache.expiresAt > Date.now() ? requestModelCache.values : [];
-    if (admin) {
-      if (!requestModelCache.expiresAt || requestModelCache.expiresAt <= Date.now()) {
-        try {
-          models = (await get(endpoint('requests/groups?field=model&limit=200'), signal)).groups.map(g => g.label).filter(Boolean);
-          requestModelCache = { values: models, expiresAt: Date.now() + 60_000 };
-        } catch (e) {
-          if (e.name === 'AbortError') throw e;
-          models = [];
-        }
+    // Model suggestions for the search box are admin-only and cached for a minute.
+    if (admin && requestModelCache.expiresAt <= Date.now()) {
+      try {
+        const groups = (await get(endpoint('requests/groups?field=model&limit=200'), signal)).groups;
+        requestModelCache = { values: groups.map(g => g.label).filter(Boolean), expiresAt: Date.now() + 60_000 };
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        // Suggestions are optional; the filter form still works without them.
       }
     }
-    return `<div class="card-head"><h3>Request history</h3><button data-refresh class="ghost small">Refresh</button></div>
+    const models = admin ? requestModelCache.values : [];
+    return `<div class="card-head"><h3>Request history</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
       <form id="request-filter" class="request-filters${admin ? ' admin' : ''}">
         <input class="request-search" name="q" type="search" list="request-models" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID…">
         <datalist id="request-models">${models.map(m => `<option value="${esc(m)}"></option>`).join('')}</datalist>
@@ -1000,9 +1056,9 @@ const views = {
     const now = Date.now() / 1000;
     const best = bestCode(p.plans);
     return `<section class="billing-catalog">
-          <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.</p></div><button class="ghost" data-redeem>Have a credit code?</button></div>
+          <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.</p></div><button type="button" class="ghost" data-redeem>Have a credit code?</button></div>
           <div class="plans plan-catalog">${p.plans.length
-            ? p.plans.map(plan => planCard(plan, best, `<button class="primary" data-buy="${esc(plan.code)}">Pay with Stripe ↗</button>`)).join('')
+            ? p.plans.map(plan => planCard(plan, best, `<button type="button" class="primary" data-buy="${esc(plan.code)}">Pay with Stripe ↗</button>`)).join('')
             : emptyState('No plans available', 'Ask the operator for a redeem code instead.')}</div>
       </section>
       <h3 class="section">Your credit ledger</h3>
@@ -1041,7 +1097,7 @@ async function editKeyForm(button) {
       Object.assign(payload, {
         status: b.status,
         markup_pct: b.markup_pct || null,
-        expires_at: b.expires_at ? Math.floor(new Date(b.expires_at).getTime() / 1000) : null,
+        expires_at: toUnix(b.expires_at),
         limits: {
           rpm: b.rpm ? Number(b.rpm) : null,
           requests: bounded('requests', 24),
@@ -1072,7 +1128,7 @@ function planForm(initial = {}) {
 function showIssuedCodes(v) {
   const codes = v.codes || [v.code];
   const list = codes.join('\n');
-  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'} — shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button class="primary" data-copy-codes>Copy ${codes.length === 1 ? 'code' : 'all'}</button></div>`, d => {
+  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'} — shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button type="button" class="primary" data-copy-codes>Copy ${codes.length === 1 ? 'code' : 'all'}</button></div>`, d => {
     const button = d.querySelector('[data-copy-codes]');
     button.onclick = () => copyText(list, 'Redeem codes').then(ok => ok && flashCopied(button));
   }, 'wide');
@@ -1089,7 +1145,7 @@ async function codeForm() {
       credit.required = !plan.value;
     };
     bindForm(form, async b => {
-      const item = { note: b.note, expires_at: b.expires_at ? Math.floor(new Date(b.expires_at).getTime() / 1000) : null };
+      const item = { note: b.note, expires_at: toUnix(b.expires_at) };
       if (b.plan_code) item.plan_code = b.plan_code;
       else item.credit_usd = b.credit_usd;
       const amount = Number(b.count);
@@ -1103,7 +1159,7 @@ async function codeForm() {
 
 function editCodeForm(button) {
   modal('Edit redeem code', `<form><label for="edit-code-expiry">Expires (optional)</label><input id="edit-code-expiry" name="expires_at" type="datetime-local" value="${esc(localDateTime(button.dataset.codeExpires))}"><label for="edit-code-note">Internal note</label><input id="edit-code-note" name="note" value="${esc(button.dataset.codeNote || '')}" maxlength="4096"><div class="actions"><button class="primary" type="submit">Save changes</button></div></form>`, d => bindForm(d.querySelector('form'), async b => {
-    await api(endpoint(`codes/${button.dataset.editCode}`), 'PATCH', { expires_at: b.expires_at ? Math.floor(new Date(b.expires_at).getTime() / 1000) : null, note: b.note });
+    await api(endpoint(`codes/${button.dataset.editCode}`), 'PATCH', { expires_at: toUnix(b.expires_at), note: b.note });
     d.close();
     notice('Code updated');
     await load();
@@ -1133,7 +1189,7 @@ function wire(root) {
     });
   });
   root.querySelectorAll('[data-list-clear]').forEach(button => button.onclick = () => {
-    Object.assign(listStates[button.dataset.listClear], { q: '', status: '', sort: 'created', dir: 'desc', group: '', offset: 0 });
+    Object.assign(listStates[button.dataset.listClear], { ...DEFAULT_LIST_STATE, limit: listStates[button.dataset.listClear].limit });
     load();
   });
   root.querySelectorAll('[data-list-size]').forEach(select => select.onchange = () => {
@@ -1232,15 +1288,17 @@ function wire(root) {
     let limit = 20;
     let filters = {};
     let sequence = 0;
+    // Tied to this view's load(): aborted when the user switches tabs or signs out.
+    const signal = loadController?.signal;
     const refresh = async () => {
       const seq = ++sequence;
       const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
       for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value);
       try {
-        const v = await api(endpoint(admin ? 'requests' : 'account/requests') + `?${params}`);
-        if (seq !== sequence) return;
-        if (!root.isConnected) return;
-        root.querySelector('#request-results').innerHTML = requestTable(v.requests);
+        const v = await get(endpoint(admin ? 'requests' : 'account/requests') + `?${params}`, signal);
+        const results = root.querySelector('#request-results');
+        if (seq !== sequence || !results || !form.isConnected) return;
+        results.innerHTML = requestTable(v.requests);
         const total = Number(v.total || 0);
         const shown = v.requests.length;
         root.querySelector('#request-range').textContent = total === 0
@@ -1249,7 +1307,7 @@ function wire(root) {
         root.querySelector('[data-prev]').disabled = offset === 0;
         root.querySelector('[data-next]').disabled = offset + shown >= total;
       } catch (e) {
-        notice(e.message, true);
+        if (e.name !== 'AbortError' && seq === sequence) notice(e.message, true);
       }
     };
     bindForm(form, async b => {

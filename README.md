@@ -100,7 +100,7 @@ Build locally with `docker build -t reseller:local .`. The release binary is a s
 
 Always-runtime options: `HOST`, `PORT`, `DB_FILE`, `RESELLER_CONFIG`, `RUST_LOG`, and corresponding CLI flags. The application does not automatically read `.env` files.
 
-Supported bootstrap variables:
+`ADMIN_TOKEN` and `KEY_PEPPER` must be at least 24 characters; leave them unset to have secure values generated. Supported bootstrap variables:
 
 ```text
 OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL / OPENAI_MODEL_FALLBACKS
@@ -112,7 +112,7 @@ PUBLIC_URL / STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET
 
 Fallback lists are comma-separated. Each upstream is configured independently. Set TTS/STT keys if you use audio routes. `public_url` controls dashboard links and payment redirects; set it to the externally reachable origin.
 
-Settings include `model_policy` and `voice_policy` (`default`, `force`, `passthrough`), body limits, timeout, CORS, key-creation limits, default per-key limits, retention, prices, and payment secrets. CORS changes take effect after restart; other settings apply to new requests. Secrets are redacted in API responses; blank secret fields preserve the current value. Changing the key pepper invalidates all customer credentials and unredeemed codes.
+Price-table model names match case-insensitively. `ip_overrides` maps an IP address to its monthly key allowance (`0` = unlimited). Settings include `model_policy` and `voice_policy` (`default`, `force`, `passthrough`), body limits, timeout, CORS, key-creation limits, default per-key limits, retention, prices, and payment secrets. CORS changes take effect after restart; other settings apply to new requests. Secrets are redacted in API responses; blank secret fields preserve the current value. Changing the key pepper invalidates all customer credentials and unredeemed codes.
 
 Use decimal **strings** for prices, percentages, and spend-limit amounts:
 
@@ -159,7 +159,7 @@ Routing replaces `/v1` with the configured base path and preserves query strings
 - `/v1/audio/transcriptions`, `/v1/audio/translations` → STT
 - All other `/v1/*` proxy routes → LLM
 
-JSON requests apply model/voice policies; chat streams request usage reporting. Multipart uploads stream with bounded size while the `model` form field alone is rewritten by the policy, so with `force` (or `default` plus a configured model) the request is admitted and metered against the configured model rather than an unknown one. WebSocket model checks use the query-string model or configured default.
+JSON requests apply model/voice policies; chat streams request usage reporting. Multipart uploads stream with bounded size while the `model` form field alone is rewritten by the policy, so with `force` (or `default` plus a configured model) the request is admitted and metered against the configured model rather than an unknown one. WebSocket (realtime) connections apply the same policy to the `?model=` query parameter before admission and forwarding.
 
 Fallbacks apply only to JSON requests using the configured model, and only before forwarding response headers. Availability errors (`400/402/404/408/429/5xx`) and connection/timeouts can trigger the next model. Fallback models must also be allowed by the key. Client-selected models are not replaced by fallbacks, and multipart uploads get a single forward attempt because the payload cannot be replayed. Redirects are not followed. Hop-by-hop headers and local credentials are removed before forwarding.
 
@@ -175,11 +175,11 @@ Responses include `X-Request-Id`, `X-Key-Prefix`, `X-Account-Balance-USD` (pre-r
 
 Balance and spend/token checks are soft preflight limits: concurrent in-flight requests can overshoot. Uncovered spend becomes account debt, and future top-ups settle that debt before becoming spendable credit. Request admission and RPM checks are serialized in SQLite; hourly usage windows include the entire boundary hour. A completed admitted request counts even if the upstream failed. Model usage is aggregated for up to 367 days; detailed request retention is independently bounded.
 
-SSE inspection works across chunk boundaries with bounded memory. JSON usage inspection is capped at 4 MiB. WAV and 24 kHz mono 16-bit PCM durations can be estimated. **If a provider returns no usage and no supported audio duration, cost is zero**; configure providers that report usage for reliable billing. WebSockets are authenticated, limited, and logged but **not token/cost metered**, matching the source project. Connections are bounded by `upstream_timeout_seconds`. Upstream costs for failed fallback attempts cannot be recovered unless the provider reports them in the final response.
+SSE inspection works across chunk boundaries with bounded memory. JSON usage inspection is capped at 4 MiB. WAV and 24 kHz mono 16-bit PCM durations can be estimated. **If a provider returns no usage and no supported audio duration, cost is zero**; configure providers that report usage for reliable billing. WebSocket sessions are authenticated, admitted, and logged like other requests; usage from each realtime `response.done` event is summed and billed when the session ends. Balance is checked at admission only, so a long session can run into debt. Sessions are bounded by `upstream_timeout_seconds`. Upstream costs for failed fallback attempts cannot be recovered unless the provider reports them in the final response.
 
 ## Payments
 
-The original project supported manual redeem codes only. Reseller adds **Stripe-hosted one-time Checkout** for prepaid plan purchases. Plans are non-renewing credit packages; `duration_days` sets their credit expiry. Automatic recurring subscriptions and refunds/chargebacks are not implemented.
+Reseller supports **Stripe-hosted one-time Checkout** for prepaid plan purchases, alongside manual redeem codes. Plans are non-renewing credit packages; `duration_days` sets their credit expiry. Automatic recurring subscriptions and refunds/chargebacks are not implemented.
 
 1. Set `stripe_secret_key`, `stripe_webhook_secret`, and your external `public_url` in Settings (or bootstrap environment on first start).
 2. Register `https://api.example.com/webhooks/stripe` in Stripe for `checkout.session.completed` and `checkout.session.async_payment_succeeded`.
@@ -251,9 +251,33 @@ List limits default to 50 and cap at 200. Detailed account credit history, codes
 
 ## Operations
 
-Place a TLS reverse proxy in front of public deployments. `trust_proxy` defaults off; enable it only when direct access to the application is blocked and your edge overwrites incoming forwarding headers. It trusts `CF-Connecting-IP`, then the first `X-Forwarded-For` address. Self-service defaults to two keys per IP/calendar month, a 30-second cooldown, and 100 creations globally/hour. Subscribed/permitted accounts bypass the IP allowance, but not the global or account key caps. Use edge rate limits for management endpoints and payment attempts.
+Place a TLS reverse proxy in front of public deployments. `trust_proxy` defaults off; enable it only when direct access to the application is blocked and your edge overwrites incoming forwarding headers. It trusts `CF-Connecting-IP`, then the **last** `X-Forwarded-For` address (the one your proxy appended; earlier entries are client-controlled). Self-service defaults to two keys per IP/calendar month, a 30-second cooldown, and 100 creations globally/hour. Subscribed/permitted accounts bypass the IP allowance, but not the global or account key caps. Use edge rate limits for management endpoints and payment attempts.
 
 Database settings contain upstream/payment secrets: protect the database and backups as credentials. API keys and codes are hashed; upstream secrets must be recoverable to proxy requests. Do not share the same database between multiple running server instances. Take a backup before upgrades. Migrations apply automatically; restore a backup with the server stopped. An abrupt process or machine failure can lose usage that an upstream has not yet reported; interrupted requests remain identifiable in the database.
+
+## Development
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
+
+Source layout (`src/`):
+
+| Module | Responsibility |
+|---|---|
+| `main.rs` | CLI: `serve`, `init`, `doctor`, `token`, `reset-admin`, `backup`, `healthcheck` |
+| `web.rs` | Router, security headers, CORS, static assets, top-level dispatch |
+| `proxy/` | Upstream transport: JSON policies and fallbacks, streamed uploads (`multipart.rs`), usage inspection (`inspect.rs`), realtime relay (`websocket.rs`) |
+| `meter.rs` | Admission (status, balance, RPM/usage limits) and exactly-once settlement |
+| `api/` | Customer workspace (`customer.rs`) and administrator console (`admin.rs`) JSON APIs |
+| `identity.rs`, `keys.rs` | Credential hashing/authentication; key limits, creation guards, rotation |
+| `billing.rs`, `payments.rs`, `money.rs` | Credit ledger, plans, redeem codes, Stripe Checkout, micro-USD arithmetic |
+| `stats.rs` | Overview, usage series, log retention |
+| `config.rs`, `db.rs`, `error.rs` | Settings, SQLite access, API error type |
+
+The embedded UI (`assets/`) is plain HTML/CSS/JS served under a strict Content-Security-Policy; there is no frontend build step. Integration tests in `tests/` drive the real router against mock upstreams.
 
 ## License
 

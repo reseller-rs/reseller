@@ -1,20 +1,30 @@
+//! SQLite pool, migrations, persisted settings, and shared ledger queries.
 use crate::{config::Config, error::Result};
 use sqlx::{
-    Row, SqlitePool,
+    Sqlite, SqliteConnection, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::{path::Path, time::Duration};
+
+pub const HOUR: i64 = 3600;
+pub const DAY: i64 = 86_400;
+
+/// Current Unix time in seconds.
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
+
+/// Random UUIDv4 primary key.
 pub fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+/// Opens (creating if needed) the database in WAL mode and runs migrations.
 pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
-    if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::create_dir_all(p).await?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::create_dir_all(parent).await?;
     }
-    let opts = SqliteConnectOptions::new()
+    let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
         .foreign_keys(true)
@@ -22,17 +32,28 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
         .busy_timeout(Duration::from_secs(10));
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
-        .connect_with(opts)
+        .connect_with(options)
         .await?;
     sqlx::migrate!().run(&pool).await?;
     Ok(pool)
 }
+
+/// Starts a write transaction that takes the database lock up front, so
+/// read-check-write sequences cannot interleave with other writers.
+pub async fn write(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>> {
+    Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
+}
+
+/// Returns the stored settings, or seeds them from `seed` on first start.
+///
+/// Missing secrets are generated during seeding; a generated administrator
+/// token is printed once because it cannot be recovered later.
 pub async fn settings(pool: &SqlitePool, mut seed: Config) -> anyhow::Result<Config> {
-    if let Some(row) = sqlx::query("SELECT value FROM settings WHERE id=1")
+    if let Some(value) = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE id=1")
         .fetch_optional(pool)
         .await?
     {
-        return Ok(serde_json::from_str(row.get("value"))?);
+        return Ok(serde_json::from_str(&value)?);
     }
     if seed.admin_token.is_empty() {
         seed.admin_token = crate::identity::secret("admin_");
@@ -48,6 +69,25 @@ pub async fn settings(pool: &SqlitePool, mut seed: Config) -> anyhow::Result<Con
         .await?;
     Ok(seed)
 }
-pub async fn balance(conn: &mut sqlx::SqliteConnection, account: &str) -> Result<i64> {
-    Ok(sqlx::query_scalar::<_,i64>("SELECT COALESCE((SELECT SUM(remaining_micro) FROM credits WHERE account_id=a.id AND (expires_at IS NULL OR expires_at>?)),0)-debt_micro FROM accounts a WHERE id=?").bind(now()).bind(account).fetch_one(conn).await?)
+
+/// Overwrites the stored settings.
+pub async fn save_settings(pool: &SqlitePool, config: &Config) -> Result<()> {
+    sqlx::query("UPDATE settings SET value=? WHERE id=1")
+        .bind(serde_json::to_string(config)?)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Spendable balance in micro-USD: unexpired credit minus outstanding debt.
+pub async fn balance(conn: &mut SqliteConnection, account: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE((SELECT SUM(remaining_micro) FROM credits \
+           WHERE account_id=a.id AND (expires_at IS NULL OR expires_at>?)),0) - debt_micro \
+         FROM accounts a WHERE id=?",
+    )
+    .bind(now())
+    .bind(account)
+    .fetch_one(conn)
+    .await?)
 }

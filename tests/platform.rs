@@ -9,8 +9,9 @@ use axum::{
 use reseller::{
     App, billing,
     config::{Config, Policy},
-    db, identity, money,
-    stats::{Meter, RequestMeta, Usage},
+    db, identity, keys,
+    meter::{Meter, RequestMeta, Usage},
+    money,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -46,9 +47,14 @@ impl Test {
         }
     }
     async fn key(&self) -> Value {
-        identity::create(&self.app, None, None, "127.0.0.1", &json!({"name":"test"}))
-            .await
-            .unwrap()
+        keys::create(
+            &self.app,
+            keys::Requester::Public(None),
+            "127.0.0.1",
+            &json!({"name":"test"}),
+        )
+        .await
+        .unwrap()
     }
     async fn call(
         &self,
@@ -150,24 +156,21 @@ fn target_preserves_base_and_query_but_rejects_traversal() {
 }
 #[test]
 fn sse_inspector_handles_split_utf8_usage_and_done() {
-    let mut i = reseller::proxy::Inspector::default();
+    let mut i = reseller::proxy::Inspector::new("text/event-stream");
     let s = "data: {\"choices\":[{\"delta\":{\"content\":\"世界\"}}]}\r\ndata: {\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":9,\"cost\":0.001}}}\n\ndata: [DONE]\n\n";
     for byte in s.as_bytes().chunks(1) {
-        i.feed(byte, "text/event-stream");
+        i.feed(byte);
     }
-    i.finish("text/event-stream");
+    i.finish();
     assert_eq!(i.usage.total, 16);
     assert_eq!(i.usage.cost, Some(1000));
 }
 #[test]
 fn sse_inspector_recovers_after_oversized_line() {
-    let mut i = reseller::proxy::Inspector::default();
-    i.feed(&vec![b'x'; 5 * 1024 * 1024], "text/event-stream");
-    i.feed(
-        b"\ndata: {\"usage\":{\"total_tokens\":12}}\n",
-        "text/event-stream",
-    );
-    i.finish("text/event-stream");
+    let mut i = reseller::proxy::Inspector::new("text/event-stream");
+    i.feed(&vec![b'x'; 5 * 1024 * 1024]);
+    i.feed(b"\ndata: {\"usage\":{\"total_tokens\":12}}\n");
+    i.finish();
     assert_eq!(i.usage.total, 12);
 }
 #[test]
@@ -186,11 +189,11 @@ fn audio_inspection_handles_chunked_wav_header() {
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&48000u32.to_le_bytes());
     wav.resize(48044, 0);
-    let mut i = reseller::proxy::Inspector::default();
+    let mut i = reseller::proxy::Inspector::new("audio/wav");
     for c in wav.chunks(3) {
-        i.feed(c, "audio/wav");
+        i.feed(c);
     }
-    i.finish("audio/wav");
+    i.finish();
     assert_eq!(i.usage.audio_ms, 1000);
 }
 #[tokio::test]
@@ -235,12 +238,18 @@ async fn signup_hashes_secrets_and_dashboard_cannot_proxy() {
 #[tokio::test]
 async fn concurrent_signup_cannot_exceed_monthly_allowance() {
     let t = Test::new().await;
-    t.app.config.write().await.ip_limit_per_month = 2;
+    t.app.config_mut().await.ip_limit_per_month = 2;
     let mut tasks = Vec::new();
     for _ in 0..12 {
         let app = t.app.clone();
         tasks.push(tokio::spawn(async move {
-            identity::create(&app, None, None, "203.0.113.7", &json!({})).await
+            keys::create(
+                &app,
+                keys::Requester::Public(None),
+                "203.0.113.7",
+                &json!({}),
+            )
+            .await
         }));
     }
     let mut successes = 0;
@@ -261,9 +270,14 @@ async fn child_keys_share_credit_without_trial_mining() {
     let t = Test::new().await;
     let k = t.key().await;
     let i = t.identity(&k).await;
-    let child = identity::create(&t.app, Some(&i), None, "127.0.0.1", &json!({}))
-        .await
-        .unwrap();
+    let child = keys::create(
+        &t.app,
+        keys::Requester::Public(Some(&i)),
+        "127.0.0.1",
+        &json!({}),
+    )
+    .await
+    .unwrap();
     assert_eq!(child["account_id"], k["account_id"]);
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credits")
         .fetch_one(&t.app.db)
@@ -470,12 +484,17 @@ async fn plan_grants_expiring_credit_and_bypasses_ip_allowance() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
-    t.app.config.write().await.ip_limit_per_month = 1;
+    t.app.config_mut().await.ip_limit_per_month = 1;
     let i = t.identity(&k).await;
     assert!(
-        identity::create(&t.app, Some(&i), None, "127.0.0.1", &json!({}))
-            .await
-            .is_err()
+        keys::create(
+            &t.app,
+            keys::Requester::Public(Some(&i)),
+            "127.0.0.1",
+            &json!({})
+        )
+        .await
+        .is_err()
     );
     let (s, _) = t
         .call(
@@ -487,9 +506,14 @@ async fn plan_grants_expiring_credit_and_bypasses_ip_allowance() {
         .await;
     assert_eq!(s, 200);
     assert!(
-        identity::create(&t.app, Some(&i), None, "127.0.0.1", &json!({}))
-            .await
-            .is_ok()
+        keys::create(
+            &t.app,
+            keys::Requester::Public(Some(&i)),
+            "127.0.0.1",
+            &json!({})
+        )
+        .await
+        .is_ok()
     );
     let v = billing::account(&t.app, aid).await.unwrap();
     assert_eq!(v["account"]["balance_usd"], "20.25");
@@ -500,7 +524,7 @@ async fn request_admission_counts_concurrent_inflight_requests() {
     let t = Test::new().await;
     let k = t.key().await;
     let mut i = t.identity(&k).await;
-    i.limits.requests = Some(identity::Window {
+    i.limits.requests = Some(keys::Window {
         max: 1,
         window_hours: 24,
     });
@@ -630,7 +654,7 @@ async fn json_proxy_rewrites_model_strips_secrets_and_bills() {
   axum::Json(json!({"id":"fake","usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost":0.01}}))
  }}))).await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.llm.base_url = format!("{base}/api/v1");
         c.llm.api_key = "upstream-secret".into();
         c.llm.model = "configured".into();
@@ -670,7 +694,7 @@ async fn sse_proxy_streams_before_upstream_finishes_and_tracks_final_usage() {
   ([("content-type","text/event-stream")],Body::from_stream(stream)).into_response()
  })) ).await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.llm.base_url = format!("{base}/v1");
         c.llm.api_key = "upstream".into();
     }
@@ -731,7 +755,7 @@ async fn fallback_retries_configured_models_only() {
     })))
     .await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.llm.base_url = format!("{base}/v1");
         c.llm.api_key = "upstream".into();
         c.llm.model = "primary".into();
@@ -766,6 +790,61 @@ async fn fallback_retries_configured_models_only() {
     task.abort();
 }
 #[tokio::test]
+async fn fallback_skips_models_outside_the_key_allowlist() {
+    let t = Test::new().await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let (base, task) = upstream(Router::new().fallback(any(move |req: Request<Body>| {
+        let log = log.clone();
+        async move {
+            let v: Value =
+                serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap()).unwrap();
+            let model = v["model"].as_str().unwrap_or("").to_owned();
+            log.lock().unwrap().push(model.clone());
+            let status = if model == "second" {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            };
+            (status, axum::Json(json!({"usage":{"cost":0}}))).into_response()
+        }
+    })))
+    .await;
+    {
+        let mut c = t.app.config_mut().await;
+        c.llm.base_url = format!("{base}/v1");
+        c.llm.api_key = "upstream".into();
+        c.llm.model = "primary".into();
+        c.llm.fallbacks = vec!["forbidden".into(), "second".into()];
+    }
+    let k = t.key().await;
+    let (status, _) = t
+        .call(
+            "PATCH",
+            &format!("/admin/api/keys/{}", k["id"].as_str().unwrap()),
+            Some(ADMIN),
+            json!({"limits":{"allowed_models":["primary","second"]}}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = t
+        .call(
+            "POST",
+            "/v1/chat/completions",
+            k["key"].as_str(),
+            json!({"messages":[]}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(*seen.lock().unwrap(), ["primary", "second"]);
+    let logged: String = sqlx::query_scalar("SELECT model FROM requests WHERE status=200")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(logged, "second");
+    task.abort();
+}
+#[tokio::test]
 async fn multipart_is_streamed_unchanged_to_stt() {
     let t = Test::new().await;
     let payload =
@@ -780,7 +859,7 @@ async fn multipart_is_streamed_unchanged_to_stt() {
     )))
     .await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.stt.base_url = format!("{base}/api");
         c.stt.api_key = "stt-secret".into();
     }
@@ -821,7 +900,7 @@ async fn multipart_stt_model_follows_force_policy() {
     })))
     .await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.stt.base_url = format!("{base}/api");
         c.stt.api_key = "stt-secret".into();
         c.stt.model = "configured-stt".into();
@@ -881,7 +960,7 @@ async fn request_body_limit_is_enforced_before_upstream() {
     let t = Test::new().await;
     let k = t.key().await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.max_json_body_bytes = 10;
         c.llm.api_key = "upstream".into();
     }
@@ -901,22 +980,26 @@ async fn request_body_limit_is_enforced_before_upstream() {
 async fn anonymous_mode_does_not_bill_accounts() {
     let t = Test::new().await;
     {
-        let mut c = t.app.config.write().await;
+        let mut c = t.app.config_mut().await;
         c.require_key = false;
         c.accept_any_token = false;
     }
     let mut h = HeaderMap::new();
     assert!(
-        identity::authenticate(&t.app, &h, true)
+        identity::authenticate(&t.app, &h, identity::Scope::Proxy)
             .await
             .unwrap()
             .is_none()
     );
     h.insert("authorization", "Bearer placeholder".parse().unwrap());
-    assert!(identity::authenticate(&t.app, &h, true).await.is_err());
-    t.app.config.write().await.accept_any_token = true;
     assert!(
-        identity::authenticate(&t.app, &h, true)
+        identity::authenticate(&t.app, &h, identity::Scope::Proxy)
+            .await
+            .is_err()
+    );
+    t.app.config_mut().await.accept_any_token = true;
+    assert!(
+        identity::authenticate(&t.app, &h, identity::Scope::Proxy)
             .await
             .unwrap()
             .is_none()
@@ -929,7 +1012,7 @@ async fn anonymous_mode_does_not_bill_accounts() {
     assert_eq!(v["upstream_cost_usd"], "0.02");
 }
 fn signature(secret: &str, body: &[u8], timestamp: i64) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     m.update(format!("{timestamp}.").as_bytes());
     m.update(body);
@@ -951,7 +1034,7 @@ fn stripe_signature_rejects_tampering_and_replay() {
 async fn payment_webhook_uses_snapshot_and_grants_only_once() {
     let t = Test::new().await;
     let k = t.key().await;
-    t.app.config.write().await.stripe_webhook_secret = "whsec_test".into();
+    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
     let aid = k["account_id"].as_str().unwrap();
     sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order1',?,'monthly',20000000,25000000,40,'cs_test',?)").bind(aid).bind(db::now()).execute(&t.app.db).await.unwrap();
     let mut event = json!({"id":"evt_one","type":"checkout.session.completed","data":{"object":{"id":"cs_test","client_reference_id":"order1","metadata":{"order_id":"order1"},"mode":"payment","currency":"usd","amount_total":2000,"payment_status":"paid"}}});
@@ -983,7 +1066,7 @@ async fn payment_webhook_uses_snapshot_and_grants_only_once() {
 async fn payment_amount_mismatch_rolls_back_event_and_credit() {
     let t = Test::new().await;
     let k = t.key().await;
-    t.app.config.write().await.stripe_webhook_secret = "whsec_test".into();
+    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
     sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order1',?,'monthly',20000000,20000000,30,'cs_test',?)").bind(k["account_id"].as_str()).bind(db::now()).execute(&t.app.db).await.unwrap();
     let event=json!({"id":"evt_bad","type":"checkout.session.completed","data":{"object":{"id":"cs_test","client_reference_id":"order1","metadata":{"order_id":"order1"},"mode":"payment","currency":"usd","amount_total":1,"payment_status":"paid"}}}).to_string();
     let mut h = HeaderMap::new();
@@ -1010,7 +1093,14 @@ fn starter_config_documents_every_option_and_validates() {
     // validation, and mention every configurable field at least once.
     let text = include_str!("../assets/reseller.example.toml");
     let c: Config = toml::from_str(text).unwrap();
-    c.validate().unwrap();
+    // Secrets are generated on first start; validation requires them.
+    assert!(c.validate().is_err(), "empty secrets must not validate");
+    let seeded = Config {
+        admin_token: "a".repeat(24),
+        key_pepper: "p".repeat(24),
+        ..c.clone()
+    };
+    seeded.validate().unwrap();
     for key in [
         // Config
         "site_name",
