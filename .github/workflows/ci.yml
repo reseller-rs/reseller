@@ -40,7 +40,12 @@ jobs:
       - name: Container smoke test
         run: |
           docker run -d --name reseller-test -p 56787:56787 reseller:test
-          curl --retry 20 --retry-connrefused --retry-delay 1 --fail http://localhost:56787/readyz
+          # Until the server binds, Docker's port proxy accepts and then resets
+          # connections (curl exit 56), so retry every error, not only refusals.
+          if ! curl --retry 30 --retry-all-errors --retry-delay 1 --fail --silent --show-error http://localhost:56787/readyz; then
+            docker logs reseller-test
+            exit 1
+          fi
           docker exec reseller-test /usr/local/bin/reseller --version
           docker exec reseller-test /usr/local/bin/reseller healthcheck
           test "$(docker inspect -f '{{.Config.User}}' reseller-test)" = "10001:10001"
