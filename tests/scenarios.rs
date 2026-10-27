@@ -612,7 +612,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
         )
         .await;
     assert_eq!(s, 200);
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order_pending',?,'pending',20000000,20000000,30,'cs_pending',?)")
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order_pending',?,'pending','stripe',20000000,20000000,30,'cs_pending',?)")
         .bind(&aid)
         .bind(db::now())
         .execute(&t.app.db)
@@ -1633,8 +1633,8 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
-    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order_snap',?,'monthly',20000000,25000000,40,'cs_snap',?)")
+    t.app.config_mut().await.stripe.webhook_secret = "whsec_test".into();
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order_snap',?,'monthly','stripe',20000000,25000000,40,'cs_snap',?)")
         .bind(aid)
         .bind(db::now())
         .execute(&t.app.db)
@@ -1660,7 +1660,7 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
                 .parse()
                 .unwrap(),
         );
-        reseller::payments::webhook(&t.app, &h, body.as_bytes())
+        reseller::payments::stripe::webhook(&t.app, &h, body.as_bytes())
             .await
             .unwrap();
     }
@@ -2410,7 +2410,7 @@ async fn checkout_validates_configuration_and_plan_pricing() {
         .admin(
             "PATCH",
             "settings",
-            json!({"stripe_secret_key":"sk_test_123","stripe_webhook_secret":"whsec_123"}),
+            json!({"stripe":{"secret_key":"sk_test_123","webhook_secret":"whsec_123"}}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2503,7 +2503,7 @@ async fn webhook_ignores_unpaid_and_unknown_orders_without_side_effects() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
-    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
+    t.app.config_mut().await.stripe.webhook_secret = "whsec_test".into();
     let send = |event: Value| {
         let app = t.app.clone();
         async move {
@@ -2515,7 +2515,7 @@ async fn webhook_ignores_unpaid_and_unknown_orders_without_side_effects() {
                     .parse()
                     .unwrap(),
             );
-            reseller::payments::webhook(&app, &h, body.as_bytes()).await
+            reseller::payments::stripe::webhook(&app, &h, body.as_bytes()).await
         }
     };
     let unpaid = json!({"id":"evt_unpaid","type":"checkout.session.completed","data":{"object":{"id":"cs_ghost","client_reference_id":"ghost","metadata":{"order_id":"ghost"},"mode":"payment","currency":"usd","amount_total":2000,"payment_status":"unpaid"}}});
@@ -2534,7 +2534,7 @@ async fn webhook_ignores_unpaid_and_unknown_orders_without_side_effects() {
     assert_eq!(events, 0);
     assert_eq!(balance(&t, aid).await, "0.25");
 
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order_async',?,'monthly',20000000,10000000,15,'cs_async',?)")
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order_async',?,'monthly','stripe',20000000,10000000,15,'cs_async',?)")
         .bind(aid)
         .bind(db::now())
         .execute(&t.app.db)

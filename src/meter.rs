@@ -26,6 +26,8 @@ pub struct Usage {
     pub output: i64,
     pub total: i64,
     pub audio_ms: i64,
+    /// Generated images (images API responses).
+    pub images: i64,
     /// Provider-reported cost in micro-USD; overrides the price table,
     /// including an explicit zero.
     pub cost: Option<i64>,
@@ -55,6 +57,7 @@ impl Usage {
                 .unwrap_or(input + output)
                 .clamp(0, 2_000_000_000),
             audio_ms: (audio_seconds * 1000.0).round() as i64,
+            images: 0,
             cost: v
                 .get("cost")
                 .filter(|c| !c.is_null())
@@ -64,7 +67,7 @@ impl Usage {
 
     /// Whether any billable quantity was observed.
     pub fn is_empty(&self) -> bool {
-        self.cost.is_none() && self.total == 0 && self.audio_ms == 0
+        self.cost.is_none() && self.total == 0 && self.audio_ms == 0 && self.images == 0
     }
 
     /// Accumulates another usage report (for example one per realtime
@@ -74,6 +77,7 @@ impl Usage {
         self.output = self.output.saturating_add(other.output);
         self.total = self.total.saturating_add(other.total);
         self.audio_ms = self.audio_ms.saturating_add(other.audio_ms);
+        self.images = self.images.saturating_add(other.images);
         self.cost = match (self.cost, other.cost) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
@@ -94,7 +98,8 @@ impl Usage {
                 + Decimal::from(self.output) * money::decimal(&price.output)?)
                 / per_million
                 + Decimal::from(self.audio_ms) * money::decimal(&price.audio_second)?
-                    / Decimal::from(1000),
+                    / Decimal::from(1000)
+                + Decimal::from(self.images) * money::decimal(&price.image)?,
         )
     }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "reseller"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.98"
-description = "Self-hosted OpenAI-compatible API reseller: streaming proxy, metering, billing, and dashboards"
+description = "Self-hosted OpenAI-compatible API reseller: streaming proxy, images, metering, card and crypto billing, white-label dashboards"
 license = "MIT"
 repository = "https://github.com/reseller-rs/reseller"
 readme = "README.md"

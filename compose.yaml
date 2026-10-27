@@ -8,12 +8,29 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
+      TTS_BASE_URL: ${TTS_BASE_URL:-https://api.openai.com/v1}
+      TTS_API_KEY: ${TTS_API_KEY:-}
+      TTS_MODEL: ${TTS_MODEL:-}
+      TTS_VOICE: ${TTS_VOICE:-}
+      STT_BASE_URL: ${STT_BASE_URL:-https://api.openai.com/v1}
+      STT_API_KEY: ${STT_API_KEY:-}
+      STT_MODEL: ${STT_MODEL:-}
+      IMG_BASE_URL: ${IMG_BASE_URL:-https://api.openai.com/v1}
+      IMG_API_KEY: ${IMG_API_KEY:-}
+      IMG_MODEL: ${IMG_MODEL:-}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:56787}
+      BRAND_NAME: ${BRAND_NAME:-Reseller}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      PAYROOF_PROJECT: ${PAYROOF_PROJECT:-}
+      PAYROOF_TOKEN: ${PAYROOF_TOKEN:-}
+      PAYROOF_WEBHOOK_SECRET: ${PAYROOF_WEBHOOK_SECRET:-}
+      # White-label files (logo, favicon, theme.css, index.html); see README.
+      # RESELLER_THEME_DIR: /theme
     volumes:
       - reseller-data:/data
+      # - ./theme:/theme:ro
     stop_grace_period: 330s
     security_opt:
       - no-new-privileges:true

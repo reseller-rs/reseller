@@ -2,6 +2,15 @@
 
 /* Boot state ----------------------------------------------------------------- */
 const main = document.querySelector('#main');
+// Operator branding rendered into the page as inert JSON (see theme.rs).
+const brand = (() => {
+  try {
+    return JSON.parse(document.querySelector('#branding')?.textContent || '{}');
+  } catch {
+    return {};
+  }
+})();
+const brandName = brand.name || 'Reseller';
 const admin = location.pathname.startsWith('/admin');
 const workspace = location.pathname.startsWith('/workspace');
 const store = admin ? 'reseller.admin' : 'reseller.customer';
@@ -44,7 +53,9 @@ const localDateTime = v => {
 const count = v => Number(v || 0).toLocaleString();
 const planRate = p => Number(p.price_usd) / Number(p.duration_days || 1);
 const bestCode = plans => plans.slice().sort((a, b) => planRate(a) - planRate(b))[0]?.code;
-const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', pending: 'info', redeemed: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger' }));
+const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', confirmed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', late: 'warn', pending: 'info', redeemed: 'info', seen: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger' }));
+const METHOD_LABELS = { stripe: 'Card', crypto: 'Crypto' };
+const methodLabel = m => METHOD_LABELS[m] || m;
 const pill = (value, tone) => `<span class="pill tone-${tone || TONES.get(String(value).toLowerCase()) || 'muted'}">${esc(value)}</span>`;
 const requestPill = r => r.status >= 400 ? pill(r.status, 'danger') : r.status ? pill(r.status, 'ok') : pill('In progress', 'info');
 const KEY_NAMES = [
@@ -532,9 +543,9 @@ async function landing() {
   main.innerHTML = `
     <section class="hero">
       <div>
-        <div class="eyebrow">ONE ENDPOINT · ENDLESS POSSIBILITIES</div>
-        <h1>Intelligence,<br>on your terms<span class="accent">.</span></h1>
-        <p>Language, speech, and audio through one familiar API. Create a key, connect your app, and stay in control of every request.</p>
+        <div class="eyebrow">${esc(brand.hero_eyebrow || 'ONE ENDPOINT · ENDLESS POSSIBILITIES')}</div>
+        <h1>${brand.hero_title ? esc(brand.hero_title) : 'Intelligence,<br>on your terms<span class="accent">.</span>'}</h1>
+        <p>${esc(brand.hero_text || 'Language, speech, audio, and images through one familiar API. Create a key, connect your app, and stay in control of every request.')}</p>
         <div class="actions section">
           <button type="button" class="primary" id="create">Get an API key ↗</button>
           <a class="button ghost" href="/workspace/">Open workspace</a>
@@ -602,7 +613,7 @@ function login() {
       ${intro}
       <section class="auth-panel">
         <form class="card auth-card">
-          <div class="eyebrow">${admin ? 'ADMINISTRATOR' : 'SIGN IN'}</div>
+          <div class="eyebrow">${esc(admin ? `${brandName} administrator` : `Sign in to ${brandName}`).toUpperCase()}</div>
           <h2>Welcome back<span class="accent">.</span></h2>
           <label for="login-token">${admin ? 'Administrator token' : 'API key or dashboard token'}</label>
           <input id="login-token" name="token" type="password" autocomplete="off" required>
@@ -979,22 +990,24 @@ const views = {
     const state = listStates.payments;
     const v = await get(`${endpoint('payments')}?${listParams(state)}`, signal);
     const toolbar = listToolbar('payments', state, {
-      placeholder: 'Search order, account, or plan…',
+      placeholder: 'Search order, account, plan, or provider…',
       statuses: [['pending', 'Pending'], ['paid', 'Paid']],
-      sorts: [['created', 'Newest'], ['status', 'Status'], ['account', 'Account'], ['plan', 'Plan'], ['amount', 'Amount']],
-      groups: [['status', 'Group by status'], ['plan', 'Group by plan'], ['account', 'Group by account']],
+      sorts: [['created', 'Newest'], ['status', 'Status'], ['provider', 'Method'], ['account', 'Account'], ['plan', 'Plan'], ['amount', 'Amount']],
+      groups: [['status', 'Group by status'], ['method', 'Group by method'], ['plan', 'Group by plan'], ['account', 'Group by account']],
     });
-    const group = state.group ? { value: r => state.group === 'plan' ? r.plan_code : state.group === 'account' ? r.account_id : r.status } : null;
-    return `<div class="card-head"><div><h3>Payment orders</h3><span class="muted">${count(v.total)} Stripe Checkout orders</span></div></div>
+    const group = state.group ? { value: r => state.group === 'plan' ? r.plan_code : state.group === 'account' ? r.account_id : state.group === 'method' ? methodLabel(r.method) : r.status } : null;
+    return `<div class="card-head"><div><h3>Payment orders</h3><span class="muted">${count(v.total)} card and crypto orders</span></div><button type="button" class="ghost" data-payroof>Crypto payments setup</button></div>
       ${toolbar}${table([
         ['Created', r => esc(date(r.created_at))],
         ['Order', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}…</code>`],
         ['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}…</code>`],
         ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
+        ['Method', r => esc(methodLabel(r.method))],
         ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`],
-        ['Credit', r => `<span class="num">${esc(usd(r.credit_usd))}</span>`],
+        ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`],
         ['Status', r => pill(r.status)],
-        ['Paid', r => esc(date(r.paid_at))]
+        ['Paid', r => esc(date(r.paid_at))],
+        ['', r => `<button type="button" class="small ghost" data-payment="${esc(r.id)}">Details</button>`]
       ], v.payments, group)}${listPager('payments', state, Number(v.total || 0), v.payments.length)}`;
   },
   async requests(signal) {
@@ -1018,6 +1031,7 @@ const views = {
           <option value="llm">LLM</option>
           <option value="tts">TTS</option>
           <option value="stt">STT</option>
+          <option value="image">Image</option>
         </select>
         <select name="status" aria-label="Status">
           <option value="">All statuses</option>
@@ -1052,15 +1066,29 @@ const views = {
       ], v.series)}`;
   },
   async billing(signal) {
-    const [v, p] = await Promise.all([get('/v1/account', signal), get('/v1/plans', signal)]);
+    const [v, p, orders] = await Promise.all([get('/v1/account', signal), get('/v1/plans', signal), get('/v1/account/payments', signal)]);
     const now = Date.now() / 1000;
     const best = bestCode(p.plans);
+    const methods = p.payment_methods || [];
+    const cta = plan => methods.length
+      ? `<div class="pay-buttons">${methods.map((m, i) => `<button type="button" class="${i === 0 ? 'primary' : 'ghost'}" data-buy="${esc(plan.code)}" data-method="${esc(m)}">${m === 'stripe' ? 'Pay by card ↗' : 'Pay with crypto'}</button>`).join('')}</div>`
+      : '<span class="hint">Online payments are not enabled. Use a credit code.</span>';
     return `<section class="billing-catalog">
-          <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.</p></div><button type="button" class="ghost" data-redeem>Have a credit code?</button></div>
+          <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto payments accept USDC, USDT, and native coins on supported networks.' : ''}</p></div><button type="button" class="ghost" data-redeem>Have a credit code?</button></div>
           <div class="plans plan-catalog">${p.plans.length
-            ? p.plans.map(plan => planCard(plan, best, `<button type="button" class="primary" data-buy="${esc(plan.code)}">Pay with Stripe ↗</button>`)).join('')
+            ? p.plans.map(plan => planCard(plan, best, cta(plan))).join('')
             : emptyState('No plans available', 'Ask the operator for a redeem code instead.')}</div>
       </section>
+      ${orders.payments.length ? `<h3 class="section">Your payments</h3>
+      ${table([
+        ['Created', r => esc(date(r.created_at))],
+        ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
+        ['Method', r => esc(methodLabel(r.method))],
+        ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`],
+        ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`],
+        ['Status', r => pill(r.status)],
+        ['', r => r.method === 'crypto' ? `<button type="button" class="small ghost" data-order="${esc(r.id)}">${r.status === 'pending' ? 'Pay' : 'Details'}</button>` : '']
+      ], orders.payments)}` : ''}
       <h3 class="section">Your credit ledger</h3>
       ${table([
         ['Source', r => esc(r.source)],
@@ -1072,7 +1100,7 @@ const views = {
   async settings(signal) {
     const v = await get(endpoint('settings'), signal);
     return `<div class="card-head"><h3>Runtime settings</h3><span class="muted">Stored in SQLite</span></div>
-      <p class="muted">Secret fields are redacted; leave them blank to keep their current values. USD amounts and percentages are decimal strings. CORS changes require a restart.</p>
+      <p class="muted">Secret fields are redacted; leave them blank to keep their current values. USD amounts and percentages are decimal strings. CORS changes require a restart. <code>branding</code> controls the name, copy, logo, favicon, colours (<code>css_vars</code>), and custom CSS of these pages; <code>stripe</code> and <code>payroof</code> enable card and crypto checkout.</p>
       <form id="settings" class="card">
         <label for="settings-json">Configuration JSON</label>
         <textarea id="settings-json" name="json" rows="30" spellcheck="false">${esc(JSON.stringify(v.settings, null, 2))}</textarea>
@@ -1164,6 +1192,138 @@ function editCodeForm(button) {
     notice('Code updated');
     await load();
   }));
+}
+
+/* Payments ------------------------------------------------------------------- */
+
+const shortHash = v => v && v.length > 18 ? `${v.slice(0, 10)}…${v.slice(-6)}` : v || '';
+function wireCopies(root) {
+  root.querySelectorAll('[data-copy-value]').forEach(b => {
+    b.onclick = () => copyText(b.dataset.copyValue, b.dataset.copyLabel || 'Value').then(ok => ok && flash(b));
+  });
+}
+function transfersTable(transfers) {
+  if (!transfers?.length) return '';
+  return `<h3 class="section">Transfers</h3>${table([
+    ['Seen', r => esc(date(r.seen_at))],
+    ['Network', r => `<code>${esc(r.chain)}</code>`],
+    ['Transaction', r => `<code title="${esc(r.transaction)}">${esc(shortHash(r.transaction))}</code>`],
+    ['Status', r => pill(r.status)],
+    ['Credited', r => `<span class="num">${esc(usd(r.value_usd))}</span>`],
+    ['Note', r => r.note ? pill(r.note.replace(/_/g, ' '), 'warn') : '']
+  ], transfers)}`;
+}
+function cryptoView(o) {
+  const open = o.status === 'pending';
+  const quotes = (o.quotes || []).map(q => `<tr>
+      <td><strong>${esc(q.symbol)}</strong><div class="hint">${esc(q.chain_name)}</div></td>
+      <td><button type="button" class="link-copy num" data-copy-value="${esc(q.amount)}" data-copy-label="Amount" title="Copy amount">${esc(q.amount)} ${esc(q.symbol)}</button>${q.rate_usd !== '1' ? `<div class="hint">at ${esc(usd(q.rate_usd))} / ${esc(q.symbol)}</div>` : ''}</td>
+      <td><button type="button" class="link-copy address" data-copy-value="${esc(q.address)}" data-copy-label="Address" title="Copy address"><code>${esc(q.address)}</code></button></td>
+    </tr>`).join('');
+  return `<div class="crypto-summary">
+      <div>${metric('Order total', usd(o.price_usd), `${o.plan_code} plan`)}</div>
+      <div>${metric('Confirmed', usd(o.received_usd), o.status === 'paid' ? 'Credit added' : 'Updates automatically')}</div>
+      <div class="card metric-card"><div class="label">Status</div><div class="metric">${pill(o.status)}</div><div class="hint">${open && o.expires_at ? `Quote valid until ${esc(date(o.expires_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}` : ''}</div></div>
+    </div>
+    ${open ? `<p class="muted">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Your credit is added after network confirmations; partial payments in several assets add up. Stablecoins are valued 1:1 with USD, native coins at the quoted rate.</p>
+    <div class="table-wrap"><table class="quotes"><thead><tr><th scope="col">Asset</th><th scope="col">Amount</th><th scope="col">Deposit address</th></tr></thead><tbody>${quotes}</tbody></table></div>` : ''}
+    ${transfersTable(o.transfers)}`;
+}
+function cryptoOrder(initial) {
+  let order = initial;
+  let timer;
+  modal('Pay with crypto', '<div data-crypto></div>', d => {
+    const box = d.querySelector('[data-crypto]');
+    const draw = () => {
+      box.innerHTML = cryptoView(order);
+      wireCopies(box);
+    };
+    const poll = async () => {
+      if (!d.open) return;
+      try {
+        const next = await api(`/v1/account/payments/${encodeURIComponent(order.id)}`);
+        const changed = next.status !== order.status || next.received_usd !== order.received_usd || (next.transfers || []).length !== (order.transfers || []).length;
+        order = next;
+        if (changed) draw();
+        if (order.status === 'paid') {
+          notice('Payment confirmed — credit added');
+          if (tab === 'billing') load();
+          return;
+        }
+      } catch {
+        // Transient errors: keep polling.
+      }
+      if (order.status === 'pending') timer = setTimeout(poll, 10_000);
+    };
+    draw();
+    if (order.status === 'pending') timer = setTimeout(poll, 10_000);
+    d.addEventListener('close', () => clearTimeout(timer));
+  }, 'wide');
+}
+async function paymentDetails(id) {
+  const o = await api(endpoint(`payments/${encodeURIComponent(id)}`));
+  const quotes = (o.quotes || []).length ? `<h3 class="section">Quotes</h3>${table([
+    ['Asset', q => `${esc(q.symbol)} <span class="hint">${esc(q.chain_name)}</span>`],
+    ['Amount', q => `<span class="num">${esc(q.amount)}</span>`],
+    ['Rate', q => esc(usd(q.rate_usd))],
+    ['Address', q => `<code title="${esc(q.address)}">${esc(shortHash(q.address))}</code>`]
+  ], o.quotes)}` : '';
+  const payable = o.status === 'pending' || o.status === 'expired';
+  modal(`Payment · ${o.id.slice(0, 8)}…`, `
+    <div class="crypto-summary">
+      <div>${metric('Price', usd(o.price_usd), `${o.plan_code} · ${methodLabel(o.method)}`)}</div>
+      <div>${metric('Received', usd(o.received_usd), `Credit ${usd(o.credit_usd)} for ${o.duration_days} days`)}</div>
+      <div class="card metric-card"><div class="label">Status</div><div class="metric">${pill(o.status)}</div><div class="hint">${o.paid_at ? `Paid ${esc(date(o.paid_at))} by ${esc(o.paid_by)}` : `Created ${esc(date(o.created_at))}`}</div></div>
+    </div>
+    <p class="muted">Account <code>${esc(o.account_id)}</code></p>
+    ${quotes}${transfersTable(o.transfers)}
+    ${payable ? `<div class="actions section"><button type="button" class="primary" data-complete>Mark as paid and grant credit</button></div><p class="field-help">Use after verifying a late, underpaid, or otherwise flagged payment by hand. Credit is granted once.</p>` : ''}`, d => {
+    d.querySelector('[data-complete]')?.addEventListener('click', async e => {
+      if (!(await confirmModal('Complete payment?', 'Grant this order\'s plan credit to the account now?', 'Grant credit'))) return;
+      e.target.disabled = true;
+      try {
+        await api(endpoint(`payments/${encodeURIComponent(id)}/complete`), 'POST', {});
+        d.close();
+        notice('Payment completed');
+        await load();
+      } catch (err) {
+        notice(err.message, true);
+        e.target.disabled = false;
+      }
+    });
+  }, 'wide');
+}
+async function payroofSetup() {
+  const s = await api(endpoint('payroof'));
+  const row = (label, value) => `<div class="kv"><span>${esc(label)}</span><strong>${value}</strong></div>`;
+  const yes = v => v ? pill('configured', 'ok') : pill('missing', 'warn');
+  const chains = (s.chains || []).map(c => `<li><strong>${esc(c.name)}</strong> <code>${esc(c.id)}</code> · ${esc((c.assets || []).map(a => a.symbol).join(', '))} · ${count(c.confirmations)} confirmations</li>`).join('');
+  modal('Crypto payments (Payroof)', `
+    <p class="muted">Configure <code>payroof.project</code> and <code>payroof.token</code> in Settings, then register the webhook so confirmed transfers complete orders automatically.</p>
+    ${row('Status', s.enabled ? pill('enabled', 'ok') : pill('disabled', 'warn'))}
+    ${row('API', `<code>${esc(s.api_url)}</code>`)}
+    ${row('Project', s.project ? `<code>${esc(s.project)}</code>` : pill('missing', 'warn'))}
+    ${row('Project token', yes(s.token_configured))}
+    ${row('Webhook secret', yes(s.webhook_secret_configured))}
+    ${row('Webhook URL', `<code>${esc(s.webhook_url)}</code> ${s.webhook_registered ? pill('registered', 'ok') : ''}`)}
+    ${s.project_error ? `<p class="card error">${esc(s.project_error)}</p>` : ''}
+    ${s.webhooks_error ? `<p class="hint">Webhooks: ${esc(s.webhooks_error)}</p>` : ''}
+    ${chains ? `<h3 class="section">Watched networks</h3><ul class="chain-list">${chains}</ul>` : ''}
+    <div class="actions section"><button type="button" class="primary" data-register${s.project && s.token_configured ? '' : ' disabled'}>Register webhook</button></div>
+    <p class="field-help">Registering subscribes <code>${esc(s.webhook_url)}</code> to seen and confirmed events and stores the returned signing secret. Payroof only delivers to public HTTPS URLs.</p>`, d => {
+    d.querySelector('[data-register]').onclick = async e => {
+      e.target.disabled = true;
+      try {
+        const v = await api(endpoint('payroof/webhook'), 'POST', {});
+        notice(v.notice);
+        d.close();
+        payroofSetup();
+      } catch (err) {
+        notice(err.message, true);
+        e.target.disabled = false;
+      }
+    };
+  }, 'wide');
 }
 
 /* Interaction wiring --------------------------------------------------------- */
@@ -1266,11 +1426,19 @@ function wire(root) {
   });
   action('[data-code]', async () => codeForm());
   action('[data-buy]', async b => {
-    const v = await api('/v1/account/checkout', 'POST', { plan_code: b.dataset.buy });
+    const v = await api('/v1/account/checkout', 'POST', { plan_code: b.dataset.buy, method: b.dataset.method });
+    if (v.method === 'crypto') {
+      cryptoOrder(v);
+      await load();
+      return;
+    }
     const url = new URL(v.url);
     if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com') throw new Error('Unexpected checkout URL');
     location.href = url.href;
   });
+  action('[data-order]', async b => cryptoOrder(await api(`/v1/account/payments/${encodeURIComponent(b.dataset.order)}`)));
+  action('[data-payment]', async b => paymentDetails(b.dataset.payment));
+  action('[data-payroof]', async () => payroofSetup());
 
   root.querySelectorAll('[data-redeem]').forEach(b => b.onclick = redeemForm);
   if (root.querySelector('#settings')) bindForm(root.querySelector('#settings'), async b => {
@@ -1338,6 +1506,14 @@ function wire(root) {
   }
 }
 
+// Stripe returns to /workspace/?payment=success|cancelled#billing.
+const paymentResult = new URLSearchParams(location.search).get('payment');
+if (paymentResult) {
+  history.replaceState(null, '', location.pathname + location.hash);
+  notice(paymentResult === 'success'
+    ? 'Payment received. Credit appears as soon as the provider confirms it.'
+    : 'Checkout cancelled. You have not been charged.', paymentResult !== 'success');
+}
 renderHeader();
 if (!admin && !workspace) landing();
 else if (token) shell();

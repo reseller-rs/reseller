@@ -44,6 +44,7 @@ pub enum Kind {
     Llm,
     Tts,
     Stt,
+    Image,
 }
 
 impl Kind {
@@ -51,6 +52,8 @@ impl Kind {
         match path {
             "/v1/audio/speech" => Self::Tts,
             "/v1/audio/transcriptions" | "/v1/audio/translations" => Self::Stt,
+            "/v1/images" => Self::Image,
+            p if p.starts_with("/v1/images/") => Self::Image,
             _ => Self::Llm,
         }
     }
@@ -60,16 +63,39 @@ impl Kind {
             Self::Llm => "llm",
             Self::Tts => "tts",
             Self::Stt => "stt",
+            Self::Image => "image",
         }
     }
 
-    fn upstream(self, config: &Config) -> &Upstream {
+    pub fn upstream(self, config: &Config) -> &Upstream {
         match self {
             Self::Llm => &config.llm,
             Self::Tts => &config.tts,
             Self::Stt => &config.stt,
+            Self::Image => &config.image,
         }
     }
+}
+
+/// Effective timeout for `upstream`.
+pub(crate) fn timeout(config: &Config, upstream: &Upstream) -> Duration {
+    Duration::from_secs(if upstream.timeout_seconds > 0 {
+        upstream.timeout_seconds
+    } else {
+        config.upstream_timeout_seconds
+    })
+}
+
+/// Client headers to forward plus the upstream's configured extra headers.
+pub(crate) fn upstream_headers(client: &HeaderMap, upstream: &Upstream) -> HeaderMap {
+    let mut headers = forward_headers(client, true);
+    for (name, value) in &upstream.headers {
+        // Validated when the settings were saved.
+        if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), HeaderValue::from_str(value)) {
+            headers.insert(name, value);
+        }
+    }
+    headers
 }
 
 /// Maps `/v1/<suffix>` onto the upstream base URL, rejecting path traversal
@@ -203,16 +229,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
         .get(header::UPGRADE)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
     {
-        return websocket::relay(
-            app.clone(),
-            req,
-            ip,
-            identity,
-            upstream,
-            config.model_policy,
-            url,
-        )
-        .await;
+        return websocket::relay(app.clone(), req, ip, identity, upstream, &config, url).await;
     }
 
     let (parts, body) = req.into_parts();
@@ -251,7 +268,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
         );
     }
 
-    let timeout = Duration::from_secs(config.upstream_timeout_seconds);
+    let timeout = timeout(&config, upstream);
     let mut fallback = None;
     let mut index = 0;
     let response = loop {
@@ -261,7 +278,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
         let mut request = app
             .client
             .request(parts.method.clone(), url.clone())
-            .headers(forward_headers(&parts.headers, true))
+            .headers(upstream_headers(&parts.headers, upstream))
             .bearer_auth(&upstream.api_key)
             .header(header::ACCEPT_ENCODING, "identity")
             .timeout(timeout);

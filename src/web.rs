@@ -1,17 +1,17 @@
-//! HTTP router: health probes, embedded dashboards, and dispatch to the
-//! management APIs, the Stripe webhook, and the upstream proxy.
+//! HTTP router: health probes, embedded dashboards and theme files, and
+//! dispatch to the management APIs, payment webhooks, and the upstream proxy.
 use crate::{
     App, api,
     error::{Error, Result},
-    identity, payments, proxy, stats,
+    identity, payments, proxy, stats, theme,
 };
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, header},
     response::{
-        Html, IntoResponse, Response,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::get,
@@ -26,7 +26,8 @@ use tower_http::{
 const WEBHOOK_BODY_LIMIT: usize = 1024 * 1024;
 const EVENTS_INTERVAL: Duration = Duration::from_secs(5);
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-     connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; \
+     connect-src 'self'; img-src 'self' data: https:; font-src 'self'; frame-ancestors 'none'; \
+     base-uri 'none'; \
      form-action 'self'";
 
 /// Builds the application router. CORS is read once here, so CORS changes
@@ -42,6 +43,18 @@ pub async fn router(app: App) -> Router {
         .route("/workspace/", get(page))
         .route("/admin", get(page))
         .route("/admin/", get(page))
+        .route(
+            "/assets/theme.css",
+            get(|State(app): State<App>| async move { theme::stylesheet(&app).await }),
+        )
+        .route(
+            "/theme/{*path}",
+            get(
+                |State(app): State<App>, Path(path): Path<String>| async move {
+                    theme::file(&app, &path).await
+                },
+            ),
+        )
         .route(
             "/assets/app.js",
             get(|| {
@@ -114,8 +127,8 @@ async fn asset(content_type: &'static str, bytes: &'static [u8]) -> impl IntoRes
     ([(header::CONTENT_TYPE, content_type)], bytes)
 }
 
-async fn page() -> Html<&'static str> {
-    Html(include_str!("../assets/index.html"))
+async fn page(State(app): State<App>) -> impl IntoResponse {
+    theme::page(&app).await
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -127,6 +140,13 @@ async fn discovery() -> Json<serde_json::Value> {
         "service": "reseller",
         "api_base": "/v1",
         "keys": "/v1/keys",
+        "plans": "/v1/plans",
+        "routes": {
+            "llm": ["/v1/chat/completions", "/v1/responses", "/v1/completions", "/v1/embeddings", "/v1/realtime"],
+            "tts": ["/v1/audio/speech"],
+            "stt": ["/v1/audio/transcriptions", "/v1/audio/translations"],
+            "image": ["/v1/images", "/v1/images/generations", "/v1/images/edits", "/v1/images/variations"],
+        },
         "workspace": "/workspace/",
         "admin": "/admin/",
     }))
@@ -177,12 +197,19 @@ async fn route(app: App, peer: SocketAddr, req: Request<Body>) -> Result<Respons
     let ip = client_ip(peer, req.headers(), app.config().await.trust_proxy).to_string();
     let is_api = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
 
-    if path == "/webhooks/stripe" && method == Method::POST {
+    if method == Method::POST
+        && (path == "/webhooks/stripe" || path == payments::payroof::WEBHOOK_PATH)
+    {
         let (parts, body) = req.into_parts();
         let body = to_bytes(body, WEBHOOK_BODY_LIMIT)
             .await
             .map_err(|_| Error::too_large("Webhook too large"))?;
-        return Ok(Json(payments::webhook(&app, &parts.headers, &body).await?).into_response());
+        let handled = if path == "/webhooks/stripe" {
+            payments::stripe::webhook(&app, &parts.headers, &body).await?
+        } else {
+            payments::payroof::webhook(&app, &parts.headers, &body).await?
+        };
+        return Ok(Json(handled).into_response());
     }
     if path == "/admin/api/events" && method == Method::GET {
         return admin_events(app, req.headers().clone()).await;

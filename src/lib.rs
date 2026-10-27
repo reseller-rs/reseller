@@ -6,7 +6,9 @@
 //! - [`meter`]: request admission, usage accounting, and settlement.
 //! - [`api`]: customer (`/v1/keys`, `/v1/account`) and administrator APIs.
 //! - [`identity`] / [`keys`]: authentication and API-key lifecycle.
-//! - [`billing`] / [`payments`] / [`money`]: credit ledger, plans, Stripe.
+//! - [`billing`] / [`money`]: credit ledger, plans, redeem codes, micro-USD.
+//! - [`payments`]: plan checkout orders via Stripe (cards) and Payroof (crypto).
+//! - [`theme`]: white-label branding, the page template, and theme files.
 //! - [`stats`]: dashboards, usage series, and log retention.
 //! - [`config`] / [`db`] / [`error`]: settings, persistence, error type.
 pub mod api;
@@ -21,9 +23,10 @@ pub mod money;
 pub mod payments;
 pub mod proxy;
 pub mod stats;
+pub mod theme;
 pub mod web;
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockWriteGuard};
 
 /// Shared application state; cheap to clone.
@@ -34,6 +37,10 @@ pub struct App {
     pub client: reqwest::Client,
     /// Background settlement tasks that must finish before shutdown.
     pub tasks: tokio_util::task::TaskTracker,
+    /// Payroof catalog and exchange-rate caches.
+    pub payroof: Arc<payments::payroof::Cache>,
+    /// Optional directory of theme files served under `/theme/`.
+    pub theme_dir: Option<Arc<PathBuf>>,
 }
 
 impl App {
@@ -46,7 +53,17 @@ impl App {
                 .connect_timeout(Duration::from_secs(15))
                 .build()?,
             tasks: tokio_util::task::TaskTracker::new(),
+            payroof: Arc::default(),
+            theme_dir: None,
         })
+    }
+
+    /// Serves white-label files (logo, favicon, fonts, `theme.css`,
+    /// `index.html`) from `dir`.
+    #[must_use]
+    pub fn with_theme_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.theme_dir = dir.map(Arc::new);
+        self
     }
 
     /// Immutable snapshot of the current settings.

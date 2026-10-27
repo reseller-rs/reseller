@@ -6,12 +6,12 @@ use super::{
 };
 use crate::{
     App, billing,
-    config::{Config, SECRET_FIELDS},
+    config::{Config, SECRET_PATHS},
     db::{self, id, now},
     error::{Error, Result},
     identity,
     keys::{self, Requester},
-    money, stats,
+    money, payments, stats,
 };
 use axum::{
     body::Body,
@@ -94,6 +94,10 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["codes", cid], "DELETE") => delete_code(app, cid).await,
 
         (["payments"], "GET") => list_payments(app, &q).await,
+        (["payments", pid], "GET") => payments::order(app, pid, None).await,
+        (["payments", pid, "complete"], "POST") => payments::admin_complete(app, pid).await,
+        (["payroof"], "GET") => payments::payroof::status(app).await,
+        (["payroof", "webhook"], "POST") => payments::payroof::register_webhook(app).await,
         (["requests"], "GET") => requests(app, None, &q, false).await,
         (["requests", "groups"], "GET") => requests(app, None, &q, true).await,
 
@@ -111,7 +115,8 @@ async fn list_accounts(app: &App, q: &Query) -> Result<Value> {
     let search = search(q);
     let status = status_filter(q);
     let page = Page::from(q);
-    const FILTER: &str = "(id LIKE ? OR contact LIKE ?) AND (?='' OR status=?)";
+    const FILTER: &str =
+        "(id LIKE ? ESCAPE '\\' OR contact LIKE ? ESCAPE '\\') AND (?='' OR status=?)";
     let total: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM accounts WHERE {FILTER}"
     )))
@@ -132,7 +137,7 @@ async fn list_accounts(app: &App, q: &Query) -> Result<Value> {
     let sql = format!(
         "SELECT a.*,\
            COALESCE((SELECT SUM(c.remaining_micro) FROM credits c WHERE c.account_id=a.id \
-             AND c.remaining_micro>0 AND (c.expires_at IS NULL OR c.expires_at>?)),0) AS balance_micro,\
+             AND c.remaining_micro>0 AND (c.expires_at IS NULL OR c.expires_at>?)),0)-a.debt_micro AS balance_micro,\
            (SELECT COUNT(*) FROM api_keys k WHERE k.account_id=a.id) AS key_count,\
            (SELECT s.plan_code FROM subscriptions s WHERE s.account_id=a.id AND s.expires_at>? \
              ORDER BY s.expires_at DESC LIMIT 1) AS plan_code \
@@ -418,8 +423,8 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
     let status = status_filter(q);
     let search = search(q);
     let page = Page::from(q);
-    const FILTER: &str =
-        "(?='' OR status=?) AND (id LIKE ? OR account_id LIKE ? OR plan_code LIKE ?)";
+    const FILTER: &str = "(?='' OR status=?) AND (id LIKE ? ESCAPE '\\' OR account_id LIKE ? ESCAPE '\\' \
+         OR plan_code LIKE ? ESCAPE '\\' OR provider LIKE ? ESCAPE '\\')";
     let total: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM payments WHERE {FILTER}"
     )))
@@ -428,10 +433,12 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
     .bind(&search)
     .bind(&search)
     .bind(&search)
+    .bind(&search)
     .fetch_one(&app.db)
     .await?;
     let order = match q.get("sort").map(String::as_str) {
         Some("status") => "status",
+        Some("provider") => "provider",
         Some("account") => "account_id",
         Some("plan") => "plan_code",
         Some("amount") => "price_micro",
@@ -448,28 +455,47 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
         .bind(&search)
         .bind(&search)
         .bind(&search)
+        .bind(&search)
         .bind(page.limit)
         .bind(page.offset)
         .fetch_all(&app.db)
         .await?;
-    Ok(page.wrap("payments", rows.iter().map(row_json).collect(), total))
+    Ok(page.wrap(
+        "payments",
+        rows.iter().map(payments::summary).collect(),
+        total,
+    ))
 }
 
-/// Recursively merges a settings patch. Blank secrets keep the current value;
-/// map-valued settings are replaced wholesale so entries can be removed.
-fn merge(base: &mut Value, patch: Value) {
+/// Map-valued settings that a patch replaces wholesale, so entries can be
+/// removed.
+const REPLACED_MAPS: [&str; 10] = [
+    "/prices",
+    "/ip_overrides",
+    "/default_limits",
+    "/branding/css_vars",
+    "/payroof/rate_ids",
+    "/payroof/native_rates_usd",
+    "/llm/headers",
+    "/tts/headers",
+    "/stt/headers",
+    "/image/headers",
+];
+
+/// Recursively merges a settings patch. Blank secrets keep the current value.
+fn merge(base: &mut Value, patch: Value, path: &str) {
     let (Some(target), Value::Object(patch)) = (base.as_object_mut(), patch) else {
         return;
     };
     for (key, value) in patch {
-        let secret = SECRET_FIELDS.contains(&key.as_str()) || key == "api_key";
-        if secret && value.as_str() == Some("") {
+        let pointer = format!("{path}/{key}");
+        if SECRET_PATHS.contains(&pointer.as_str()) && value.as_str() == Some("") {
             continue;
         }
-        let replace_whole = matches!(key.as_str(), "prices" | "ip_overrides" | "default_limits");
+        let replace_whole = REPLACED_MAPS.contains(&pointer.as_str());
         match target.get_mut(&key) {
             Some(existing) if value.is_object() && existing.is_object() && !replace_whole => {
-                merge(existing, value);
+                merge(existing, value, &pointer);
             }
             _ => {
                 target.insert(key, value);
@@ -481,7 +507,7 @@ fn merge(base: &mut Value, patch: Value) {
 async fn update_settings(app: &App, patch: Value) -> Result<Value> {
     let mut config = app.config_mut().await;
     let mut merged = serde_json::to_value(&*config)?;
-    merge(&mut merged, patch);
+    merge(&mut merged, patch, "");
     let updated: Config = serde_json::from_value(merged)?;
     updated
         .validate()

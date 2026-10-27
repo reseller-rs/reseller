@@ -20,11 +20,16 @@
 #  OPENAI_BASE_URL OPENAI_API_KEY OPENAI_MODEL OPENAI_MODEL_FALLBACKS
 #  TTS_BASE_URL TTS_API_KEY TTS_MODEL TTS_MODEL_FALLBACKS TTS_VOICE
 #  STT_BASE_URL STT_API_KEY STT_MODEL STT_MODEL_FALLBACKS
-#  ADMIN_TOKEN KEY_PEPPER MARKUP_PCT FREE_CREDIT_USD PUBLIC_URL
+#  IMG_BASE_URL IMG_API_KEY IMG_MODEL IMG_MODEL_FALLBACKS
+#  ADMIN_TOKEN KEY_PEPPER MARKUP_PCT FREE_CREDIT_USD PUBLIC_URL BRAND_NAME
 #  STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET
+#  PAYROOF_API_URL PAYROOF_PROJECT PAYROOF_TOKEN PAYROOF_WEBHOOK_SECRET
 #
 #  Always-runtime environment variables (also available as CLI flags):
-#  HOST PORT DB_FILE RESELLER_CONFIG RUST_LOG.
+#  HOST PORT DB_FILE RESELLER_CONFIG RESELLER_THEME_DIR RUST_LOG.
+#
+#  To replace the stored settings later, stop the server and run
+#  `reseller config import <file>`; `reseller config export` prints them.
 #
 #  FORMATS
 #  -------
@@ -39,11 +44,9 @@
 #  init` writes mode 0600) and protect database backups.
 # =============================================================================
 
-# Display name shown in dashboards and page titles.
-site_name = "Reseller"
-
-# Externally reachable origin. Used for dashboard links, API hints, and Stripe
-# redirects. Must be an absolute http(s) URL without query or fragment.
+# Externally reachable origin. Used for dashboard links, API hints, payment
+# redirects, and webhook URLs. Must be an absolute http(s) URL without query or
+# fragment.
 public_url = "http://localhost:56787"
 
 # --- credentials -------------------------------------------------------------
@@ -121,13 +124,6 @@ public_url = "http://localhost:56787"
 # log_retention_days = 30
 # max_log_entries = 5000
 
-# --- payments (optional) -----------------------------------------------------
-# Set both values to enable Stripe Checkout for prepaid plans. Register
-# {public_url}/webhooks/stripe for checkout.session.completed and
-# checkout.session.async_payment_succeeded.
-# stripe_secret_key = ""
-# stripe_webhook_secret = ""
-
 # =============================================================================
 #  UPSTREAMS
 #  Each upstream is configured independently. base_url must be an http(s) URL
@@ -145,6 +141,11 @@ api_key = "sk-replace-with-your-upstream-key"
 model = "gpt-4o-mini"
 # Ordered fallback models, for example ["gpt-4o", "gpt-4o-mini"].
 # fallbacks = []
+# Per-upstream timeout in seconds (0 = upstream_timeout_seconds, max 3600).
+# timeout_seconds = 0
+# Extra request headers for this upstream (Authorization, Host and framing
+# headers cannot be set). Every upstream section accepts these two keys.
+# headers = { "HTTP-Referer" = "https://api.example.com", "X-Title" = "My API" }
 
 # Text-to-speech. Required only for /v1/audio/speech.
 # [tts]
@@ -164,25 +165,38 @@ model = "gpt-4o-mini"
 # model = "whisper-1"
 # fallbacks = []
 
+# Image generation and editing. Required only for /v1/images,
+# /v1/images/generations, /v1/images/edits and /v1/images/variations. JSON
+# requests follow model_policy (reference images travel inline, for example
+# "input_references": [{"type":"image_url","image_url":{"url":"data:…"}}]);
+# multipart edits stream like other uploads.
+# [image]
+# base_url = "https://openrouter.ai/api/v1"
+# api_key = "sk-or-replace-with-your-upstream-key"
+# model = "meta/muse-image"
+# fallbacks = []
+
 # =============================================================================
 #  PRICE TABLE
-#  USD per 1,000,000 input/output tokens and USD per second of audio. The
-#  "default" entry covers models without their own section; model names match
-#  case-insensitively. Provider-reported usage.cost always takes precedence,
-#  including an explicit zero.
+#  USD per 1,000,000 input/output tokens, USD per second of audio, and USD per
+#  generated image. The "default" entry covers models without their own
+#  section; model names match case-insensitively. Provider-reported
+#  usage.cost always takes precedence, including an explicit zero.
 # =============================================================================
 
 # [prices.default]
 # input = "0.5"
 # output = "1.5"
 # audio_second = "0"
+# image = "0"
 
 # Per-model override example. Quote model names containing dots, slashes, or
 # colons.
-# [prices."my-model"]
-# input = "0.25"
-# output = "1"
+# [prices."meta/muse-image"]
+# input = "0"
+# output = "0"
 # audio_second = "0"
+# image = "0.01"
 
 # =============================================================================
 #  DEFAULT KEY LIMITS
@@ -207,3 +221,68 @@ model = "gpt-4o-mini"
 # [ip_overrides]
 # "203.0.113.7" = 10
 # "198.51.100.9" = 0   # unlimited
+
+# =============================================================================
+#  BRANDING (white label)
+#  Names, copy, logo, favicon, colours and CSS of the web app. Logos and
+#  favicons are site paths (for example files in the theme directory, served
+#  at /theme/<file>) or http(s) URLs. css_vars override the built-in CSS
+#  custom properties (accent, accent-2, accent-ink, bg, panel, text, muted,
+#  border, radius, …) without the leading "--". With --theme-dir, a
+#  theme.css file is appended to the stylesheet and an index.html file
+#  replaces the page template ({{name}}, {{title}}, {{logo_url}}, …).
+# =============================================================================
+
+# [branding]
+# name = "Reseller"
+# tagline = "API workspace"
+# description = "Your API workspace. Create keys, track usage, and manage your balance."
+# logo_url = ""            # e.g. "/theme/logo.svg"; empty = built-in mark
+# favicon_url = ""         # e.g. "/theme/favicon.png"; empty = built-in icon
+# theme_color = "#0c0e0d"
+# color_scheme = "dark"    # "dark" or "light"
+# custom_css = ""
+# hero_eyebrow = ""        # landing page copy; empty keeps the built-in text
+# hero_title = ""
+# hero_text = ""
+# footer_text = "independently hosted"
+# footer_links = [{ label = "Source ↗", url = "https://github.com/reseller-rs/reseller" }]
+#
+# [branding.css_vars]
+# accent = "#ff7a1a"
+# accent-2 = "#ff9f4a"
+# accent-ink = "#1d0d00"
+
+# =============================================================================
+#  PAYMENTS (optional)
+# =============================================================================
+
+# Stripe Checkout (cards). Set both values, then register
+# {public_url}/webhooks/stripe for checkout.session.completed and
+# checkout.session.async_payment_succeeded.
+# [stripe]
+# secret_key = ""
+# webhook_secret = ""
+
+# Payroof crypto payments: USDC/USDT and native coins (ETH, POL, BNB, …) on
+# the EVM chains your Payroof project watches. Set project and token (a prf_
+# project token with the "references" and "webhooks" permissions), then use
+# Admin -> Payments -> "Register webhook" (requires an https public_url) or
+# paste the whsec_ secret of a webhook pointing at {public_url}/webhooks/payroof.
+# [payroof]
+# api_url = "https://api.payroof.top"
+# project = ""
+# token = ""
+# webhook_secret = ""
+# stablecoins = ["USDC", "USDT"]   # valued 1:1 with USD
+# native_coins = true              # quote native coins at the current rate
+# chains = []                      # CAIP-2 ids to offer; empty = all watched
+# rate_source = "coingecko"        # or "static" (native_rates_usd only)
+# rate_url = "https://api.coingecko.com/api/v3/simple/price"
+# quote_ttl_minutes = 60           # quotes and native rates hold this long
+# underpayment_tolerance_pct = "0.5"
+# native_rates_usd = { ETH = "3000" }   # fixed rates override the feed
+# [payroof.rate_ids]               # native symbol -> CoinGecko coin id
+# ETH = "ethereum"
+# POL = "polygon-ecosystem-token"
+# BNB = "binancecoin"

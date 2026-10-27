@@ -64,10 +64,28 @@ CREATE TABLE totals (id INTEGER PRIMARY KEY CHECK(id=1), requests INTEGER NOT NU
 INSERT INTO totals(id) VALUES (1);
 CREATE TABLE payments (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), plan_code TEXT NOT NULL REFERENCES plans(code),
- price_micro INTEGER NOT NULL, credit_micro INTEGER NOT NULL, duration_days INTEGER NOT NULL,
- session_id TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid')),
- created_at INTEGER NOT NULL, paid_at INTEGER
+ provider TEXT NOT NULL CHECK(provider IN ('stripe','payroof')),
+ price_micro INTEGER NOT NULL CHECK(price_micro>0), credit_micro INTEGER NOT NULL CHECK(credit_micro>0),
+ duration_days INTEGER NOT NULL CHECK(duration_days>0),
+ external_id TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid')),
+ received_micro INTEGER NOT NULL DEFAULT 0 CHECK(received_micro>=0),
+ created_at INTEGER NOT NULL, expires_at INTEGER, paid_at INTEGER, paid_by TEXT
 ) STRICT;
+CREATE UNIQUE INDEX payments_external ON payments(provider,external_id) WHERE external_id IS NOT NULL;
 CREATE INDEX payments_created ON payments(created_at DESC);
 CREATE INDEX payments_account_created ON payments(account_id,created_at DESC);
+CREATE TABLE payment_quotes (
+ payment_id TEXT NOT NULL REFERENCES payments(id), chain TEXT NOT NULL, chain_name TEXT NOT NULL,
+ asset TEXT NOT NULL, symbol TEXT NOT NULL, decimals INTEGER NOT NULL CHECK(decimals BETWEEN 0 AND 36),
+ address TEXT NOT NULL, amount TEXT NOT NULL, rate_usd TEXT NOT NULL,
+ PRIMARY KEY(payment_id,asset)
+) STRICT;
+CREATE TABLE payment_transfers (
+ id TEXT PRIMARY KEY, payment_id TEXT NOT NULL REFERENCES payments(id),
+ chain TEXT NOT NULL, asset TEXT NOT NULL, address TEXT NOT NULL, tx_hash TEXT NOT NULL, amount TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('seen','confirmed')),
+ value_micro INTEGER NOT NULL DEFAULT 0 CHECK(value_micro>=0), note TEXT NOT NULL DEFAULT '',
+ seen_at INTEGER NOT NULL, confirmed_at INTEGER
+) STRICT;
+CREATE INDEX payment_transfers_payment ON payment_transfers(payment_id,seen_at);
 CREATE TABLE payment_events (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;

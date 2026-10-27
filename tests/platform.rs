@@ -1025,18 +1025,18 @@ fn signature(secret: &str, body: &[u8], timestamp: i64) -> String {
 fn stripe_signature_rejects_tampering_and_replay() {
     let body = b"{\"id\":\"evt_test\"}";
     let h = signature("whsec_test", body, 1000);
-    assert!(reseller::payments::verify("whsec_test", &h, body, 1000).is_ok());
-    assert!(reseller::payments::verify("whsec_test", &h, b"{}", 1000).is_err());
-    assert!(reseller::payments::verify("whsec_test", &h, body, 1301).is_err());
-    assert!(reseller::payments::verify("", &h, body, 1000).is_err());
+    assert!(reseller::payments::stripe::verify("whsec_test", &h, body, 1000).is_ok());
+    assert!(reseller::payments::stripe::verify("whsec_test", &h, b"{}", 1000).is_err());
+    assert!(reseller::payments::stripe::verify("whsec_test", &h, body, 1301).is_err());
+    assert!(reseller::payments::stripe::verify("", &h, body, 1000).is_err());
 }
 #[tokio::test]
 async fn payment_webhook_uses_snapshot_and_grants_only_once() {
     let t = Test::new().await;
     let k = t.key().await;
-    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
+    t.app.config_mut().await.stripe.webhook_secret = "whsec_test".into();
     let aid = k["account_id"].as_str().unwrap();
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order1',?,'monthly',20000000,25000000,40,'cs_test',?)").bind(aid).bind(db::now()).execute(&t.app.db).await.unwrap();
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order1',?,'monthly','stripe',20000000,25000000,40,'cs_test',?)").bind(aid).bind(db::now()).execute(&t.app.db).await.unwrap();
     let mut event = json!({"id":"evt_one","type":"checkout.session.completed","data":{"object":{"id":"cs_test","client_reference_id":"order1","metadata":{"order_id":"order1"},"mode":"payment","currency":"usd","amount_total":2000,"payment_status":"paid"}}});
     for eid in ["evt_one", "evt_one", "evt_two"] {
         event["id"] = eid.into();
@@ -1048,7 +1048,7 @@ async fn payment_webhook_uses_snapshot_and_grants_only_once() {
                 .parse()
                 .unwrap(),
         );
-        reseller::payments::webhook(&t.app, &h, body.as_bytes())
+        reseller::payments::stripe::webhook(&t.app, &h, body.as_bytes())
             .await
             .unwrap();
     }
@@ -1066,8 +1066,8 @@ async fn payment_webhook_uses_snapshot_and_grants_only_once() {
 async fn payment_amount_mismatch_rolls_back_event_and_credit() {
     let t = Test::new().await;
     let k = t.key().await;
-    t.app.config_mut().await.stripe_webhook_secret = "whsec_test".into();
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,session_id,created_at) VALUES('order1',?,'monthly',20000000,20000000,30,'cs_test',?)").bind(k["account_id"].as_str()).bind(db::now()).execute(&t.app.db).await.unwrap();
+    t.app.config_mut().await.stripe.webhook_secret = "whsec_test".into();
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order1',?,'monthly','stripe',20000000,20000000,30,'cs_test',?)").bind(k["account_id"].as_str()).bind(db::now()).execute(&t.app.db).await.unwrap();
     let event=json!({"id":"evt_bad","type":"checkout.session.completed","data":{"object":{"id":"cs_test","client_reference_id":"order1","metadata":{"order_id":"order1"},"mode":"payment","currency":"usd","amount_total":1,"payment_status":"paid"}}}).to_string();
     let mut h = HeaderMap::new();
     h.insert(
@@ -1077,7 +1077,7 @@ async fn payment_amount_mismatch_rolls_back_event_and_credit() {
             .unwrap(),
     );
     assert!(
-        reseller::payments::webhook(&t.app, &h, event.as_bytes())
+        reseller::payments::stripe::webhook(&t.app, &h, event.as_bytes())
             .await
             .is_err()
     );
@@ -1103,13 +1103,14 @@ fn starter_config_documents_every_option_and_validates() {
     seeded.validate().unwrap();
     for key in [
         // Config
-        "site_name",
+        "branding",
         "public_url",
         "admin_token",
         "key_pepper",
         "llm",
         "tts",
         "stt",
+        "image",
         "model_policy",
         "voice_policy",
         "markup_pct",
@@ -1131,18 +1132,46 @@ fn starter_config_documents_every_option_and_validates() {
         "upstream_timeout_seconds",
         "log_retention_days",
         "max_log_entries",
-        "stripe_secret_key",
-        "stripe_webhook_secret",
+        "stripe",
+        "payroof",
+        // Branding
+        "name",
+        "tagline",
+        "description",
+        "logo_url",
+        "favicon_url",
+        "theme_color",
+        "color_scheme",
+        "css_vars",
+        "custom_css",
+        "hero_title",
+        "footer_links",
+        // Payments
+        "secret_key",
+        "webhook_secret",
+        "api_url",
+        "project",
+        "token",
+        "stablecoins",
+        "native_coins",
+        "chains",
+        "rate_source",
+        "native_rates_usd",
+        "quote_ttl_minutes",
+        "underpayment_tolerance_pct",
         // Upstream
         "base_url",
         "api_key",
         "model",
         "voice",
         "fallbacks",
+        "timeout_seconds",
+        "headers",
         // Price
         "input",
         "output",
         "audio_second",
+        "image",
         // Limits / windows
         "rpm",
         "requests",

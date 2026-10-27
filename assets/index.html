@@ -3,20 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#0c0e0d">
-  <meta name="description" content="Your API workspace. Create keys, track usage, and manage your balance.">
-  <title>Reseller — API workspace</title>
-  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
-  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
+  <meta name="color-scheme" content="{{color_scheme}}">
+  <meta name="theme-color" content="{{theme_color}}">
+  <meta name="description" content="{{description}}">
+  <title>{{title}}</title>
+  {{favicon_links}}
   <link rel="stylesheet" href="/assets/style.css">
+  <link rel="stylesheet" href="/assets/theme.css">
+  <script type="application/json" id="branding">{{branding_json}}</script>
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
   <header>
     <div class="shell">
-      <a class="brand" href="/"><img class="mark" src="/assets/favicon.svg" alt="" width="36" height="36"> reseller</a>
+      <a class="brand" href="/"><img class="mark" src="{{logo_url}}" alt="" width="36" height="36"> <span class="brand-name">{{name}}</span></a>
       <div class="actions" id="header-actions"></div>
     </div>
   </header>
@@ -27,8 +28,8 @@
   <div id="notice" popover="manual" role="status" aria-live="polite" aria-atomic="true"></div>
   <footer>
     <div class="shell">
-      <span>Reseller <span class="muted">/ independently hosted</span></span>
-      <a href="https://github.com/reseller-rs/reseller">Source ↗</a>
+      <span>{{name}} <span class="muted">{{footer_text}}</span></span>
+      <span class="footer-links">{{footer_links}}</span>
     </div>
   </footer>
 </body>

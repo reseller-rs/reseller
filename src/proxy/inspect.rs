@@ -5,10 +5,33 @@ use serde_json::Value;
 
 /// Largest SSE line or JSON body retained for parsing.
 const CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+/// Bytes kept from the end of a larger JSON body (for example inline base64
+/// images) to find its trailing `usage` object.
+const TAIL_LIMIT: usize = 256 * 1024;
+/// Marks one inline generated image in an images API response.
+const IMAGE_MARKER: &[u8] = b"\"b64_json\"";
 /// Audio responses only need their header to determine the format.
 const AUDIO_HEADER_LIMIT: usize = 64 * 1024;
 /// OpenAI raw PCM output: 24 kHz, 16-bit, mono.
 const PCM_BYTES_PER_SECOND: i64 = 48_000;
+
+/// Bytes per second of 16-bit PCM from `rate=`/`channels=` content-type
+/// parameters (for example `audio/pcm;rate=16000;channels=2`).
+fn pcm_bytes_per_second(content_type: &str) -> i64 {
+    let param = |name: &str| {
+        content_type
+            .split(';')
+            .skip(1)
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.trim().trim_matches('"').parse::<i64>().ok())
+            .filter(|n| (1..=1_000_000).contains(n))
+    };
+    match (param("rate"), param("channels")) {
+        (None, None) => PCM_BYTES_PER_SECOND,
+        (rate, channels) => rate.unwrap_or(24_000) * channels.unwrap_or(1).min(16) * 2,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
@@ -48,7 +71,16 @@ pub struct Inspector {
     skipping_line: bool,
     /// Bounded prefix of a JSON body or audio header.
     capture: Vec<u8>,
+    /// Set once a JSON body outgrows [`CAPTURE_LIMIT`]; `tail` then holds
+    /// its last bytes.
+    overflow: bool,
+    tail: Vec<u8>,
+    /// Inline images seen so far, and the bytes that may start a marker
+    /// split across chunks.
+    images: i64,
+    marker_carry: Vec<u8>,
     bytes: i64,
+    pcm_rate: i64,
     pub usage: Usage,
 }
 
@@ -59,7 +91,12 @@ impl Inspector {
             line: Vec::new(),
             skipping_line: false,
             capture: Vec::new(),
+            overflow: false,
+            tail: Vec::new(),
+            images: 0,
+            marker_carry: Vec::new(),
             bytes: 0,
+            pcm_rate: pcm_bytes_per_second(content_type),
             usage: Usage::default(),
         }
     }
@@ -85,7 +122,10 @@ impl Inspector {
                     }
                 }
             }
-            Format::Json => self.capture_prefix(chunk, CAPTURE_LIMIT),
+            Format::Json => {
+                self.count_images(chunk);
+                self.capture_json(chunk);
+            }
             Format::Wav | Format::Pcm | Format::OtherAudio => {
                 self.capture_prefix(chunk, AUDIO_HEADER_LIMIT);
             }
@@ -97,16 +137,59 @@ impl Inspector {
     pub fn finish(&mut self) {
         match self.format {
             Format::EventStream if !self.skipping_line => self.parse_line(),
-            Format::Json => {
+            Format::Json if !self.overflow => {
                 if let Ok(v) = serde_json::from_slice::<Value>(&self.capture) {
                     self.observe(&v);
+                    self.usage.images = inline_images(&v);
                 }
             }
+            Format::Json => {
+                if let Some(usage) = trailing_usage(&self.tail) {
+                    self.usage = Usage::parse(&usage);
+                }
+                self.usage.images = self.images;
+            }
             Format::Pcm => {
-                self.usage.audio_ms = self.bytes.saturating_mul(1000) / PCM_BYTES_PER_SECOND;
+                self.usage.audio_ms = self.bytes.saturating_mul(1000) / self.pcm_rate;
             }
             Format::Wav => self.usage.audio_ms = wav_ms(&self.capture, self.bytes).unwrap_or(0),
             _ => {}
+        }
+    }
+
+    /// Keeps the whole JSON body up to [`CAPTURE_LIMIT`], then only a tail.
+    fn capture_json(&mut self, chunk: &[u8]) {
+        if !self.overflow && self.capture.len() + chunk.len() <= CAPTURE_LIMIT {
+            self.capture.extend_from_slice(chunk);
+            return;
+        }
+        if !self.overflow {
+            self.overflow = true;
+            self.tail = std::mem::take(&mut self.capture);
+        }
+        self.tail.extend_from_slice(chunk);
+        if self.tail.len() > 2 * TAIL_LIMIT {
+            let cut = self.tail.len() - TAIL_LIMIT;
+            self.tail.drain(..cut);
+        }
+    }
+
+    /// Counts [`IMAGE_MARKER`] occurrences across chunk boundaries.
+    fn count_images(&mut self, chunk: &[u8]) {
+        let keep = IMAGE_MARKER.len() - 1;
+        let head = &chunk[..chunk.len().min(keep)];
+        let mut window = std::mem::take(&mut self.marker_carry);
+        window.extend_from_slice(head);
+        // Markers that start in the carried bytes and end in this chunk.
+        let mut found = count(&window, IMAGE_MARKER);
+        found += count(chunk, IMAGE_MARKER);
+        self.images = self.images.saturating_add(found as i64);
+        let carry_from = chunk.len().saturating_sub(keep);
+        if chunk.len() >= keep {
+            self.marker_carry = chunk[carry_from..].to_vec();
+        } else {
+            window.drain(..window.len().saturating_sub(keep));
+            self.marker_carry = window;
         }
     }
 
@@ -138,6 +221,46 @@ fn usage_object(v: &Value) -> Option<&Value> {
         .or_else(|| v.pointer("/response/usage"))
         .or_else(|| v.pointer("/data/usage"))
         .filter(|u| u.is_object())
+}
+
+/// Non-overlapping occurrences of `needle` in `haystack`.
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// Generated images in an images API response (`data[]` entries carrying
+/// `b64_json` or `url`).
+fn inline_images(v: &Value) -> i64 {
+    v["data"].as_array().map_or(0, |items| {
+        items
+            .iter()
+            .filter(|i| i.get("b64_json").is_some() || i.get("url").is_some_and(Value::is_string))
+            .count() as i64
+    })
+}
+
+/// The last top-level-looking `"usage": {…}` object in the tail of a JSON
+/// body too large to buffer.
+fn trailing_usage(tail: &[u8]) -> Option<Value> {
+    const KEY: &[u8] = b"\"usage\"";
+    let mut end = tail.len();
+    while let Some(pos) = tail[..end].windows(KEY.len()).rposition(|w| w == KEY) {
+        let rest = &tail[pos + KEY.len()..];
+        let rest = &rest[rest.iter().position(|b| !b.is_ascii_whitespace())?..];
+        if let Some(object) = rest.strip_prefix(b":")
+            && let Some(Ok(value)) = serde_json::Deserializer::from_slice(object)
+                .into_iter::<Value>()
+                .next()
+            && value.is_object()
+        {
+            return Some(value);
+        }
+        end = pos;
+    }
+    None
 }
 
 /// Usage carried by a realtime WebSocket server event. Each `response.done`
@@ -195,6 +318,63 @@ mod tests {
             realtime_usage(r#"{"type":"conversation.item.created","note":"response.done"}"#)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn large_image_responses_keep_trailing_usage_and_count_images() {
+        let image = "A".repeat(CAPTURE_LIMIT + 1024);
+        let body = format!(
+            r#"{{"created":1,"data":[{{"b64_json":"{image}","media_type":"image/webp"}},{{"b64_json":"{image}"}}],"usage":{{"prompt_tokens":9,"completion_tokens":642,"total_tokens":651,"cost":0.01}}}}"#
+        );
+        let mut inspector = Inspector::new("application/json");
+        // Odd chunk sizes split the image marker across chunk boundaries.
+        for chunk in body.as_bytes().chunks(4093) {
+            inspector.feed(chunk);
+        }
+        inspector.finish();
+        assert_eq!(inspector.usage.total, 651);
+        assert_eq!(inspector.usage.cost, Some(10_000));
+        assert_eq!(inspector.usage.images, 2);
+    }
+
+    #[test]
+    fn small_image_responses_count_data_entries() {
+        let mut inspector = Inspector::new("application/json");
+        inspector.feed(
+            br#"{"data":[{"url":"https://x/1.png"},{"b64_json":"AA"}],"usage":{"total_tokens":3}}"#,
+        );
+        inspector.finish();
+        assert_eq!(inspector.usage.images, 2);
+        let mut models = Inspector::new("application/json");
+        models.feed(br#"{"data":[{"id":"m","object":"model"}]}"#);
+        models.finish();
+        assert_eq!(models.usage.images, 0);
+    }
+
+    #[test]
+    fn marker_counting_handles_every_split() {
+        let body = br#"{"data":[{"b64_json":"x"},{"b64_json":"y"}]}"#;
+        for size in 1..body.len() {
+            let mut inspector = Inspector::new("application/json");
+            for chunk in body.chunks(size) {
+                inspector.count_images(chunk);
+            }
+            assert_eq!(inspector.images, 2, "chunk size {size}");
+        }
+    }
+
+    #[test]
+    fn pcm_duration_uses_content_type_parameters() {
+        for (content_type, ms) in [
+            ("audio/pcm", 2800),
+            ("audio/pcm;rate=24000;channels=1", 2800),
+            ("audio/L16; rate=16000; channels=2", 2100),
+        ] {
+            let mut inspector = Inspector::new(content_type);
+            inspector.feed(&vec![0; 134_400]);
+            inspector.finish();
+            assert_eq!(inspector.usage.audio_ms, ms, "{content_type}");
+        }
     }
 
     #[test]

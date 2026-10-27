@@ -19,7 +19,7 @@ const MAX_NAME_CHARS: usize = 80;
 const MAX_CONTACT_CHARS: usize = 254;
 
 /// Usage limits stored as JSON on every key.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Requests per rolling minute.
@@ -34,7 +34,7 @@ pub struct Limits {
 }
 
 /// A count limit over a window of whole hours.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Window {
     pub max: i64,
@@ -42,7 +42,7 @@ pub struct Window {
 }
 
 /// A spend limit (decimal USD string) over a window of whole hours.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spend {
     pub max_usd: String,

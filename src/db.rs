@@ -44,16 +44,23 @@ pub async fn write(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>> {
     Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
 }
 
+/// The stored settings, if the database has been seeded.
+pub async fn stored_settings(pool: &SqlitePool) -> anyhow::Result<Option<Config>> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE id=1")
+        .fetch_optional(pool)
+        .await?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("stored settings are not readable by this version: {e}"))
+}
+
 /// Returns the stored settings, or seeds them from `seed` on first start.
 ///
 /// Missing secrets are generated during seeding; a generated administrator
 /// token is printed once because it cannot be recovered later.
 pub async fn settings(pool: &SqlitePool, mut seed: Config) -> anyhow::Result<Config> {
-    if let Some(value) = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE id=1")
-        .fetch_optional(pool)
-        .await?
-    {
-        return Ok(serde_json::from_str(&value)?);
+    if let Some(stored) = stored_settings(pool).await? {
+        return Ok(stored);
     }
     if seed.admin_token.is_empty() {
         seed.admin_token = crate::identity::secret("admin_");

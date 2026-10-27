@@ -106,9 +106,23 @@ fn direction(q: &Query) -> &'static str {
     }
 }
 
-/// `%term%` for a LIKE search on `q` (matches everything when absent).
+/// `%term%` for a `LIKE … ESCAPE '\'` search on `q` (matches everything
+/// when absent). `%`, `_` and `\` in the term match literally.
 fn search(q: &Query) -> String {
-    format!("%{}%", q.get("q").map(String::as_str).unwrap_or(""))
+    like(q.get("q").map(String::as_str).unwrap_or(""))
+}
+
+fn like(term: &str) -> String {
+    let mut out = String::with_capacity(term.len() + 2);
+    out.push('%');
+    for c in term.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
 }
 
 /// The `status` filter, or `""` for any.
@@ -205,7 +219,8 @@ async fn list_keys(app: &App, account: Option<&str>, q: &Query) -> Result<Value>
     let status = status_filter(q);
     let page = Page::from(q);
     const FILTER: &str = "(? IS NULL OR account_id=?) AND (?='' OR status=?) \
-                          AND (name LIKE ? OR key_prefix LIKE ? OR id LIKE ?)";
+                          AND (name LIKE ? ESCAPE '\\' OR key_prefix LIKE ? ESCAPE '\\' \
+                          OR id LIKE ? ESCAPE '\\')";
     let total: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM api_keys WHERE {FILTER}"
     )))
@@ -361,14 +376,14 @@ fn request_filters(sql: &mut QueryBuilder<Sqlite>, account: Option<&str>, q: &Qu
         };
     }
     if let Some(v) = q.get("q") {
-        let like = format!("%{v}%");
+        let like = like(v);
         sql.push(" AND (model LIKE ")
             .push_bind(like.clone())
-            .push(" OR path LIKE ")
+            .push(" ESCAPE '\\' OR path LIKE ")
             .push_bind(like.clone())
-            .push(" OR id LIKE ")
+            .push(" ESCAPE '\\' OR id LIKE ")
             .push_bind(like)
-            .push(")");
+            .push(" ESCAPE '\\')");
     }
     if let Some(hour) = q.get("hour") {
         let start = hour

@@ -1,9 +1,10 @@
-//! Stripe Checkout. Each checkout creates a server-side order that snapshots
-//! the plan's price, credit, and duration; the signed webhook grants exactly
-//! that snapshot, once.
+//! Stripe-hosted one-time Checkout, completed by the signed
+//! `checkout.session.*` webhook.
+use super::{complete, create_order, first_delivery, provider_error};
 use crate::{
-    App, billing,
-    db::{self, id, now},
+    App,
+    config::Config,
+    db,
     error::{Error, Result},
     identity::Identity,
 };
@@ -11,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use sqlx::Row;
+use sqlx::{Row, sqlite::SqliteRow};
 use std::time::Duration;
 
 const CHECKOUT_URL: &str = "https://api.stripe.com/v1/checkout/sessions";
@@ -26,55 +27,42 @@ const PAID_EVENTS: [&str; 2] = [
     "checkout.session.async_payment_succeeded",
 ];
 
-fn provider_error(message: &str) -> Error {
-    Error::new(StatusCode::BAD_GATEWAY, "payment_provider_error", message)
-}
-
 /// Creates an order and a Stripe Checkout session for an active plan.
-pub async fn checkout(app: &App, identity: &Identity, body: &Value) -> Result<Value> {
-    let config = app.config().await;
-    if config.stripe_secret_key.is_empty() || config.stripe_webhook_secret.is_empty() {
-        return Err(Error::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "payments_unavailable",
-            "Online payments are not configured. Ask the operator for a redeem code.",
-        ));
-    }
-    let code = body["plan_code"]
-        .as_str()
-        .ok_or_else(|| Error::bad("plan_code is required"))?;
-    let plan = sqlx::query("SELECT * FROM plans WHERE code=? AND active=1")
-        .bind(code)
-        .fetch_optional(&app.db)
-        .await?
-        .ok_or_else(|| Error::bad("Plan not found"))?;
+pub(super) async fn checkout(
+    app: &App,
+    config: &Config,
+    identity: &Identity,
+    plan: &SqliteRow,
+) -> Result<Value> {
     let price: i64 = plan.get("price_micro");
     if price % MICROS_PER_CENT != 0 || price < MIN_CHARGE_MICROS {
         return Err(Error::bad(
-            "Stripe plans must be at least $0.50 and priced in whole cents",
+            "Card payments require plans of at least $0.50 priced in whole cents",
         ));
     }
-    let order = id();
-    sqlx::query(
-        "INSERT INTO payments(id,account_id,plan_code,price_micro,credit_micro,duration_days,created_at) \
-         VALUES(?,?,?,?,?,?,?)",
+    let order = db::id();
+    create_order(
+        &mut *app.db.acquire().await?,
+        &order,
+        &identity.account_id,
+        plan,
+        "stripe",
+        None,
     )
-    .bind(&order)
-    .bind(&identity.account_id)
-    .bind(code)
-    .bind(price)
-    .bind(plan.get::<i64, _>("credit_micro"))
-    .bind(plan.get::<i64, _>("duration_days"))
-    .bind(now())
-    .execute(&app.db)
     .await?;
     let base = config.public_base();
     let form = [
         ("mode", "payment".to_owned()),
         ("client_reference_id", order.clone()),
         ("metadata[order_id]", order.clone()),
-        ("success_url", format!("{base}/workspace/?payment=success")),
-        ("cancel_url", format!("{base}/workspace/?payment=cancelled")),
+        (
+            "success_url",
+            format!("{base}/workspace/?payment=success#billing"),
+        ),
+        (
+            "cancel_url",
+            format!("{base}/workspace/?payment=cancelled#billing"),
+        ),
         ("line_items[0][price_data][currency]", "usd".into()),
         (
             "line_items[0][price_data][unit_amount]",
@@ -89,7 +77,7 @@ pub async fn checkout(app: &App, identity: &Identity, body: &Value) -> Result<Va
     let response = app
         .client
         .post(CHECKOUT_URL)
-        .bearer_auth(&config.stripe_secret_key)
+        .bearer_auth(&config.stripe.secret_key)
         .header("Idempotency-Key", &order)
         .form(&form)
         .timeout(Duration::from_secs(30))
@@ -110,14 +98,14 @@ pub async fn checkout(app: &App, identity: &Identity, body: &Value) -> Result<Va
         .as_str()
         .ok_or_else(|| Error::internal("Stripe response missing URL"))?;
     sqlx::query(
-        "UPDATE payments SET session_id=? WHERE id=? AND (session_id IS NULL OR session_id=?)",
+        "UPDATE payments SET external_id=? WHERE id=? AND (external_id IS NULL OR external_id=?)",
     )
     .bind(session_id)
     .bind(&order)
     .bind(session_id)
     .execute(&app.db)
     .await?;
-    Ok(json!({"url": url, "order_id": order}))
+    Ok(json!({"method": super::STRIPE, "url": url, "order_id": order}))
 }
 
 /// Verifies a `Stripe-Signature` header (`t=…,v1=…`) against `body` at Unix
@@ -170,7 +158,7 @@ pub async fn webhook(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<Valu
         .get("stripe-signature")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    verify(&config.stripe_webhook_secret, signature, body, now())?;
+    verify(&config.stripe.webhook_secret, signature, body, db::now())?;
     let event: Value = serde_json::from_slice(body)?;
     let event_id = event["id"]
         .as_str()
@@ -187,17 +175,10 @@ pub async fn webhook(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<Valu
         .as_str()
         .ok_or_else(|| Error::bad("Session id missing"))?;
     let mut tx = db::write(&app.db).await?;
-    let inserted = sqlx::query(
-        "INSERT INTO payment_events(id,created_at) VALUES(?,?) ON CONFLICT(id) DO NOTHING",
-    )
-    .bind(event_id)
-    .bind(now())
-    .execute(&mut *tx)
-    .await?;
-    if inserted.rows_affected() == 0 {
+    if !first_delivery(&mut tx, &format!("stripe:{event_id}")).await? {
         return Ok(json!({"received": true, "duplicate": true}));
     }
-    let order = sqlx::query("SELECT * FROM payments WHERE id=?")
+    let order = sqlx::query("SELECT * FROM payments WHERE id=? AND provider='stripe'")
         .bind(order_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -208,29 +189,19 @@ pub async fn webhook(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<Valu
         || session["amount_total"].as_i64() != Some(expected_cents)
         || session["metadata"]["order_id"] != order_id
         || order
-            .get::<Option<String>, _>("session_id")
+            .get::<Option<String>, _>("external_id")
             .is_some_and(|s| s != session_id)
     {
         // Dropping the transaction also forgets the event id, so a corrected
         // retry is not mistaken for a duplicate.
         return Err(Error::bad("Payment does not match order"));
     }
-    if order.get::<String, _>("status") != "paid" {
-        billing::grant_snapshot(
-            &mut tx,
-            order.get("account_id"),
-            order.get("plan_code"),
-            order.get("credit_micro"),
-            order.get("duration_days"),
-        )
+    sqlx::query("UPDATE payments SET external_id=?,received_micro=price_micro WHERE id=?")
+        .bind(session_id)
+        .bind(order_id)
+        .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE payments SET status='paid',paid_at=?,session_id=? WHERE id=?")
-            .bind(now())
-            .bind(session_id)
-            .bind(order_id)
-            .execute(&mut *tx)
-            .await?;
-    }
+    complete(&mut tx, order_id, "stripe").await?;
     tx.commit().await?;
     Ok(json!({"received": true}))
 }

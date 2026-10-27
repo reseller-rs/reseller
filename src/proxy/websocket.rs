@@ -1,8 +1,8 @@
 //! WebSocket relay for realtime APIs (`/v1/realtime?model=…`).
-use super::{Kind, forward_headers, inspect::realtime_usage};
+use super::{Kind, inspect::realtime_usage, timeout, upstream_headers};
 use crate::{
     App,
-    config::{Policy, Upstream},
+    config::{Config, Policy, Upstream},
     error::{Error, Result},
     identity::Identity,
     meter::{Meter, RequestMeta},
@@ -61,11 +61,11 @@ pub(super) async fn relay(
     ip: String,
     identity: Option<Identity>,
     upstream: &Upstream,
-    policy: Policy,
+    config: &Config,
     mut url: url::Url,
 ) -> Result<Response<Body>> {
     let (mut parts, _) = req.into_parts();
-    let model = apply_model_policy(&mut url, &upstream.model, policy);
+    let model = apply_model_policy(&mut url, &upstream.model, config.model_policy);
     let path = parts.uri.path().to_owned();
     let meter = Meter::begin(
         &app,
@@ -88,7 +88,7 @@ pub(super) async fn relay(
         .map_err(Error::internal)?;
     request
         .headers_mut()
-        .extend(forward_headers(&parts.headers, true));
+        .extend(upstream_headers(&parts.headers, upstream));
     request.headers_mut().insert(
         header::AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", upstream.api_key)).map_err(Error::internal)?,
@@ -130,7 +130,7 @@ pub(super) async fn relay(
     {
         upgrade = upgrade.protocols([protocol.to_owned()]);
     }
-    let session_limit = Duration::from_secs(app.config().await.upstream_timeout_seconds);
+    let session_limit = timeout(config, upstream);
     Ok(upgrade
         .on_upgrade(move |down| session(down, up, meter, session_limit))
         .into_response())

@@ -20,7 +20,11 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
 
     // Public routes: the plan catalogue and self-service signup.
     match (path.as_slice(), method.as_str()) {
-        (["plans"], "GET") => return billing::plans(app, true).await,
+        (["plans"], "GET") => {
+            let mut plans = billing::plans(app, true).await?;
+            plans["payment_methods"] = payments::methods(&*app.config().await).into();
+            return Ok(plans);
+        }
         (["keys"], "POST") => {
             let creator = identity::authenticate(app, req.headers(), Scope::Manage).await?;
             let body = object(req).await?;
@@ -45,6 +49,8 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["account", "checkout"], "POST") => {
             payments::checkout(app, &me, &object(req).await?).await
         }
+        (["account", "payments"], "GET") => payments::account_orders(app, account).await,
+        (["account", "payments", pid], "GET") => payments::order(app, pid, Some(account)).await,
         (["account", "usage"], "GET") => {
             let key = q.get("key").map(String::as_str);
             if let Some(key) = key {

@@ -1,6 +1,10 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use reseller::{App, config::Config, db, identity, stats, web};
+use reseller::{
+    App,
+    config::{Config, SECRET_PATHS},
+    db, identity, stats, web,
+};
 use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
@@ -37,6 +41,10 @@ struct Cli {
     host: IpAddr,
     #[arg(long, env = "PORT", default_value_t = 56787, global = true)]
     port: u16,
+    /// Directory with white-label files (index.html, theme.css, logos,
+    /// fonts) served under /theme/
+    #[arg(long, env = "RESELLER_THEME_DIR", global = true)]
+    theme_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -57,6 +65,23 @@ enum Command {
     Backup { destination: PathBuf },
     /// Probe the local readiness endpoint (used by the container health check)
     Healthcheck,
+    /// Export or replace the stored settings (server must be stopped to import)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the stored settings as TOML (secrets blanked unless requested)
+    Export {
+        #[arg(long)]
+        include_secrets: bool,
+    },
+    /// Validate a TOML file and replace the stored settings with it; blank
+    /// secrets (tokens, pepper, API keys) keep their stored values
+    Import { file: PathBuf },
 }
 
 #[tokio::main]
@@ -79,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor => {
             let (pool, config) = open(&cli).await?;
             pool.close().await;
-            doctor(&cli.database, &config);
+            doctor(&cli, &config);
             Ok(())
         }
         Command::ResetAdmin => {
@@ -108,20 +133,66 @@ async fn main() -> anyhow::Result<()> {
             println!("Backup saved to {}", destination.display());
             Ok(())
         }
+        Command::Config { action } => {
+            let (pool, current) = open(&cli).await?;
+            let result = match action {
+                ConfigAction::Export { include_secrets } => {
+                    print!("{}", current.to_toml(include_secrets)?);
+                    Ok(())
+                }
+                ConfigAction::Import { file } => import(&pool, &current, &file).await,
+            };
+            pool.close().await;
+            result
+        }
         Command::Serve => {
+            if let Some(dir) = &cli.theme_dir {
+                anyhow::ensure!(dir.is_dir(), "theme directory {} not found", dir.display());
+            }
             let (pool, config) = open(&cli).await?;
-            serve(&cli, App::new(pool, config)?).await
+            let app = App::new(pool, config)?.with_theme_dir(cli.theme_dir.clone());
+            serve(&cli, app).await
         }
     }
 }
 
-/// Opens the database and loads (or seeds) validated settings.
+/// Replaces the stored settings with a validated TOML file.
+async fn import(pool: &sqlx::SqlitePool, current: &Config, file: &Path) -> anyhow::Result<()> {
+    let mut merged = serde_json::to_value(Config::from_toml_file(file)?)?;
+    let stored = serde_json::to_value(current)?;
+    // Blank secrets (as in `config export` output) keep their stored values.
+    for path in SECRET_PATHS {
+        if let (Some(slot), Some(kept)) = (merged.pointer_mut(path), stored.pointer(path))
+            && slot.as_str() == Some("")
+        {
+            *slot = kept.clone();
+        }
+    }
+    let imported: Config = serde_json::from_value(merged)?;
+    imported
+        .validate()
+        .with_context(|| format!("{} is invalid", file.display()))?;
+    db::save_settings(pool, &imported).await?;
+    if imported.key_pepper != current.key_pepper {
+        println!("Warning: key_pepper changed; existing keys and unredeemed codes no longer work.");
+    }
+    println!(
+        "Imported settings from {}. Restart reseller to apply them.",
+        file.display()
+    );
+    Ok(())
+}
+
+/// Opens the database and loads (or, on first start, seeds) validated
+/// settings. The seed file is only read when the database has no settings.
 async fn open(cli: &Cli) -> anyhow::Result<(sqlx::SqlitePool, Config)> {
-    let seed = Config::load(&cli.config)?;
     let pool = db::open(&cli.database)
         .await
         .with_context(|| format!("opening database {}", cli.database.display()))?;
-    let config = db::settings(&pool, seed).await?;
+    let config = match db::stored_settings(&pool).await? {
+        Some(stored) => stored,
+        None => db::settings(&pool, Config::load(&cli.config)?).await?,
+    };
     config.validate().context("stored settings are invalid")?;
     Ok((pool, config))
 }
@@ -167,33 +238,51 @@ fn healthcheck(host: IpAddr, port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn doctor(database: &Path, config: &Config) {
+fn doctor(cli: &Cli, config: &Config) {
     let state = |configured: bool, missing: &'static str| {
         if configured { "configured" } else { missing }
     };
     println!(
         "Database: {} (migrations current, WAL enabled)",
-        database.display()
+        cli.database.display()
     );
     println!("Configuration: valid");
     println!(
         "Administrator authentication: {}",
         state(!config.admin_token.is_empty(), "missing")
     );
+    for (name, upstream) in config.upstreams() {
+        let model = if upstream.model.is_empty() {
+            "client-selected model".to_owned()
+        } else {
+            format!("model {}", upstream.model)
+        };
+        if upstream.api_key.is_empty() {
+            let hint = if name == "llm" {
+                "missing key — configure before proxying"
+            } else {
+                "disabled (no API key)"
+            };
+            println!("Upstream {name}: {hint}");
+        } else {
+            println!("Upstream {name}: {} ({model})", upstream.base_url);
+        }
+    }
+    println!("Stripe: {}", state(config.stripe.enabled(), "disabled"));
     println!(
-        "LLM upstream key: {}",
-        state(
-            !config.llm.api_key.is_empty(),
-            "missing — configure before proxying"
-        )
+        "Payroof crypto payments: {}",
+        if config.payroof.enabled() {
+            format!("configured (project {})", config.payroof.project)
+        } else {
+            "disabled (set payroof.project, token and webhook_secret)".into()
+        }
     );
-    println!(
-        "Stripe: {}",
-        state(
-            !config.stripe_secret_key.is_empty() && !config.stripe_webhook_secret.is_empty(),
-            "disabled"
-        )
-    );
+    println!("Branding: {}", config.branding.name);
+    match &cli.theme_dir {
+        Some(dir) if dir.is_dir() => println!("Theme directory: {}", dir.display()),
+        Some(dir) => println!("Theme directory: {} (NOT FOUND)", dir.display()),
+        None => println!("Theme directory: none"),
+    }
 }
 
 async fn serve(cli: &Cli, app: App) -> anyhow::Result<()> {
@@ -204,9 +293,10 @@ async fn serve(cli: &Cli, app: App) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
     let port = addr.port();
     println!(
-        "\n  RESELLER  {}\n\n  Listening   {addr}\n  Website     http://localhost:{port}/\n  \
+        "\n  {}  {}\n\n  Listening   {addr}\n  Website     http://localhost:{port}/\n  \
          API         http://localhost:{port}/v1\n  Customers   http://localhost:{port}/workspace/\n  \
          Admin       http://localhost:{port}/admin/\n  Database    {}\n\n  Press Ctrl-C to stop.\n",
+        app.config().await.branding.name.to_uppercase(),
         env!("CARGO_PKG_VERSION"),
         cli.database.display()
     );
