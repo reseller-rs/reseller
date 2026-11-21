@@ -166,7 +166,7 @@ pub fn verify(pepper: &str, payload: &str, max_number: u32, now: i64) -> Result<
     }
     let expires = expires(&solution.salt).ok_or_else(|| invalid("Challenge has no expiry"))?;
     if expires <= now {
-        return Err(invalid("Challenge expired; request a new one"));
+        return Err(invalid("Challenge expired. Request a new one"));
     }
     if solution.number > u64::from(max_number) {
         return Err(invalid("Proof of work number is out of range"));

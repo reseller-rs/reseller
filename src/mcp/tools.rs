@@ -175,7 +175,7 @@ fn tool(name: &str, title: &str, description: &str, schema: Value, annotations: 
     let requirement = match auth {
         Auth::None => "No authentication needed.",
         Auth::Any => "Requires authentication: an API key or a dashboard token.",
-        Auth::Key => "Requires an API key (sk-res-...); dashboard tokens are rejected.",
+        Auth::Key => "Requires an API key (sk-res-...). Dashboard tokens are rejected.",
     };
     json!({
         "name": name,
@@ -216,7 +216,7 @@ pub(super) fn definitions() -> Vec<Value> {
                     "prompt": {"type": "string", "minLength": 1, "maxLength": 200_000, "description": "A single user message."},
                     "messages": {
                         "type": "array", "minItems": 1, "maxItems": 100,
-                        "description": "A conversation; use instead of `prompt`.",
+                        "description": "A conversation. Use instead of `prompt`.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -228,7 +228,7 @@ pub(super) fn definitions() -> Vec<Value> {
                         },
                     },
                     "system": {"type": "string", "maxLength": 50_000, "description": "Optional system instructions placed first."},
-                    "model": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Model id; see list_models. Defaults to the server's model."},
+                    "model": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Model id (see list_models). Defaults to the server's model."},
                     "max_tokens": {"type": "integer", "minimum": 1, "maximum": 131_072},
                     "temperature": {"type": "number", "minimum": 0, "maximum": 2},
                 },
@@ -417,7 +417,7 @@ pub(super) fn definitions() -> Vec<Value> {
             ),
             object(
                 json!({
-                    "altcha": {"type": "string", "maxLength": 2048, "description": "Base64 solution payload; omit when the challenge says it is not required."},
+                    "altcha": {"type": "string", "maxLength": 2048, "description": "Base64 solution payload. Omit when the challenge says it is not required."},
                     "name": {"type": "string", "maxLength": 80},
                     "contact": {"type": "string", "maxLength": 200, "description": "Optional contact such as an email address."},
                 }),
@@ -437,7 +437,7 @@ pub(super) fn instructions(config: &Config) -> String {
             config.signup.free_credit_usd, config.signup.free_credit_expiry_days
         )
     } else {
-        "Self-service signup is disabled; ask the operator for credentials.".to_owned()
+        "Self-service signup is disabled. Ask the operator for credentials.".to_owned()
     };
     format!(
         "{name} is a metered AI API (text, speech, transcription, images) at {base}.\n\
@@ -447,11 +447,13 @@ pub(super) fn instructions(config: &Config) -> String {
          Without a token, call signup_challenge, solve the proof of work, then create_account \
          (or use the local `reseller mcp` bridge, which does this for you). Credentials are shown once: store them securely.\n\
          \n\
-         Tools: generate_text, generate_speech, transcribe_audio, generate_image, list_models (API key); \
-         account_overview, usage_summary, list_requests, list_keys, create_key, rotate_key, block_key, \
-         redeem_code, start_checkout (any credential); list_plans, signup_challenge, create_account (public).\n\
+         Tools:\n\
+         - API key: generate_text, generate_speech, transcribe_audio, generate_image, list_models.\n\
+         - Any credential: account_overview, usage_summary, list_requests, list_keys, create_key, rotate_key, \
+         block_key, redeem_code, start_checkout.\n\
+         - Public: list_plans, signup_challenge, create_account.\n\
          \n\
-         Pricing: usage is billed in USD against prepaid credit; every generation result reports its \
+         Pricing: usage is billed in USD against prepaid credit. Every generation result reports its \
          billed cost, tokens and the remaining balance. {signup} Use list_plans and start_checkout to add credit; \
          insufficient_balance errors mean the balance is exhausted. Rate limits return an error with a retry delay.",
         name = config.branding.name,
@@ -463,7 +465,7 @@ fn require(ctx: &Ctx, name: &str) -> Result<(), ToolError> {
         (Some(Auth::Any | Auth::Key), None) => Err(ToolError::new(
             "authentication_required",
             "This tool needs credentials. To create an account call signup_challenge, solve the \
-             proof of work and call create_account; to use an existing account configure the MCP \
+             proof of work and call create_account. To use an existing account, configure the MCP \
              client to send `Authorization: Bearer <API key or dashboard token>`. \
              (The local `reseller mcp` bridge offers signup and login tools.)",
         )),

@@ -1897,7 +1897,10 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
     let shown = signup.to_string();
     assert!(!shown.contains(&api_key) && !shown.contains(&dashboard));
     assert!(shown.contains(&api_key[..15]));
-    assert!(shown.contains(b.credentials.to_str().unwrap()));
+    // `shown` is JSON text, so compare with the JSON-escaped path (Windows
+    // paths contain backslashes, which JSON doubles).
+    let path = Value::from(b.credentials.to_str().unwrap()).to_string();
+    assert!(shown.contains(path.trim_matches('"')));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

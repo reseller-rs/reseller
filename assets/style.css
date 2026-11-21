@@ -1,5 +1,5 @@
 /* ==========================================================================
-   reseller — minimalist workspace theme (dark default, light via OS setting)
+   reseller: minimalist workspace theme (dark default, light via OS setting)
    Plain CSS, no build step. Tokens first, then primitives, then views.
    One accent colour; semantic colours (ok/warn/danger/info) mean status only.
    ========================================================================== */
@@ -897,3 +897,60 @@ dialog pre {
 /* Branding hooks */
 .brand-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .footer-links { display: inline-flex; flex-wrap: wrap; gap: 14px; }
+
+/* ---------- API and MCP guidance ---------- */
+
+.get-started h2 { margin-bottom: 20px; }
+.get-started .eyebrow { display: block; margin-bottom: 10px; }
+.start-steps { list-style: none; margin: 0 0 16px; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.start-steps .card { display: flex; gap: 14px; align-items: flex-start; margin: 0; padding: 18px; }
+.start-steps h3 { margin: 0 0 6px; }
+.start-steps p { margin: 0; font-size: 13px; }
+.step-num {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: 600 12px var(--mono);
+}
+.docs-title { margin: 28px 0 14px; }
+.docs-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.docs-split .card { margin: 0; min-width: 0; }
+.docs-split .card p { font-size: 13px; margin: 0 0 12px; }
+.docs-split .code-block { margin-bottom: 12px; }
+.docs-note { margin-top: 24px; }
+.docs-note p { margin: 6px 0 0; font-size: 13px; }
+.doc-table td { white-space: normal; }
+.doc-table td:first-child, .doc-table td:nth-child(2) { white-space: nowrap; }
+.snippet-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; }
+.snippet-tabs button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 5px 12px;
+  font-size: 12.5px;
+  border-radius: 999px;
+}
+.snippet-tabs button:hover { color: var(--text); border-color: var(--border-strong); background: transparent; }
+.snippet-tabs button[aria-selected=true] { color: var(--accent); border-color: var(--accent); }
+.snippets [hidden] { display: none; }
+.code-block { position: relative; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-soft); }
+.code-block pre { padding: 14px 16px; padding-right: 76px; overflow-x: auto; white-space: pre; overflow-wrap: normal; line-height: 1.7; }
+.code-block > button { position: absolute; top: 8px; right: 8px; }
+.conn-row { display: grid; grid-template-columns: 120px minmax(0, auto) 1fr; align-items: center; gap: 6px 14px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.conn-row .label { margin: 0; }
+.conn-row code { cursor: pointer; justify-self: start; overflow-wrap: anywhere; }
+.conn-row code.copied { color: var(--ok); }
+@media (max-width: 900px) {
+  .start-steps, .docs-split { grid-template-columns: 1fr; }
+  .conn-row { grid-template-columns: 1fr; }
+}
+
+.start-steps li, .start-steps li > div, .docs-split .card, .get-started .card { min-width: 0; }
+.get-started code, .docs-split code, .conn-row code, .docs-note code { overflow-wrap: anywhere; }
+.get-started .card-head { flex-wrap: wrap; }
+.code-block { max-width: 100%; }

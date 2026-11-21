@@ -73,7 +73,7 @@ impl Default for Branding {
             hero_text: String::new(),
             footer_text: "independently hosted".into(),
             footer_links: vec![Link {
-                label: "Source ↗".into(),
+                label: "Source".into(),
                 url: "https://github.com/reseller-rs/reseller".into(),
             }],
         }
@@ -136,7 +136,7 @@ impl Branding {
         ] {
             anyhow::ensure!(
                 value.is_empty() || link_target(value),
-                "branding.{field} must be a site path (/…) or an http(s) URL"
+                "branding.{field} must be a site path (/...) or an http(s) URL"
             );
         }
         anyhow::ensure!(

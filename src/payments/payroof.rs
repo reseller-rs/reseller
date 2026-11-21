@@ -194,7 +194,7 @@ async fn call(
     tracing::warn!(%status, code, path, "Payroof rejected request");
     Err(match status.as_u16() {
         401 | 403 => provider_error("The crypto payment provider rejected the project token"),
-        429 | 503 => unavailable("Crypto payments are temporarily unavailable; try again shortly"),
+        429 | 503 => unavailable("Crypto payments are temporarily unavailable. Try again shortly"),
         _ => provider_error("The crypto payment provider rejected the request"),
     })
 }
@@ -756,7 +756,7 @@ pub async fn register_webhook(app: &App) -> Result<Value> {
     let webhook_url = format!("{}{WEBHOOK_PATH}", config.public_base());
     if !webhook_url.starts_with("https://") {
         return Err(Error::bad(
-            "Payroof delivers webhooks only to HTTPS URLs; set public_url to your public https:// origin",
+            "Payroof delivers webhooks only to HTTPS URLs. Set public_url to your public https:// origin",
         ));
     }
     let created = call(
@@ -781,7 +781,7 @@ pub async fn register_webhook(app: &App) -> Result<Value> {
         "id": created["id"],
         "url": webhook_url,
         "events": created["events"],
-        "notice": "Webhook registered; its signing secret was saved to the settings.",
+        "notice": "Webhook registered. Its signing secret was saved to the settings.",
     }))
 }
 

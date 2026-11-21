@@ -27,7 +27,7 @@ pub async fn management(app: &App, ip: &str) -> Result<()> {
     app.limiter
         .acquire(&format!("mgmt:{ip}"), limit, MINUTE)
         .map_err(|wait| {
-            Error::too_many("management_rate_limited", "Too many requests; slow down")
+            Error::too_many("management_rate_limited", "Too many requests. Slow down")
                 .retry_after(wait)
         })
 }
@@ -54,7 +54,7 @@ pub async fn check_auth_failures(app: &App, ip: &str) -> Result<()> {
     match app.limiter.blocked(&format!("authfail:{ip}"), limit, HOUR) {
         Some(wait) => Err(Error::too_many(
             "too_many_auth_failures",
-            "Too many invalid credentials from this address; try again later",
+            "Too many invalid credentials from this address. Try again later",
         )
         .retry_after(wait)),
         None => Ok(()),
@@ -76,7 +76,7 @@ pub async fn check_redeem(app: &App, account: &str) -> Result<()> {
     {
         Some(wait) => Err(Error::too_many(
             "redeem_rate_limited",
-            "Too many invalid redeem codes; try again later",
+            "Too many invalid redeem codes. Try again later",
         )
         .retry_after(wait)),
         None => Ok(()),

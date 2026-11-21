@@ -232,7 +232,7 @@ async fn save_plan(app: &App, b: &Value) -> Result<Value> {
     let days = b["duration_days"].as_i64().unwrap_or(0);
     if price <= 0 || credit <= 0 || !(1..=3650).contains(&days) {
         return Err(Error::bad(
-            "Positive price, credit, and duration of 1–3650 days required",
+            "Positive price, credit, and duration of 1-3650 days required",
         ));
     }
     sqlx::query(
@@ -276,7 +276,7 @@ async fn delete_plan(app: &App, code: &str) -> Result<Value> {
         return Err(Error::new(
             StatusCode::CONFLICT,
             "plan_in_use",
-            "Plan is referenced by subscriptions, payments, or codes; deactivate it instead",
+            "Plan is referenced by subscriptions, payments, or codes. Deactivate it instead",
         ));
     }
     sqlx::query("DELETE FROM plans WHERE code=?")

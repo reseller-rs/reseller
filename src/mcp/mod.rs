@@ -192,7 +192,7 @@ impl RpcError {
             ..Self::new(
                 INVALID_PARAMS,
                 format!(
-                    "Unsupported protocol version; this server supports {}",
+                    "Unsupported protocol version. This server supports {}",
                     SUPPORTED_VERSIONS.join(", ")
                 ),
             )
@@ -421,7 +421,7 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
             StatusCode::METHOD_NOT_ALLOWED,
             Json(json!({"error": {
                 "code": "method_not_allowed",
-                "message": "The MCP endpoint accepts POST only; there is no server-initiated stream",
+                "message": "The MCP endpoint accepts POST only. There is no server-initiated stream",
             }})),
         )
             .into_response();
@@ -461,7 +461,7 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
     if message.is_array() {
         return Ok(bad(
             INVALID_REQUEST,
-            "JSON-RPC batches are not supported; send one message per request",
+            "JSON-RPC batches are not supported. Send one message per request",
         ));
     }
     if message["jsonrpc"] != "2.0" || !message.is_object() {
@@ -569,7 +569,7 @@ async fn modern_dispatch(
         "initialize" => Err(RpcError::new(
             METHOD_NOT_FOUND,
             format!(
-                "Method not found: initialize; this request uses protocol {MODERN_VERSION}, which \
+                "Method not found: initialize. This request uses protocol {MODERN_VERSION}, which \
                  has no handshake (supported versions: {})",
                 SUPPORTED_VERSIONS.join(", ")
             ),

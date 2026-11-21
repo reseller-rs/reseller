@@ -289,7 +289,7 @@ async fn spend_proof(conn: &mut SqliteConnection, proof: &pow::Verified) -> Resu
         return Err(Error::new(
             StatusCode::CONFLICT,
             "pow_replayed",
-            "This proof of work was already used; request a new challenge",
+            "This proof of work was already used. Request a new challenge",
         ));
     }
     Ok(())
@@ -481,7 +481,7 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
         if age < cooldown {
             return Err(Error::too_many(
                 "rotate_cooldown",
-                "This key was created recently; wait before rotating it",
+                "This key was created recently. Wait before rotating it",
             )
             .retry_after((cooldown - age).unsigned_abs()));
         }

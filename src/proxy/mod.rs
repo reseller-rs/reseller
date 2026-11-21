@@ -750,7 +750,7 @@ async fn prepare(
             {
                 yield Err(counter.reject(Error::forbidden(
                     "model_not_allowed",
-                    "This key is restricted to specific models; the request must name one",
+                    "This key is restricted to specific models. The request must name one",
                 )));
                 return;
             }

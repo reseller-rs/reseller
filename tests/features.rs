@@ -808,7 +808,7 @@ async fn branding_settings_render_into_pages_and_theme_css() {
                 .contains("img-src 'self' data: https:")
         );
         assert!(
-            html.contains("<title>Acme AI — Model gateway</title>"),
+            html.contains("<title>Acme AI: Model gateway</title>"),
             "{path}"
         );
         assert!(html.contains("src=\"/theme/logo.svg\""));
@@ -886,7 +886,7 @@ async fn theme_directory_serves_files_and_overrides_template_safely() {
     assert_eq!(s, 200);
     assert_eq!(
         html,
-        "<html><title>Reseller — API workspace</title><h1>Reseller</h1></html>"
+        "<html><title>Reseller: API workspace</title><h1>Reseller</h1></html>"
     );
 }
 

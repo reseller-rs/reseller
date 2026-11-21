@@ -91,7 +91,7 @@ function renderHeader() {
     el.innerHTML = '<button type="button" id="header-logout" class="ghost">Sign out</button>';
     el.querySelector('#header-logout').onclick = signOut;
   } else {
-    el.innerHTML = '<a class="button" href="/workspace/">Workspace →</a>';
+    el.innerHTML = '<a class="button" href="/workspace/">Workspace</a>';
   }
 }
 
@@ -112,7 +112,7 @@ const copyText = async (text, label) => {
     notice(`${label} copied`);
     return true;
   } catch {
-    notice('Copy failed — select the value manually.', true);
+    notice('Copy failed. Select the value manually.', true);
     return false;
   }
 };
@@ -126,7 +126,7 @@ function flashCopied(button) {
   if (!button) return;
   if (!button.dataset.label) button.dataset.label = button.textContent;
   button.classList.add('copied');
-  button.textContent = '✓ Copied';
+  button.textContent = 'Copied';
   clearTimeout(button._flashTimer);
   button._flashTimer = setTimeout(() => {
     button.classList.remove('copied');
@@ -217,14 +217,14 @@ function metric(label, value, hint) {
 function emptyState(title, text) {
   return `<div class="empty"><strong>${esc(title)}</strong><br>${esc(text)}</div>`;
 }
-function loading(text = 'Loading…') {
+function loading(text = 'Loading...') {
   return `<div class="loading"><span class="spinner" aria-hidden="true"></span>${esc(text)}</div>`;
 }
 
 function modal(title, content, setup, className) {
   const d = document.createElement('dialog');
   if (className) d.classList.add(className);
-  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button type="button" data-close aria-label="Close dialog">✕</button></div><div class="dialog-content">${content}</div>`;
+  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button type="button" data-close aria-label="Close dialog">x</button></div><div class="dialog-content">${content}</div>`;
   document.body.append(d);
   d.querySelector('[data-close]').onclick = () => d.close();
   d.addEventListener('close', () => d.remove());
@@ -260,8 +260,8 @@ function listPager(id, state, total, shown) {
   const start = total ? state.offset + 1 : 0;
   const end = state.offset + shown;
   return `<div class="pager">
-    <span class="hint">Showing ${count(start)}–${count(end)} of ${count(total)}</span>
-    <div class="actions"><label class="inline" for="${id}-size">Rows</label><select id="${id}-size" data-list-size="${id}">${[20, 50, 100].map(n => `<option${state.limit === n ? ' selected' : ''}>${n}</option>`).join('')}</select><button type="button" class="ghost" data-list-prev="${id}"${state.offset === 0 ? ' disabled' : ''}>← Previous</button><button type="button" class="ghost" data-list-next="${id}"${end >= total ? ' disabled' : ''}>Next →</button></div>
+    <span class="hint">Showing ${count(start)} to ${count(end)} of ${count(total)}</span>
+    <div class="actions"><label class="inline" for="${id}-size">Rows</label><select id="${id}-size" data-list-size="${id}">${[20, 50, 100].map(n => `<option${state.limit === n ? ' selected' : ''}>${n}</option>`).join('')}</select><button type="button" class="ghost" data-list-prev="${id}"${state.offset === 0 ? ' disabled' : ''}>Previous</button><button type="button" class="ghost" data-list-next="${id}"${end >= total ? ' disabled' : ''}>Next</button></div>
   </div>`;
 }
 function bindForm(form, handler) {
@@ -301,16 +301,16 @@ function planCard(p, best, cta) {
     <div class="plan-price">${esc(usd(p.price_usd))}<small> / ${count(p.duration_days)} days</small></div>
     ${p.credit_usd ? `<div class="plan-credit"><span>API credit</span><strong>${esc(usd(p.credit_usd))}</strong></div>` : ''}
     <p class="plan-desc">${esc(p.description || 'Prepaid API credit.')}</p>
-    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/">Choose plan →</a>`}</div>
+    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/">Choose plan</a>`}</div>
   </article>`;
 }
 
 function redeemForm() {
   modal('Redeem a credit code', `
     <form>
-      <div class="redeem-intro"><span class="redeem-icon" aria-hidden="true">◇</span><div><h3>Apply credit to your balance</h3><p>Enter the single-use code supplied by your operator. Credit is available immediately after redemption.</p></div></div>
+      <div class="redeem-intro"><span class="redeem-icon" aria-hidden="true">+</span><div><h3>Apply credit to your balance</h3><p>Enter the single-use code supplied by your operator. Credit is available immediately after redemption.</p></div></div>
       <label for="redeem-code">Credit code</label>
-      <input id="redeem-code" name="code" autocomplete="off" required placeholder="RES-…">
+      <input id="redeem-code" name="code" autocomplete="off" required placeholder="RES-...">
       <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary">Redeem credit</button></div>
     </form>`, d => {
     d.querySelector('[data-cancel]').onclick = () => d.close();
@@ -338,7 +338,7 @@ function secrets(v) {
     </div>
     <div class="actions section">
       <button type="button" data-copy-all class="primary">Copy both</button>
-      ${admin ? '' : '<button type="button" data-open class="ghost">Open workspace →</button>'}
+      ${admin ? '' : '<button type="button" data-open class="ghost">Open workspace</button>'}
     </div>`, d => {
     const wire = (selector, text, label) => {
       const button = d.querySelector(selector);
@@ -372,8 +372,8 @@ function keyForm() {
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
       <p class="field-help">New accounts receive evaluation credit. Additional keys share your existing balance.</p>
-      <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Verifying you're human…</span></div><progress max="100" value="0"></progress></div>
-      <div class="actions"><button class="primary" type="submit">Create key →</button></div>
+      <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
+      <div class="actions"><button class="primary" type="submit">Create key</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     const pow = d.querySelector('.pow');
     const bar = pow.querySelector('progress');
@@ -398,7 +398,7 @@ function keyForm() {
 /* Account management modals -------------------------------------------------- */
 
 function manageAccount(aid) {
-  const d = modal('Manage account', `<div class="manage-body">${loading('Loading account…')}</div>`, null, 'large');
+  const d = modal('Manage account', `<div class="manage-body">${loading('Loading account...')}</div>`, null, 'large');
   const body = d.querySelector('.manage-body');
   let keyOffset = 0;
   const keyLimit = 10;
@@ -431,7 +431,7 @@ function manageAccount(aid) {
       <div class="account-head account-identity">
         <div class="account-id">
           <span class="cred-label">Account</span>
-          <code title="${esc(a.id)} — click to copy" data-copy-id="${esc(a.id)}">${esc(a.id.slice(0, 8))}…</code>
+          <code title="${esc(a.id)}, click to copy" data-copy-id="${esc(a.id)}">${esc(a.id.slice(0, 8))}...</code>
         </div>
         ${pill(a.status)}
       </div>
@@ -439,12 +439,12 @@ function manageAccount(aid) {
         <span><strong>${esc(usd(a.balance_usd))}</strong> balance</span>
         ${isPositive(a.debt_usd) ? `<span class="warn"><strong>${esc(usd(a.debt_usd))}</strong> debt</span>` : ''}
         <span><strong>${count(keyTotal)}</strong> keys</span>
-        <span><strong>${sub ? esc(sub.plan_code) : '—'}</strong> plan${sub ? ` · expires ${esc(date(sub.expires_at))}` : ''}</span>
+        <span><strong>${sub ? esc(sub.plan_code) : 'None'}</strong> plan${sub ? `, expires ${esc(date(sub.expires_at))}` : ''}</span>
       </div>
       <div class="account-meta">
-        <span>Contact <strong>${esc(a.contact || '—')}</strong></span>
+        <span>Contact <strong>${esc(a.contact || '-')}</strong></span>
         <span>Created <strong>${esc(date(a.created_at))}</strong></span>
-        <span>Billed · 30d <strong>${esc(usd(billed))}</strong></span>
+        <span>Billed (30d) <strong>${esc(usd(billed))}</strong></span>
         <span>Markup <strong>${a.markup_pct ? `${esc(a.markup_pct)}%` : 'global'}</strong></span>
         <span>Key creation <strong>${a.can_create_keys ? 'allowed' : 'guarded'}</strong></span>
       </div>
@@ -458,16 +458,16 @@ function manageAccount(aid) {
       </div>
       <div class="account-lists">
         <section class="account-keys">
-          <h3>Keys · ${count(keyTotal)}</h3>
+          <h3>Keys (${count(keyTotal)})</h3>
           ${keys.length
-            ? `<ul class="mini-list">${keys.map(k => `<li>${pill(k.status)}<strong>${esc(k.name)}</strong><code>${esc(k.key_prefix)}…</code><span class="hint">${esc(date(k.last_used_at))}</span></li>`).join('')}</ul>`
+            ? `<ul class="mini-list">${keys.map(k => `<li>${pill(k.status)}<strong>${esc(k.name)}</strong><code>${esc(k.key_prefix)}...</code><span class="hint">${esc(date(k.last_used_at))}</span></li>`).join('')}</ul>`
             : '<p class="hint">No keys.</p>'}
-          ${keyTotal > keyLimit ? `<div class="mini-pager"><span class="hint">${count(keyOffset + 1)}–${count(Math.min(keyOffset + keys.length, keyTotal))} of ${count(keyTotal)}</span><div class="actions"><button type="button" class="ghost small" data-key-prev${keyOffset === 0 ? ' disabled' : ''}>← Previous</button><button type="button" class="ghost small" data-key-next${keyOffset + keys.length >= keyTotal ? ' disabled' : ''}>Next →</button></div></div>` : ''}
+          ${keyTotal > keyLimit ? `<div class="mini-pager"><span class="hint">${count(keyOffset + 1)} to ${count(Math.min(keyOffset + keys.length, keyTotal))} of ${count(keyTotal)}</span><div class="actions"><button type="button" class="ghost small" data-key-prev${keyOffset === 0 ? ' disabled' : ''}>Previous</button><button type="button" class="ghost small" data-key-next${keyOffset + keys.length >= keyTotal ? ' disabled' : ''}>Next</button></div></div>` : ''}
         </section>
         <section>
-          <h3>Credit lots · ${count(credits.length)}</h3>
+          <h3>Credit lots (${count(credits.length)})</h3>
           ${credits.length
-            ? `<ul class="mini-list">${credits.slice(0, 3).map(c => `<li>${pill(c.source, c.expires_at && c.expires_at < now ? 'warn' : 'muted')}<strong>${esc(usd(c.remaining_usd))}</strong><span class="hint">of ${esc(usd(c.amount_usd))}${c.expires_at ? ` · ${esc(date(c.expires_at))}` : ' · no expiry'}</span></li>`).join('')}${credits.length > 3 ? `<li class="hint">+${count(credits.length - 3)} more</li>` : ''}</ul>`
+            ? `<ul class="mini-list">${credits.slice(0, 3).map(c => `<li>${pill(c.source, c.expires_at && c.expires_at < now ? 'warn' : 'muted')}<strong>${esc(usd(c.remaining_usd))}</strong><span class="hint">of ${esc(usd(c.amount_usd))}${c.expires_at ? `, expires ${esc(date(c.expires_at))}` : ', no expiry'}</span></li>`).join('')}${credits.length > 3 ? `<li class="hint">+${count(credits.length - 3)} more</li>` : ''}</ul>`
             : '<p class="hint">No credits.</p>'}
         </section>
       </div>`;
@@ -543,7 +543,7 @@ async function grantForm(aid, done) {
     <form>
       <label for="grant-plan">Plan</label>
       <select id="grant-plan" name="plan_code" required>
-        ${plans.map(p => `<option value="${esc(p.code)}">${esc(p.name)} — ${esc(usd(p.credit_usd))} credit · ${count(p.duration_days)} days</option>`).join('')}
+        ${plans.map(p => `<option value="${esc(p.code)}">${esc(p.name)}: ${esc(usd(p.credit_usd))} credit, ${count(p.duration_days)} days</option>`).join('')}
       </select>
       <p class="field-help">Grants the plan's credit immediately. Existing subscriptions are not extended or renewed.</p>
       <div class="actions"><button class="primary" type="submit">Grant plan</button></div>
@@ -600,20 +600,134 @@ function editAccountForm(a, done) {
   }));
 }
 
+/* API and MCP guidance ------------------------------------------------------- */
+
+const codeBlock = text => `<div class="code-block"><button type="button" class="small ghost" data-copy-code>Copy</button><pre><code>${esc(text)}</code></pre></div>`;
+
+function snippetTabs(items) {
+  return `<div class="snippets">
+    <div class="snippet-tabs" role="tablist">${items.map((s, i) => `<button type="button" role="tab" data-snippet-tab="${i}" aria-selected="${i === 0}">${esc(s.label)}</button>`).join('')}</div>
+    ${items.map((s, i) => `<div role="tabpanel" data-snippet-panel="${i}"${i ? ' hidden' : ''}>${codeBlock(s.code)}</div>`).join('')}
+  </div>`;
+}
+
+function wireDocs(root) {
+  root.querySelectorAll('[data-copy-code]').forEach(button => {
+    button.onclick = () => copyText(button.parentElement.querySelector('code').textContent, 'Snippet').then(ok => ok && flashCopied(button));
+  });
+  root.querySelectorAll('.snippets').forEach(box => {
+    const tabs = [...box.querySelectorAll('[data-snippet-tab]')];
+    tabs.forEach(t => t.onclick = () => {
+      tabs.forEach(o => o.setAttribute('aria-selected', String(o === t)));
+      box.querySelectorAll('[data-snippet-panel]').forEach(p => { p.hidden = p.dataset.snippetPanel !== t.dataset.snippetTab; });
+    });
+  });
+}
+
+function apiSnippets() {
+  const base = `${location.origin}/v1`;
+  return [
+    { label: 'cURL', code: `curl ${base}/chat/completions \\
+  -H "Authorization: Bearer $RESELLER_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "your-model",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'` },
+    { label: 'Python', code: `# pip install openai
+import os
+from openai import OpenAI
+
+client = OpenAI(base_url="${base}", api_key=os.environ["RESELLER_KEY"])
+reply = client.chat.completions.create(
+    model="your-model",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(reply.choices[0].message.content)` },
+    { label: 'Node', code: `// npm install openai
+import OpenAI from "openai";
+
+const client = new OpenAI({ baseURL: "${base}", apiKey: process.env.RESELLER_KEY });
+const reply = await client.chat.completions.create({
+  model: "your-model",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(reply.choices[0].message.content);` },
+    { label: 'Speech', code: `curl ${base}/audio/speech \\
+  -H "Authorization: Bearer $RESELLER_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "your-tts-model", "input": "Hello there", "voice": "alloy"}' \\
+  --output speech.mp3` },
+    { label: 'Transcription', code: `curl ${base}/audio/transcriptions \\
+  -H "Authorization: Bearer $RESELLER_KEY" \\
+  -F model=your-stt-model \\
+  -F file=@audio.mp3` },
+    { label: 'Image', code: `curl ${base}/images/generations \\
+  -H "Authorization: Bearer $RESELLER_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "your-image-model", "prompt": "A lighthouse at dusk", "size": "1024x1024"}'` },
+  ];
+}
+
+// `cliKey` is what the one-line command shows in place of the secret.
+function mcpPanel(cliKey) {
+  const url = `${location.origin}/mcp`;
+  return `<div class="docs-split">
+    <div class="card">
+      <div class="card-head"><h3>Remote endpoint</h3><span class="hint">HTTP, POST only</span></div>
+      <p>Any MCP client that supports HTTP servers can connect with an API key. Endpoint: <code>${esc(url)}</code></p>
+      ${codeBlock(`claude mcp add --transport http reseller ${url} \\\n  --header "Authorization: Bearer ${cliKey}"`)}
+      <p class="hint">Or add this to <code>.mcp.json</code>. Keep the key in an environment variable.</p>
+      ${codeBlock(JSON.stringify({ mcpServers: { reseller: { type: 'http', url, headers: { Authorization: 'Bearer ${RESELLER_KEY}' } } } }, null, 2))}
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Local bridge</h3><span class="pill tone-ok">Recommended</span></div>
+      <p>Runs next to your agent. Secrets and the signup proof of work stay on your machine, and generated media is saved to disk.</p>
+      ${codeBlock(`cargo install reseller --locked\nclaude mcp add reseller -- reseller mcp --url ${location.origin}`)}
+      <p class="hint">Or run <code>reseller mcp --url ${esc(location.origin)}</code> from any MCP client that launches stdio servers.</p>
+    </div>
+  </div>`;
+}
+
+const ENDPOINT_DOCS = [
+  ['POST', '/v1/chat/completions', 'Chat completions, with streaming.'],
+  ['POST', '/v1/responses', 'Responses API.'],
+  ['POST', '/v1/embeddings', 'Text embeddings.'],
+  ['POST', '/v1/audio/speech', 'Text to speech. Returns audio.'],
+  ['POST', '/v1/audio/transcriptions', 'Speech to text. Multipart file upload.'],
+  ['POST', '/v1/images/generations', 'Image generation from a prompt.'],
+  ['GET', '/v1/models', 'Models offered by the service.'],
+];
+const MCP_TOOL_DOCS = [
+  ['generate_text', 'API key', 'Generate text with a chat model.'],
+  ['generate_speech', 'API key', 'Convert text to speech.'],
+  ['transcribe_audio', 'API key', 'Transcribe audio to text.'],
+  ['generate_image', 'API key', 'Generate images from a prompt.'],
+  ['account_overview', 'Key or token', 'Balance, debt, plan, and credit lots.'],
+  ['usage_summary', 'Key or token', 'Spending and tokens over the last N days.'],
+  ['list_requests', 'Key or token', 'Request history with billed cost.'],
+  ['list_keys', 'Key or token', 'Key names and prefixes, never secrets.'],
+  ['create_key', 'Key or token', 'Create another key on the account.'],
+  ['rotate_key', 'Key or token', 'Replace a key with a new secret.'],
+  ['redeem_code', 'Key or token', 'Redeem a single-use credit code.'],
+  ['start_checkout', 'Key or token', 'Start a card or crypto purchase.'],
+];
+const docTable = (columns, rows) => `<div class="doc-table">${table(columns, rows)}</div>`;
+
 /* Views ---------------------------------------------------------------------- */
 
 async function landing() {
   main.innerHTML = `
     <section class="hero">
       <div>
-        <div class="eyebrow">${esc(brand.hero_eyebrow || 'ONE ENDPOINT · ENDLESS POSSIBILITIES')}</div>
+        <div class="eyebrow">${esc(brand.hero_eyebrow || 'ONE ENDPOINT, ENDLESS POSSIBILITIES')}</div>
         <h1>${brand.hero_title ? esc(brand.hero_title) : 'Intelligence,<br>on your terms<span class="accent">.</span>'}</h1>
         <p>${esc(brand.hero_text || 'Language, speech, audio, and images through one familiar API. Create a key, connect your app, and stay in control of every request.')}</p>
         <div class="actions section">
-          <button type="button" class="primary" id="create">Get an API key ↗</button>
+          <button type="button" class="primary" id="create">Get an API key</button>
           <a class="button ghost" href="/workspace/">Open workspace</a>
         </div>
-        <p class="section"><small>OpenAI-compatible · Usage-based billing · Live statistics</small></p>
+        <p class="section"><small>OpenAI-compatible, usage-based billing, live statistics</small></p>
       </div>
       <div class="terminal">
         <div class="bar">QUICK START / cURL</div>
@@ -630,12 +744,27 @@ async function landing() {
   }'</pre>
       </div>
     </section>
+    <section class="section get-started" id="get-started">
+      <div class="eyebrow">GET STARTED</div>
+      <h2>Your first request in three steps</h2>
+      <ol class="start-steps">
+        <li class="card"><span class="step-num">1</span><div><h3>Create a key</h3><p>Choose Get an API key. A short proof of work runs in your browser. No card needed.</p></div></li>
+        <li class="card"><span class="step-num">2</span><div><h3>Call the API</h3><p>Point any OpenAI SDK at <code>${esc(location.origin)}/v1</code> and send the key as a bearer token.</p></div></li>
+        <li class="card"><span class="step-num">3</span><div><h3>Connect an agent</h3><p>Add <code>${esc(location.origin)}/mcp</code> to an MCP client, or run the local bridge.</p></div></li>
+      </ol>
+      <div class="card">
+        <div class="card-head"><h3>Call the API</h3><span class="hint">Set <code>RESELLER_KEY</code> to your key</span></div>
+        ${snippetTabs(apiSnippets())}
+      </div>
+      <h3 class="docs-title">Connect an agent over MCP</h3>
+      ${mcpPanel('sk-res-...')}
+    </section>
     <section class="section">
       <div class="row">
         <div><div class="eyebrow">ROOM TO BUILD</div><h2>Choose your credit plan</h2></div>
         <span class="muted">Simple, prepaid access.</span>
       </div>
-      <div class="plans section" id="plans">${loading('Loading plans…')}</div>
+      <div class="plans section" id="plans">${loading('Loading plans...')}</div>
     </section>
     <section class="steps section">
       <div class="card step"><div class="eyebrow">01 / CONNECT ONCE</div><p>Use your existing OpenAI SDK. Change the base URL and API key.</p></div>
@@ -643,6 +772,7 @@ async function landing() {
       <div class="card step"><div class="eyebrow">03 / STAY IN CONTROL</div><p>Rotate keys, add credit, and keep your applications running.</p></div>
     </section>`;
   document.querySelector('#create').onclick = keyForm;
+  wireDocs(main);
   try {
     const v = await api('/v1/plans');
     const best = bestCode(v.plans);
@@ -681,15 +811,15 @@ function login() {
           <label for="login-token">${admin ? 'Administrator token' : 'API key or dashboard token'}</label>
           <input id="login-token" name="token" type="password" autocomplete="off" required>
           <p class="field-help">Credentials stay in this browser tab for the session.</p>
-          <div class="actions full"><button class="primary" type="submit">Open ${admin ? 'console' : 'workspace'} →</button></div>
+          <div class="actions full"><button class="primary" type="submit">Open ${admin ? 'console' : 'workspace'}</button></div>
         </form>
         ${admin ? '' : `
         <div class="auth-alt">
           <div>
             <div class="label">New here?</div>
-            <div class="hint">Create an account and get evaluation credit — no card required.</div>
+            <div class="hint">Create an account and get evaluation credit. No card required.</div>
           </div>
-          <button type="button" id="create" class="button ghost">Create a new account →</button>
+          <button type="button" id="create" class="button ghost">Create a new account</button>
         </div>`}
       </section>
     </div>`;
@@ -709,7 +839,7 @@ function login() {
 }
 
 async function shell() {
-  const tabs = admin ? ['overview', 'keys', 'accounts', 'plans', 'codes', 'payments', 'requests', 'settings'] : ['overview', 'keys', 'usage', 'requests', 'billing'];
+  const tabs = admin ? ['overview', 'keys', 'accounts', 'plans', 'codes', 'payments', 'requests', 'settings'] : ['overview', 'connect', 'keys', 'usage', 'requests', 'billing'];
   const requested = location.hash.slice(1);
   if (tabs.includes(requested)) tab = requested;
   else history.replaceState(null, '', `#${tab}`);
@@ -810,7 +940,7 @@ function chart(series) {
   const bars = entries.map(([day, v], i) => {
     const height = value(v) > 0 ? Math.max(3, base - points[i][1]) : 1;
     const summary = `${new Date(Number(day) * 1000).toLocaleDateString()}|${usd(v.cost)} billed|${count(v.requests)} request${v.requests === 1 ? '' : 's'}|${count(v.tokens)} tokens`;
-    return `<g class="chart-column" tabindex="0" data-chart-summary="${esc(summary)}"><rect class="chart-hit" x="${(step * i).toFixed(1)}" y="0" width="${step.toFixed(1)}" height="${base}"/><rect class="chart-bar" x="${(points[i][0] - barWidth / 2).toFixed(1)}" y="${(base - height).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${height.toFixed(1)}" rx="3"/><circle class="chart-dot" cx="${points[i][0].toFixed(1)}" cy="${points[i][1].toFixed(1)}" r="3"/><title>${esc(summary.replaceAll('|', ' · '))}</title></g>`;
+    return `<g class="chart-column" tabindex="0" data-chart-summary="${esc(summary)}"><rect class="chart-hit" x="${(step * i).toFixed(1)}" y="0" width="${step.toFixed(1)}" height="${base}"/><rect class="chart-bar" x="${(points[i][0] - barWidth / 2).toFixed(1)}" y="${(base - height).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${height.toFixed(1)}" rx="3"/><circle class="chart-dot" cx="${points[i][0].toFixed(1)}" cy="${points[i][1].toFixed(1)}" r="3"/><title>${esc(summary.replaceAll('|', ', '))}</title></g>`;
   }).join('');
   return `<div class="chart-wrap">
     <div class="chart-legend"><span><i></i>${mode === 'cost' ? 'Daily billed cost' : 'Daily requests (no billed cost)'}</span><strong>${mode === 'cost' ? esc(usd(totalCost)) : count(entries.reduce((sum, [, v]) => sum + v.requests, 0))}</strong></div>
@@ -858,7 +988,7 @@ const requestTable = rows => {
   return table([
     ['Time', r => esc(date(r.created_at))],
     ['Route', r => `<code>${esc(r.path)}</code>`],
-    ['Model', r => esc(r.model || '—')],
+    ['Model', r => esc(r.model || '-')],
     ['Status', r => requestPill(r)],
     ['Tokens', r => `<span class="num">${count(r.tokens)}</span>`],
     ['Billed', r => `<span class="num">${esc(usd(r.billed_usd))}</span>`],
@@ -871,8 +1001,8 @@ function requestDetails(r) {
   document.querySelector('dialog[data-request-dialog]')?.close();
   const cell = (label, value) => `<div><span class="label">${esc(label)}</span><div class="kv-value">${value}</div></div>`;
   const ref = value => value
-    ? `<code title="${esc(value)} — click to copy" data-copy-value="${esc(value)}">${esc(value.slice(0, 13))}…</code>`
-    : '<span class="muted">—</span>';
+    ? `<code title="${esc(value)}, click to copy" data-copy-value="${esc(value)}">${esc(value.slice(0, 13))}...</code>`
+    : '<span class="muted">-</span>';
   const d = modal('Request details', `
     <div class="request-summary">
       <div><span class="label">Route</span><div class="request-route"><strong>${esc(r.method)}</strong><code>${esc(r.path)}</code></div></div>
@@ -882,13 +1012,13 @@ function requestDetails(r) {
     </div>
     <section class="detail-section"><h3>Identity</h3><div class="kv">
       ${cell('Request ID', ref(r.id))}
-      ${cell('Model', esc(r.model || '—'))}
-      ${cell('Kind', esc(r.kind || '—'))}
+      ${cell('Model', esc(r.model || '-'))}
+      ${cell('Kind', esc(r.kind || '-'))}
       ${cell('Account', ref(r.account_id))}
       ${cell('Key', ref(r.key_id))}
-      ${cell('IP', esc(r.ip || '—'))}
+      ${cell('IP', esc(r.ip || '-'))}
     </div></section>
-    <section class="detail-section"><h3>Usage & transfer</h3><div class="kv">
+    <section class="detail-section"><h3>Usage and transfer</h3><div class="kv">
       ${cell('Tokens', `<span class="num">${count(r.tokens)}</span>`)}
       ${cell('Upstream cost', `<span class="num">${esc(usd(r.upstream_usd))}</span>`)}
       ${cell('Billed', `<span class="num">${esc(usd(r.billed_usd))}</span>`)}
@@ -924,6 +1054,10 @@ const views = {
           ${metric('Tokens', count(v.tokens))}
           ${metric('Upstream cost', usd(v.upstream_cost_usd))}
           ${metric('Outstanding credit', usd(v.outstanding_usd))}
+        </div>
+        <div class="card docs-note">
+          <h3>Docs</h3>
+          <p>Customers connect through the OpenAI-compatible API at <code>${esc(location.origin)}/v1</code> and MCP at <code>${esc(location.origin)}/mcp</code> (POST only). <a href="/v1">Open API discovery</a> for the route list. The Connect tab in the workspace has ready-made snippets.</p>
         </div>`;
     }
     const [v, u, r] = await Promise.all([get('/v1/account', signal), get('/v1/account/usage', signal), get('/v1/account/requests?limit=5', signal)]);
@@ -950,6 +1084,41 @@ const views = {
         ${requestTable(r.requests)}
       </div>`;
   },
+  async connect(signal) {
+    let prefix = token.startsWith('sk-res-') ? token.slice(0, 15) : '';
+    if (!prefix) {
+      try {
+        const k = (await get('/v1/keys?limit=50', signal)).keys || [];
+        prefix = (k.find(x => x.status === 'active') || k[0] || {}).key_prefix || '';
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+      }
+    }
+    const value = (label, text, note) => `<div class="conn-row"><span class="label">${esc(label)}</span><code data-copy-value="${esc(text)}" data-copy-label="${esc(label)}" title="Click to copy">${esc(text)}</code>${note ? `<span class="hint">${esc(note)}</span>` : ''}</div>`;
+    return `<div class="card">
+        <div class="card-head"><h3>Connection details</h3></div>
+        ${value('API base URL', `${location.origin}/v1`, 'Works with any OpenAI-compatible SDK.')}
+        ${value('MCP endpoint', `${location.origin}/mcp`, 'Streamable HTTP, POST only.')}
+        <div class="conn-row"><span class="label">API key</span>${prefix ? `<code>${esc(prefix)}...</code>` : '<span class="muted">Not available</span>'}<span class="hint">Only the prefix is shown. The full secret appears once when a key is created. Lost it? Rotate the key in Keys.</span></div>
+        <p class="hint">Snippets below read the key from <code>$RESELLER_KEY</code>. Export it in your shell first.</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Call the API</h3></div>
+        ${snippetTabs(apiSnippets())}
+      </div>
+      <h3 class="docs-title">Connect an agent over MCP</h3>
+      ${mcpPanel('$RESELLER_KEY')}
+      <h3 class="docs-title">API endpoints</h3>
+      ${docTable([['Method', r => `<code>${esc(r[0])}</code>`], ['Path', r => `<code>${esc(r[1])}</code>`], ['Description', r => esc(r[2])]], ENDPOINT_DOCS)}
+      <p class="hint">Other OpenAI-compatible routes such as <code>/v1/completions</code> are proxied too. <a href="/v1">API discovery</a> lists every route.</p>
+      <h3 class="docs-title">MCP tools</h3>
+      ${docTable([['Tool', r => `<code>${esc(r[0])}</code>`], ['Credential', r => esc(r[1])], ['Description', r => esc(r[2])]], MCP_TOOL_DOCS)}
+      <p class="hint">Generation tools need an API key. Account tools also accept a dashboard token.</p>
+      <div class="card docs-note">
+        <h3>How billing works</h3>
+        <p>Each request is billed at the provider cost or the operator's price table. The amount is deducted from your prepaid balance. Every charge is visible per request in Requests, in the Billed column. API and MCP calls are billed the same way.</p>
+      </div>`;
+  },
   async keys(signal) {
     const state = listStates.keys;
     const v = await get(`${endpoint('keys')}?${listParams(state)}`, signal);
@@ -965,13 +1134,13 @@ const views = {
     };
     const used = r => Number(r.usage_30d_usd ?? 0);
     const columns = [
-      ['Key', r => `<strong>${esc(r.name)}</strong><br><code class="muted">${esc(r.key_prefix)}…</code>`],
+      ['Key', r => `<strong>${esc(r.name)}</strong><br><code class="muted">${esc(r.key_prefix)}...</code>`],
       ['Status', r => `${pill(r.status)}${r.expires_at ? `<br><span class="hint">expires ${esc(date(r.expires_at))}</span>` : ''}`],
     ];
-    if (admin) columns.push(['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}…</code>`]);
+    if (admin) columns.push(['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}...</code>`]);
     columns.push(
       ['Limits', r => limits(r.limits)],
-      ['Used · 30d', r => `<span class="num">${esc(usd(used(r)))}</span>`],
+      ['Used (30d)', r => `<span class="num">${esc(usd(used(r)))}</span>`],
       ['Last used', r => esc(date(r.last_used_at))],
       ['Actions', r => `<div class="actions">
         <button type="button" data-edit-key="${esc(r.id)}" data-key-name="${esc(r.name)}">Edit</button>
@@ -981,7 +1150,7 @@ const views = {
       </div>`]
     );
     const toolbar = listToolbar('keys', state, {
-      placeholder: 'Search key name, prefix, or ID…',
+      placeholder: 'Search key name, prefix, or ID...',
       statuses: [['active', 'Active'], ['blocked', 'Blocked'], ['revoked', 'Revoked']],
       sorts: [['created', 'Newest'], ['name', 'Name'], ['status', 'Status'], ...(admin ? [['account', 'Account']] : []), ['usage', '30-day usage'], ['last_used', 'Last used']],
       groups: [['status', 'Group by status'], ...(admin ? [['account', 'Group by account']] : [])],
@@ -994,7 +1163,7 @@ const views = {
     const state = listStates.accounts;
     const v = await get(`${endpoint('accounts')}?${listParams(state)}`, signal);
     const toolbar = listToolbar('accounts', state, {
-      placeholder: 'Search account ID or contact…',
+      placeholder: 'Search account ID or contact...',
       statuses: [['active', 'Active'], ['suspended', 'Suspended']],
       sorts: [['created', 'Newest'], ['contact', 'Contact'], ['balance', 'Balance'], ['keys', 'Key count'], ['status', 'Status']],
       groups: [['status', 'Group by status'], ['plan', 'Group by plan']],
@@ -1002,11 +1171,11 @@ const views = {
     const group = state.group === 'status' ? { value: r => r.status } : state.group === 'plan' ? { value: r => r.plan_code || 'No active plan' } : null;
     return `<div class="card-head"><div><h3>Customer accounts</h3><span class="muted">${count(v.total)} total</span></div></div>
       ${toolbar}${table([
-        ['Account', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}…</code>`],
-        ['Contact', r => esc(r.contact || '—')],
+        ['Account', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}...</code>`],
+        ['Contact', r => esc(r.contact || '-')],
         ['Balance', r => `<strong class="num">${esc(usd(r.balance_usd))}</strong>`],
         ['Keys', r => `<span class="num">${count(r.key_count)}</span>`],
-        ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : '<span class="muted">—</span>'],
+        ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : '<span class="muted">-</span>'],
         ['Status', r => pill(r.status)],
         ['Created', r => esc(date(r.created_at))],
         ['Actions', r => `<button type="button" data-account="${esc(r.id)}">Manage</button>`]
@@ -1035,11 +1204,11 @@ const views = {
     const now = Date.now() / 1000;
     const state = r => r.redeemed_at ? pill('redeemed', 'info') : r.expires_at && r.expires_at < now ? pill('expired', 'warn') : pill('available', 'ok');
     return `<div class="card-head"><h3>Prepaid redeem codes</h3><button type="button" class="primary" data-code>+ Issue code</button></div>
-      <p class="muted">Codes are shown once and stored hashed. Unredeemed codes can be edited or cancelled; redeemed codes are kept as audit records.</p>
+      <p class="muted">Codes are shown once and stored hashed. Unredeemed codes can be edited or cancelled. Redeemed codes are kept as audit records.</p>
       ${table([
-        ['Code prefix', r => `<code>${esc(r.code_prefix)}…</code>`],
+        ['Code prefix', r => `<code>${esc(r.code_prefix)}...</code>`],
         ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : 'Credit'],
-        ['Credit', r => r.credit_usd ? `<span class="num">${esc(usd(r.credit_usd))}</span>` : '—'],
+        ['Credit', r => r.credit_usd ? `<span class="num">${esc(usd(r.credit_usd))}</span>` : '-'],
         ['Status', state],
         ['Redeemed', r => esc(date(r.redeemed_at))],
         ['Expires', r => esc(date(r.expires_at))],
@@ -1053,7 +1222,7 @@ const views = {
     const state = listStates.payments;
     const v = await get(`${endpoint('payments')}?${listParams(state)}`, signal);
     const toolbar = listToolbar('payments', state, {
-      placeholder: 'Search order, account, plan, or provider…',
+      placeholder: 'Search order, account, plan, or provider...',
       statuses: [['pending', 'Pending'], ['paid', 'Paid']],
       sorts: [['created', 'Newest'], ['status', 'Status'], ['provider', 'Method'], ['account', 'Account'], ['plan', 'Plan'], ['amount', 'Amount']],
       groups: [['status', 'Group by status'], ['method', 'Group by method'], ['plan', 'Group by plan'], ['account', 'Group by account']],
@@ -1062,8 +1231,8 @@ const views = {
     return `<div class="card-head"><div><h3>Payment orders</h3><span class="muted">${count(v.total)} card and crypto orders</span></div><button type="button" class="ghost" data-payroof>Crypto payments setup</button></div>
       ${toolbar}${table([
         ['Created', r => esc(date(r.created_at))],
-        ['Order', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}…</code>`],
-        ['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}…</code>`],
+        ['Order', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}...</code>`],
+        ['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}...</code>`],
         ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
         ['Method', r => esc(methodLabel(r.method))],
         ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`],
@@ -1087,7 +1256,7 @@ const views = {
     const models = admin ? requestModelCache.values : [];
     return `<div class="card-head"><h3>Request history</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
       <form id="request-filter" class="request-filters${admin ? ' admin' : ''}">
-        <input class="request-search" name="q" type="search" list="request-models" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID…">
+        <input class="request-search" name="q" type="search" list="request-models" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID...">
         <datalist id="request-models">${models.map(m => `<option value="${esc(m)}"></option>`).join('')}</datalist>
         <select name="kind" aria-label="Kind">
           <option value="">All kinds</option>
@@ -1106,20 +1275,20 @@ const views = {
         ${admin ? '<input name="account" aria-label="Account ID" placeholder="Account ID"><input name="key" aria-label="Key ID" placeholder="Key ID">' : ''}
         <div class="filter-actions"><button type="submit" class="primary">Apply filters</button><button type="button" class="ghost" data-clear>Clear</button></div>
       </form>
-      <div id="request-results">${loading('Loading requests…')}</div>
+      <div id="request-results">${loading('Loading requests...')}</div>
       <div class="pager">
         <span class="hint" id="request-range"></span>
         <div class="actions">
           <label class="inline" for="request-size">Rows</label>
           <select id="request-size" aria-label="Rows per page"><option>20</option><option>50</option><option>100</option></select>
-          <button type="button" data-prev class="ghost">← Previous</button>
-          <button type="button" data-next class="ghost">Next →</button>
+          <button type="button" data-prev class="ghost">Previous</button>
+          <button type="button" data-next class="ghost">Next</button>
         </div>
       </div>`;
   },
   async usage(signal) {
     const v = await get('/v1/account/usage', signal);
-    return `<div class="card"><div class="card-head"><h3>Usage · last 30 days</h3></div>${chart(v.series)}</div>
+    return `<div class="card"><div class="card-head"><h3>Usage (last 30 days)</h3></div>${chart(v.series)}</div>
       ${table([
         ['Day', r => esc(new Date(r.day * 1000).toLocaleDateString())],
         ['Model', r => `<code>${esc(r.model)}</code>`],
@@ -1134,7 +1303,7 @@ const views = {
     const best = bestCode(p.plans);
     const methods = p.payment_methods || [];
     const cta = plan => methods.length
-      ? `<div class="pay-buttons">${methods.map((m, i) => `<button type="button" class="${i === 0 ? 'primary' : 'ghost'}" data-buy="${esc(plan.code)}" data-method="${esc(m)}">${m === 'stripe' ? 'Pay by card ↗' : 'Pay with crypto'}</button>`).join('')}</div>`
+      ? `<div class="pay-buttons">${methods.map((m, i) => `<button type="button" class="${i === 0 ? 'primary' : 'ghost'}" data-buy="${esc(plan.code)}" data-method="${esc(m)}">${m === 'stripe' ? 'Pay by card' : 'Pay with crypto'}</button>`).join('')}</div>`
       : '<span class="hint">Online payments are not enabled. Use a credit code.</span>';
     return `<section class="billing-catalog">
           <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto payments accept USDC, USDT, and native coins on supported networks.' : ''}</p></div><button type="button" class="ghost" data-redeem>Have a credit code?</button></div>
@@ -1163,7 +1332,7 @@ const views = {
   async settings(signal) {
     const v = await get(endpoint('settings'), signal);
     return `<div class="card-head"><h3>Runtime settings</h3><span class="muted">Stored in SQLite</span></div>
-      <p class="muted">Secret fields are redacted; leave them blank to keep their current values. USD amounts and percentages are decimal strings. CORS changes require a restart. <code>branding</code> controls the name, copy, logo, favicon, colours (<code>css_vars</code>), and custom CSS of these pages; <code>stripe</code> and <code>payroof</code> enable card and crypto checkout.</p>
+      <p class="muted">Secret fields are redacted. Leave them blank to keep their current values. USD amounts and percentages are decimal strings. CORS changes require a restart. <code>branding</code> controls the name, copy, logo, favicon, colours (<code>css_vars</code>), and custom CSS of these pages. <code>stripe</code> and <code>payroof</code> enable card and crypto checkout.</p>
       <form id="settings" class="card">
         <label for="settings-json">Configuration JSON</label>
         <textarea id="settings-json" name="json" rows="30" spellcheck="false">${esc(JSON.stringify(v.settings, null, 2))}</textarea>
@@ -1179,7 +1348,7 @@ async function editKeyForm(button) {
   modal('Edit API key', `<form>
     <label for="edit-key-name">Key name</label><input id="edit-key-name" name="name" maxlength="80" value="${esc(key.name)}" required>
     ${admin ? `<div class="form-grid"><div><label for="edit-key-status">Status</label><select id="edit-key-status" name="status">${key.status === 'revoked' ? '<option value="revoked">Revoked (permanent)</option>' : `<option value="active"${key.status === 'active' ? ' selected' : ''}>Active</option><option value="blocked"${key.status === 'blocked' ? ' selected' : ''}>Blocked</option>`}</select></div><div><label for="edit-key-markup">Markup %</label><input id="edit-key-markup" name="markup_pct" type="number" step="0.000001" value="${esc(key.markup_pct || '')}" placeholder="Account default"></div><div><label for="edit-key-expiry">Expires</label><input id="edit-key-expiry" name="expires_at" type="datetime-local" value="${esc(localDateTime(key.expires_at))}"></div><div><label for="edit-key-rpm">Requests per minute</label><input id="edit-key-rpm" name="rpm" type="number" min="1" value="${esc(limits.rpm || '')}" placeholder="No limit"></div></div>
-    <details class="advanced-fields"><summary>Usage limits and models</summary><div class="form-grid">${windowFields('requests', 'Request limit', limits.requests, '24')}${windowFields('tokens', 'Token limit', limits.tokens, '720')}${windowFields('spend', 'Spend limit (USD)', limits.spend && { max: limits.spend.max_usd, window_hours: limits.spend.window_hours }, '720', '0.000001')}<div><label for="edit-key-children">Maximum child keys</label><input id="edit-key-children" name="max_children" type="number" min="1" value="${esc(limits.max_children || '')}" placeholder="No limit"></div></div><label for="edit-key-models">Allowed models</label><textarea id="edit-key-models" name="allowed_models" rows="4" placeholder="One model per line; blank allows all">${esc((limits.allowed_models || []).join('\n'))}</textarea></details>` : ''}
+    <details class="advanced-fields"><summary>Usage limits and models</summary><div class="form-grid">${windowFields('requests', 'Request limit', limits.requests, '24')}${windowFields('tokens', 'Token limit', limits.tokens, '720')}${windowFields('spend', 'Spend limit (USD)', limits.spend && { max: limits.spend.max_usd, window_hours: limits.spend.window_hours }, '720', '0.000001')}<div><label for="edit-key-children">Maximum child keys</label><input id="edit-key-children" name="max_children" type="number" min="1" value="${esc(limits.max_children || '')}" placeholder="No limit"></div></div><label for="edit-key-models">Allowed models</label><textarea id="edit-key-models" name="allowed_models" rows="4" placeholder="One model per line. Blank allows all">${esc((limits.allowed_models || []).join('\n'))}</textarea></details>` : ''}
     <div class="actions"><button class="primary" type="submit">Save changes</button></div>
   </form>`, d => bindForm(d.querySelector('form'), async b => {
     const payload = { name: b.name };
@@ -1208,7 +1377,7 @@ async function editKeyForm(button) {
 
 function planForm(initial = {}) {
   const editing = Boolean(initial.code);
-  modal(editing ? `Edit plan · ${initial.code}` : 'Create plan', `<form><div class="form-grid"><div><label for="plan-code">Code</label><input id="plan-code" name="code" value="${esc(initial.code || '')}" placeholder="starter" maxlength="80" pattern="[A-Za-z0-9_-]+" ${editing ? 'readonly' : 'required'}></div><div><label for="plan-name">Name</label><input id="plan-name" name="name" value="${esc(initial.name || '')}" placeholder="Starter" required></div><div><label for="plan-price">Price (USD)</label><input id="plan-price" name="price_usd" type="number" min="0.50" step="0.01" value="${esc(initial.price_usd || '10')}" required></div><div><label for="plan-credit">API credit (USD)</label><input id="plan-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="${esc(initial.credit_usd || '10')}" required></div><div><label for="plan-days">Duration (days)</label><input id="plan-days" name="duration_days" type="number" min="1" max="3650" value="${esc(initial.duration_days || 30)}" required></div></div><label for="plan-description">Description</label><input id="plan-description" name="description" value="${esc(initial.description || '')}" maxlength="4096" placeholder="Thirty days of API credit"><label class="inline check-line"><input type="checkbox" name="active"${initial.active !== false ? ' checked' : ''}> Visible to customers</label><div class="actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Create plan'}</button></div></form>`, d => bindForm(d.querySelector('form'), async b => {
+  modal(editing ? `Edit plan: ${initial.code}` : 'Create plan', `<form><div class="form-grid"><div><label for="plan-code">Code</label><input id="plan-code" name="code" value="${esc(initial.code || '')}" placeholder="starter" maxlength="80" pattern="[A-Za-z0-9_-]+" ${editing ? 'readonly' : 'required'}></div><div><label for="plan-name">Name</label><input id="plan-name" name="name" value="${esc(initial.name || '')}" placeholder="Starter" required></div><div><label for="plan-price">Price (USD)</label><input id="plan-price" name="price_usd" type="number" min="0.50" step="0.01" value="${esc(initial.price_usd || '10')}" required></div><div><label for="plan-credit">API credit (USD)</label><input id="plan-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="${esc(initial.credit_usd || '10')}" required></div><div><label for="plan-days">Duration (days)</label><input id="plan-days" name="duration_days" type="number" min="1" max="3650" value="${esc(initial.duration_days || 30)}" required></div></div><label for="plan-description">Description</label><input id="plan-description" name="description" value="${esc(initial.description || '')}" maxlength="4096" placeholder="Thirty days of API credit"><label class="inline check-line"><input type="checkbox" name="active"${initial.active !== false ? ' checked' : ''}> Visible to customers</label><div class="actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Create plan'}</button></div></form>`, d => bindForm(d.querySelector('form'), async b => {
     await api(endpoint('plans'), 'POST', { ...b, duration_days: Number(b.duration_days), active: b.active === 'on' });
     d.close();
     notice(editing ? 'Plan updated' : 'Plan created');
@@ -1219,7 +1388,7 @@ function planForm(initial = {}) {
 function showIssuedCodes(v) {
   const codes = v.codes || [v.code];
   const list = codes.join('\n');
-  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'} — shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button type="button" class="primary" data-copy-codes>Copy ${codes.length === 1 ? 'code' : 'all'}</button></div>`, d => {
+  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'}. Shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button type="button" class="primary" data-copy-codes>Copy ${codes.length === 1 ? 'code' : 'all'}</button></div>`, d => {
     const button = d.querySelector('[data-copy-codes]');
     button.onclick = () => copyText(list, 'Redeem codes').then(ok => ok && flashCopied(button));
   }, 'wide');
@@ -1227,7 +1396,7 @@ function showIssuedCodes(v) {
 
 async function codeForm() {
   const plans = (await api(endpoint('plans'))).plans.filter(p => p.active);
-  modal('Issue redeem codes', `<form><div class="form-grid"><div><label for="code-plan">Credit source</label><select id="code-plan" name="plan_code"><option value="">Fixed credit amount</option>${plans.map(p => `<option value="${esc(p.code)}">Plan · ${esc(p.name)}</option>`).join('')}</select></div><div><label for="code-credit">Credit (USD)</label><input id="code-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="10" required></div><div><label for="code-count">Number of codes</label><input id="code-count" name="count" type="number" min="1" max="100" value="1" required></div><div><label for="code-expiry">Expires (optional)</label><input id="code-expiry" name="expires_at" type="datetime-local"></div></div><label for="code-note">Internal note (optional)</label><input id="code-note" name="note" maxlength="4096" placeholder="Campaign or customer reference"><p class="field-help">Codes are single use and only displayed once after creation.</p><div class="actions"><button class="primary" type="submit">Issue codes</button></div></form>`, d => {
+  modal('Issue redeem codes', `<form><div class="form-grid"><div><label for="code-plan">Credit source</label><select id="code-plan" name="plan_code"><option value="">Fixed credit amount</option>${plans.map(p => `<option value="${esc(p.code)}">Plan: ${esc(p.name)}</option>`).join('')}</select></div><div><label for="code-credit">Credit (USD)</label><input id="code-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="10" required></div><div><label for="code-count">Number of codes</label><input id="code-count" name="count" type="number" min="1" max="100" value="1" required></div><div><label for="code-expiry">Expires (optional)</label><input id="code-expiry" name="expires_at" type="datetime-local"></div></div><label for="code-note">Internal note (optional)</label><input id="code-note" name="note" maxlength="4096" placeholder="Campaign or customer reference"><p class="field-help">Codes are single use and only displayed once after creation.</p><div class="actions"><button class="primary" type="submit">Issue codes</button></div></form>`, d => {
     const form = d.querySelector('form');
     const plan = form.querySelector('[name=plan_code]');
     const credit = form.querySelector('[name=credit_usd]');
@@ -1259,7 +1428,7 @@ function editCodeForm(button) {
 
 /* Payments ------------------------------------------------------------------- */
 
-const shortHash = v => v && v.length > 18 ? `${v.slice(0, 10)}…${v.slice(-6)}` : v || '';
+const shortHash = v => v && v.length > 18 ? `${v.slice(0, 10)}...${v.slice(-6)}` : v || '';
 function wireCopies(root) {
   root.querySelectorAll('[data-copy-value]').forEach(b => {
     b.onclick = () => copyText(b.dataset.copyValue, b.dataset.copyLabel || 'Value').then(ok => ok && flash(b));
@@ -1288,7 +1457,7 @@ function cryptoView(o) {
       <div>${metric('Confirmed', usd(o.received_usd), o.status === 'paid' ? 'Credit added' : 'Updates automatically')}</div>
       <div class="card metric-card"><div class="label">Status</div><div class="metric">${pill(o.status)}</div><div class="hint">${open && o.expires_at ? `Quote valid until ${esc(date(o.expires_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}` : ''}</div></div>
     </div>
-    ${open ? `<p class="muted">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Your credit is added after network confirmations; partial payments in several assets add up. Stablecoins are valued 1:1 with USD, native coins at the quoted rate.</p>
+    ${open ? `<p class="muted">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Your credit is added after network confirmations. Partial payments in several assets add up. Stablecoins are valued 1:1 with USD, native coins at the quoted rate.</p>
     <div class="table-wrap"><table class="quotes"><thead><tr><th scope="col">Asset</th><th scope="col">Amount</th><th scope="col">Deposit address</th></tr></thead><tbody>${quotes}</tbody></table></div>` : ''}
     ${transfersTable(o.transfers)}`;
 }
@@ -1309,7 +1478,7 @@ function cryptoOrder(initial) {
         order = next;
         if (changed) draw();
         if (order.status === 'paid') {
-          notice('Payment confirmed — credit added');
+          notice('Payment confirmed, credit added');
           if (tab === 'billing') load();
           return;
         }
@@ -1332,9 +1501,9 @@ async function paymentDetails(id) {
     ['Address', q => `<code title="${esc(q.address)}">${esc(shortHash(q.address))}</code>`]
   ], o.quotes)}` : '';
   const payable = o.status === 'pending' || o.status === 'expired';
-  modal(`Payment · ${o.id.slice(0, 8)}…`, `
+  modal(`Payment ${o.id.slice(0, 8)}...`, `
     <div class="crypto-summary">
-      <div>${metric('Price', usd(o.price_usd), `${o.plan_code} · ${methodLabel(o.method)}`)}</div>
+      <div>${metric('Price', usd(o.price_usd), `${o.plan_code}, ${methodLabel(o.method)}`)}</div>
       <div>${metric('Received', usd(o.received_usd), `Credit ${usd(o.credit_usd)} for ${o.duration_days} days`)}</div>
       <div class="card metric-card"><div class="label">Status</div><div class="metric">${pill(o.status)}</div><div class="hint">${o.paid_at ? `Paid ${esc(date(o.paid_at))} by ${esc(o.paid_by)}` : `Created ${esc(date(o.created_at))}`}</div></div>
     </div>
@@ -1360,7 +1529,7 @@ async function payroofSetup() {
   const s = await api(endpoint('payroof'));
   const row = (label, value) => `<div class="kv"><span>${esc(label)}</span><strong>${value}</strong></div>`;
   const yes = v => v ? pill('configured', 'ok') : pill('missing', 'warn');
-  const chains = (s.chains || []).map(c => `<li><strong>${esc(c.name)}</strong> <code>${esc(c.id)}</code> · ${esc((c.assets || []).map(a => a.symbol).join(', '))} · ${count(c.confirmations)} confirmations</li>`).join('');
+  const chains = (s.chains || []).map(c => `<li><strong>${esc(c.name)}</strong> <code>${esc(c.id)}</code>, ${esc((c.assets || []).map(a => a.symbol).join(', '))}, ${count(c.confirmations)} confirmations</li>`).join('');
   modal('Crypto payments (Payroof)', `
     <p class="muted">Configure <code>payroof.project</code> and <code>payroof.token</code> in Settings, then register the webhook so confirmed transfers complete orders automatically.</p>
     ${row('Status', s.enabled ? pill('enabled', 'ok') : pill('disabled', 'warn'))}
@@ -1395,6 +1564,8 @@ function wire(root) {
   root.querySelectorAll('[data-refresh]').forEach(b => b.onclick = load);
   root.querySelectorAll('[data-create]').forEach(b => b.onclick = keyForm);
   wireCharts(root);
+  wireDocs(root);
+  wireCopies(root);
   // `#content` survives view renders, so replace its delegated handler instead
   // of accumulating one listener on every refresh/navigation.
   root.onclick = e => {
@@ -1534,7 +1705,7 @@ function wire(root) {
         const shown = v.requests.length;
         root.querySelector('#request-range').textContent = total === 0
           ? 'No matching requests.'
-          : `Showing ${count(offset + 1)}–${count(offset + shown)} of ${count(total)}`;
+          : `Showing ${count(offset + 1)} to ${count(offset + shown)} of ${count(total)}`;
         root.querySelector('[data-prev]').disabled = offset === 0;
         root.querySelector('[data-next]').disabled = offset + shown >= total;
       } catch (e) {

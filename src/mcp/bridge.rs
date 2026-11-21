@@ -44,7 +44,7 @@ use tokio::{
 const HIDDEN_REMOTE_TOOLS: [&str; 2] = ["signup_challenge", "create_account"];
 /// Remote tools that work without credentials.
 const PUBLIC_REMOTE_TOOLS: [&str; 1] = ["list_plans"];
-const MASK: &str = "<stored locally; use reveal_credentials>";
+const MASK: &str = "<stored locally, use reveal_credentials>";
 const MAX_REMOTE_RESPONSE: u64 = 512 * 1024 * 1024;
 
 /// Credentials for one server.
@@ -174,7 +174,7 @@ pub fn default_credentials_path() -> anyhow::Result<PathBuf> {
     let base = match var("XDG_CONFIG_HOME").filter(|p| p.is_absolute()) {
         Some(xdg) => xdg,
         None => var("HOME")
-            .context("cannot locate a config directory; pass --credentials")?
+            .context("cannot locate a config directory, pass --credentials")?
             .join(".config"),
     };
     Ok(base.join("reseller").join("credentials.json"))
@@ -481,7 +481,7 @@ impl Bridge {
                 Ok(Era::Legacy)
             }
             None => Err(RpcError::missing_meta(format!(
-                "_meta.{META_VERSION} is required (protocol {MODERN_VERSION}); legacy clients \
+                "_meta.{META_VERSION} is required (protocol {MODERN_VERSION}). Legacy clients \
                  must send initialize first"
             ))),
             Some(MODERN_VERSION) => validate_meta(params).map(|()| Era::Modern),
@@ -581,7 +581,7 @@ impl Bridge {
     async fn instructions(&self) -> (String, bool) {
         let mut instructions = format!(
             "This is the local reseller bridge for {}. Use `signup` to create an account (the proof of \
-             work is solved locally) or `login` to use existing credentials; secrets stay in a \
+             work is solved locally) or `login` to use existing credentials. Secrets stay in a \
              private local file and are never shown unless you call `reveal_credentials`. \
              Generated audio and images are also saved to {}.",
             self.origin,
@@ -779,7 +779,7 @@ impl Bridge {
             return Err(ToolError::new(
                 "token_override_active",
                 format!(
-                    "A --token / RESELLER_TOKEN is set, so {action} is disabled; unset it first."
+                    "A --token / RESELLER_TOKEN is set, so {action} is disabled. Unset it first."
                 ),
             ));
         }
@@ -870,7 +870,7 @@ impl Bridge {
         Ok(self.masked(
             &credentials,
             json!({
-                "message": "Account created. Credentials were saved locally; secrets are not shown. \
+                "message": "Account created. Credentials were saved locally. Secrets are not shown. \
                             Use whoami to see the balance.",
                 "notice": created["notice"],
                 "limits": created["limits"],
@@ -943,7 +943,7 @@ impl Bridge {
             .map_err(|e| ToolError::new("credentials_unwritable", format!("{e:#}")))?;
         Ok(self.masked(
             &credentials,
-            json!({"message": "Logged in. Credentials were verified and saved locally; secrets are not shown."}),
+            json!({"message": "Logged in. Credentials were verified and saved locally. Secrets are not shown."}),
         ))
     }
 

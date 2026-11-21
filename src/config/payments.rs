@@ -130,7 +130,7 @@ impl Payroof {
         );
         anyhow::ensure!(
             self.token.is_empty() || self.token.starts_with("prf_"),
-            "payroof.token must be a project token (prf_…)"
+            "payroof.token must be a project token (prf_...)"
         );
         anyhow::ensure!(
             self.webhook_secret.is_empty()

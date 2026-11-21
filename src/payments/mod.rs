@@ -107,7 +107,7 @@ async fn check_checkout_budget(app: &App, config: &Config, account: &str) -> Res
     if recent >= i64::from(limit) {
         return Err(Error::too_many(
             "checkout_rate_limited",
-            "Too many checkout attempts; try again later",
+            "Too many checkout attempts. Try again later",
         )
         .retry_after(oldest.map_or(60, |t| (t + HOUR - now()).max(1).unsigned_abs())));
     }

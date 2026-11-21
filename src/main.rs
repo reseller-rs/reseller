@@ -217,7 +217,7 @@ async fn import(pool: &sqlx::SqlitePool, current: &Config, file: &Path) -> anyho
         .with_context(|| format!("{} is invalid", file.display()))?;
     db::save_settings(pool, &imported).await?;
     if imported.key_pepper != current.key_pepper {
-        println!("Warning: key_pepper changed; existing keys and unredeemed codes no longer work.");
+        println!("Warning: key_pepper changed. Existing keys and unredeemed codes no longer work.");
     }
     println!(
         "Imported settings from {}. Restart reseller to apply them.",
@@ -302,7 +302,7 @@ fn doctor(cli: &Cli, config: &Config) {
         };
         if upstream.api_key.is_empty() {
             let hint = if name == "llm" {
-                "missing key — configure before proxying"
+                "missing key, configure before proxying"
             } else {
                 "disabled (no API key)"
             };

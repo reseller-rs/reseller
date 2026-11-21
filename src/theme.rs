@@ -109,7 +109,7 @@ pub fn render(template: &str, b: &Branding) -> String {
     let title = if b.tagline.is_empty() {
         b.name.clone()
     } else {
-        format!("{} — {}", b.name, b.tagline)
+        format!("{}: {}", b.name, b.tagline)
     };
     // Escape markup in the JSON so it cannot close the script element.
     let data = public_json(b)
