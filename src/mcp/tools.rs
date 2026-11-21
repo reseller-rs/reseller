@@ -428,7 +428,7 @@ pub(super) fn definitions() -> Vec<Value> {
     ]
 }
 
-/// The `instructions` text returned by `initialize`.
+/// The `instructions` text returned by `server/discover` and `initialize`.
 pub(super) fn instructions(config: &Config) -> String {
     let base = config.public_base();
     let signup = if config.signup.enabled {

@@ -3,8 +3,8 @@
 //!
 //! Each key stores one instant, its theoretical arrival time (TAT). A rule of
 //! `limit` events per `period` allows a full burst of `limit` events, then
-//! one more every `period / limit`. State is per process and not persisted;
-//! a restart only ever relaxes limits.
+//! one more every `period / limit`. State is per process and is not persisted.
+//! A restart only ever relaxes limits.
 //!
 //! Memory is bounded: when the table is full, idle entries (those whose TAT
 //! has passed, which are equivalent to absent ones) are dropped first and, if
@@ -18,6 +18,7 @@ use std::{
 /// Maximum tracked keys before eviction.
 const DEFAULT_CAPACITY: usize = 100_000;
 
+/// In-memory keyed rate limiter with a bounded number of tracked keys.
 pub struct Limiter {
     capacity: usize,
     state: Mutex<HashMap<String, Instant>>,
@@ -30,6 +31,7 @@ impl Default for Limiter {
 }
 
 impl Limiter {
+    /// Creates a limiter that tracks at most `capacity` keys (minimum 2).
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(2),
@@ -43,13 +45,15 @@ impl Limiter {
         self.acquire_at(key, limit, period, Instant::now())
     }
 
-    /// Seconds until `key` may act again, without consuming an event.
+    /// Returns the seconds until `key` may act again, or `None` when it is not
+    /// blocked. This does not consume an event. A `limit` of 0 never blocks.
     pub fn blocked(&self, key: &str, limit: u32, period: Duration) -> Option<u64> {
         self.blocked_at(key, limit, period, Instant::now())
     }
 
-    /// Consumes one event unconditionally (for example a failed login); the
-    /// debt is capped at one full period so a lockout never outlives it.
+    /// Consumes one event unconditionally, for example after a failed login.
+    ///
+    /// The debt is capped at one full period, so a lockout never outlives it.
     pub fn record(&self, key: &str, limit: u32, period: Duration) {
         self.record_at(key, limit, period, Instant::now());
     }
@@ -95,6 +99,8 @@ impl Limiter {
         self.store(&mut state, key, next, now);
     }
 
+    /// Writes `tat` for `key`. A full table drops idle entries first, then the
+    /// earliest-TAT half if still full.
     fn store(&self, state: &mut HashMap<String, Instant>, key: &str, tat: Instant, now: Instant) {
         if state.len() >= self.capacity && !state.contains_key(key) {
             state.retain(|_, tat| *tat > now);

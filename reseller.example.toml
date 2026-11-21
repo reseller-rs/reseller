@@ -1,22 +1,25 @@
 # =============================================================================
-#  reseller — starter configuration
+#  reseller: starter configuration
 # =============================================================================
 #
 #  HOW THIS FILE IS USED
 #  ---------------------
 #  This file seeds the SQLite database on the first start only. Afterwards the
-#  database is authoritative: change settings in Admin -> Settings (or with the
+#  database is authoritative: change settings in Admin > Settings (or with the
 #  API), not here. `reseller init` never overwrites an existing file.
 #
 #  WHAT TO EDIT
 #  ------------
-#  Set [llm].api_key (and base_url/model if you do not use OpenAI). Everything
-#  else has a working default and is commented out; remove the leading "#" to
-#  activate a setting. Uncommenting a table header such as [tts] activates the
-#  whole block, so uncomment its keys too.
+#  Set [llm].api_key (and base_url and model if you do not use OpenAI).
+#  Everything else has a working default and is commented out. Remove the
+#  leading "#" to activate a setting. Uncommenting a table header such as
+#  [tts] activates the whole block, so uncomment its keys too.
 #
 #  BOOTSTRAP ENVIRONMENT VARIABLES (first start only)
 #  --------------------------------------------------
+#  These variables seed the settings only when the database has none yet.
+#  Later changes to them have no effect.
+#
 #  OPENAI_BASE_URL OPENAI_API_KEY OPENAI_MODEL OPENAI_MODEL_FALLBACKS
 #  TTS_BASE_URL TTS_API_KEY TTS_MODEL TTS_MODEL_FALLBACKS TTS_VOICE
 #  STT_BASE_URL STT_API_KEY STT_MODEL STT_MODEL_FALLBACKS
@@ -25,88 +28,110 @@
 #  STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET
 #  PAYROOF_API_URL PAYROOF_PROJECT PAYROOF_TOKEN PAYROOF_WEBHOOK_SECRET
 #
-#  Always-runtime environment variables (also available as CLI flags):
-#  HOST PORT DB_FILE RESELLER_CONFIG RESELLER_THEME_DIR RUST_LOG.
+#  RUNTIME ENVIRONMENT VARIABLES
+#  -----------------------------
+#  HOST, PORT, DB_FILE, RESELLER_CONFIG, and RESELLER_THEME_DIR also have CLI
+#  flags (--host, --port, --database, --config, and --theme-dir). RUST_LOG sets
+#  the log filter.
 #
 #  To replace the stored settings later, stop the server and run
-#  `reseller config import <file>`; `reseller config export` prints them.
+#  `reseller config import <file>`. Run `reseller config export` to print them.
 #
 #  FORMATS
 #  -------
-#  Money and percentages are decimal STRINGS: markup_pct = "30",
-#  max_usd = "5", input = "0.5". Negative values, NaN and Infinity are
-#  rejected. Byte sizes and durations are integers; expiry inputs accept Unix
-#  seconds or RFC3339 timestamps. Booleans are true/false.
+#  Money and percentages are decimal strings: markup_pct = "30",
+#  max_usd = "5", input = "0.5". Negative values, NaN, and Infinity are
+#  rejected. Byte sizes and durations are integers. Expiry inputs accept Unix
+#  seconds or RFC3339 timestamps. Booleans are true or false.
 #
 #  SECURITY
 #  --------
-#  This file and the database hold credentials. Keep both private (`reseller
-#  init` writes mode 0600) and protect database backups.
+#  This file and the database hold credentials. Keep both private. `reseller
+#  init` creates this file with mode 0600. Protect database backups as well.
 # =============================================================================
 
-# Externally reachable origin. Used for dashboard links, API hints, payment
-# redirects, and webhook URLs. Must be an absolute http(s) URL without query or
-# fragment.
+# Externally reachable origin for dashboard links, API hints, payment
+# redirects, and webhook URLs. Must be an absolute http(s) URL without a query
+# or fragment.
 public_url = "http://localhost:56787"
 
 # --- credentials -------------------------------------------------------------
-# Administrator token for /admin. Leave empty (or commented) to have a
+
+# Administrator token for /admin. Leave it empty (or commented out) to have a
 # secure token generated and printed on first start. Minimum 24 characters.
 # admin_token = ""
 
-# HMAC pepper used to hash API keys, dashboard tokens, and redeem codes. Leave
-# empty (or commented) to generate one on first start. Minimum 24 characters.
-# WARNING: changing this invalidates every customer credential and every
+# HMAC pepper for hashing API keys, dashboard tokens, redeem codes, and signup
+# challenges. Leave it empty (or commented out) to generate one on first start.
+# Minimum 24 characters.
+# WARNING: changing it invalidates every customer credential and every
 # unredeemed code.
 # key_pepper = ""
 
 # --- request rewriting policies ----------------------------------------------
-# How the model field is handled for llm requests (and voice for tts). The
-# multipart model field on uploads (for example STT) follows the same policy
-# while the audio payload streams through untouched.
-# Options:
-#   "default"     fill it from the upstream config only when the client omits it
-#   "force"       always overwrite whatever the client sent
+
+# How the model field is handled for LLM requests, and the voice field for TTS.
+# The multipart model field on uploads (for example STT) follows the same
+# policy, while the audio payload streams through unchanged.
+#   "default"     fill the value from the upstream config only when the
+#                 client omits it
+#   "force"       always overwrite the value the client sent
 #   "passthrough" never modify the client's value
+# Default: "default".
 # model_policy = "default"
+
+# Same options as model_policy, applied to the TTS voice field.
+# Default: "default".
 # voice_policy = "default"
 
 # --- billing -----------------------------------------------------------------
-# Markup over upstream cost, as a percentage decimal string. Resolution order
-# is key -> account -> this global default. "0" bills at upstream cost.
+
+# Markup over upstream cost, as a percentage decimal string. The resolution
+# order is key, then account, then this global default. "0" bills at upstream
+# cost. Default: "30".
 # markup_pct = "30"
 
 # --- access control ----------------------------------------------------------
+
 # Require a valid API key on proxy routes. When false, requests without
-# credentials are served anonymously and are not billed.
+# credentials are served anonymously and are not billed. Default: true.
 # require_key = true
 
-# Only meaningful with require_key = false: treat any non-empty token as an
-# anonymous request instead of rejecting unknown credentials.
+# Only meaningful with require_key = false. Treat any non-empty token as an
+# anonymous request instead of rejecting unknown credentials. Default: false.
 # accept_any_token = false
 
-# Trust CF-Connecting-IP, else the last X-Forwarded-For entry, for client IPs,
-# key allowances, and request logs. Enable only when the app is reachable
-# exclusively through a proxy that sets those headers.
+# Trust CF-Connecting-IP, or else the last X-Forwarded-For entry, for client
+# IPs, key allowances, and request logs. Enable this only when the app is
+# reachable exclusively through a proxy that sets these headers.
+# Default: false.
 # trust_proxy = false
 
-# CORS for browser clients: "" disables CORS, "*" allows any origin, and any
-# other value is used verbatim (for example "https://app.example.com").
-# Changes require a restart.
+# CORS for browser clients. "" disables CORS, "*" allows any origin, and any
+# other value is used as the allowed origin (for example
+# "https://app.example.com"). Changes require a restart. Default: "".
 # cors_origin = ""
 
-# --- HTTP, timeouts, retention ----------------------------------------------
-# Request body limits in bytes. Defaults: 50 MiB JSON, 512 MiB streamed
-# uploads. Maximums: 512 MiB JSON, 2 GiB streamed uploads.
+# --- HTTP, timeouts, retention -----------------------------------------------
+
+# Maximum request body size in bytes for JSON requests. Default: 50 MiB
+# (52428800). Maximum: 512 MiB.
 # max_json_body_bytes = 52428800
+
+# Maximum request body size in bytes for streamed uploads. Default: 512 MiB
+# (536870912). Maximum: 2 GiB.
 # max_stream_body_bytes = 536870912
 
-# Upstream connect/stream timeout in seconds (must be greater than 0).
+# Upstream request timeout in seconds. Used when an upstream sets no
+# timeout_seconds of its own. Must be greater than 0. Default: 300.
 # upstream_timeout_seconds = 300
 
-# Delete finished request logs older than this many days while keeping at most
-# max_log_entries rows. Both values must be greater than 0.
+# Delete finished request logs older than this many days. Must be greater than
+# 0. Default: 30.
 # log_retention_days = 30
+
+# Keep at most this many request log rows. Must be greater than 0.
+# Default: 5000.
 # max_log_entries = 5000
 
 # =============================================================================
@@ -115,35 +140,79 @@ public_url = "http://localhost:56787"
 # =============================================================================
 
 # [signup]
+
+# Offer anonymous account creation. Default: true.
 # enabled = true
-# free_credit_usd = "0.25"       # trial credit; "0" for none
-# free_credit_expiry_days = 30   # 0 = never expires
-# ip_limit_per_month = 2         # new keys per source IP per calendar month
-# cooldown_seconds = 30          # minimum wait between creations from one IP
-# global_hourly_limit = 100      # key creations per hour (signup, child keys, rotations)
-# pow_max_number = 100000        # proof-of-work difficulty (ALTCHA); 0 disables it
-# pow_ttl_seconds = 300          # how long a challenge stays solvable
-# [signup.ip_overrides]          # per-IP replacement for ip_limit_per_month
+
+# Trial credit in USD, as a decimal string. "0" grants no credit.
+# Default: "0.25".
+# free_credit_usd = "0.25"
+
+# Days the trial credit stays spendable. 0 means it never expires. Maximum:
+# 3650. Default: 30.
+# free_credit_expiry_days = 30
+
+# New keys allowed per source IP per calendar month. Default: 2.
+# ip_limit_per_month = 2
+
+# Minimum seconds between key creations from one IP. Default: 30.
+# cooldown_seconds = 30
+
+# Key creations per hour across all accounts (signup, child keys, and
+# rotations). Default: 100.
+# global_hourly_limit = 100
+
+# Proof-of-work difficulty for the ALTCHA signup challenge. 0 disables the
+# challenge. Maximum: 10000000. Default: 100000.
+# pow_max_number = 100000
+
+# Seconds a signup challenge stays solvable. Must be between 10 and 86400.
+# Default: 300.
+# pow_ttl_seconds = 300
+
+# Per-IP replacements for ip_limit_per_month. 0 means unlimited.
+# [signup.ip_overrides]
 # "203.0.113.7" = 10
-# "198.51.100.9" = 0             # unlimited
+# "198.51.100.9" = 0
 
 # =============================================================================
 #  KEY POLICY
-#  default_limits are copied onto every newly minted key; existing keys keep
-#  the limits they were created with. Window hours must be 1-8760.
+#  default_limits are copied onto every newly minted key. Existing keys keep
+#  the limits they were created with. Window hours must be 1 to 8760.
 # =============================================================================
 
 # [keys]
-# max_per_account = 10           # active keys per account (greater than 0)
-# max_new_per_day = 20           # keys a customer creates or rotates per rolling 24h
-# rotate_cooldown_seconds = 300  # customers may rotate keys only this old or older
-#
+
+# Active keys allowed per account. Must be greater than 0. Default: 10.
+# max_per_account = 10
+
+# Keys a customer may create or rotate per rolling 24 hours. Administrators
+# are exempt. 0 disables the guard. Default: 20.
+# max_new_per_day = 20
+
+# A customer may rotate a key only once it is this many seconds old. 0 disables
+# the guard. Maximum: 86400. Default: 300.
+# rotate_cooldown_seconds = 300
+
 # [keys.default_limits]
+# The values below are examples. The built-in default sets no limits.
+
+# Requests per rolling minute.
 # rpm = 60
+
+# Request count limit over a window of whole hours.
 # requests = { max = 2000, window_hours = 24 }
+
+# Token count limit over a window of whole hours.
 # tokens = { max = 1000000, window_hours = 720 }
+
+# Spend limit in USD over a window of whole hours.
 # spend = { max_usd = "5", window_hours = 720 }
+
+# Active child keys that a proxy key may create.
 # max_children = 2
+
+# Models the key may use, case-insensitive. An empty list allows every model.
 # allowed_models = []
 
 # =============================================================================
@@ -151,76 +220,117 @@ public_url = "http://localhost:56787"
 # =============================================================================
 
 # [rate_limits]
-# management_per_minute = 120      # per client IP: signup, keys, account, plans, admin API
-# auth_failures_per_hour = 20      # per client IP; then credentialed requests get 429
-# max_concurrent_requests = 8      # per account, in-flight proxy requests
-# checkouts_per_hour = 10          # per account
-# redeem_failures_per_hour = 10    # per account
-# challenges_per_minute = 10       # per client IP, signup challenges
+
+# Management requests per client IP per minute (signup, keys, account, plans,
+# and the admin API). Default: 120.
+# management_per_minute = 120
+
+# Invalid-credential attempts per client IP per hour. Once the limit is
+# reached, credentialed requests from that IP get 429. Default: 20.
+# auth_failures_per_hour = 20
+
+# In-flight proxy requests per account. Default: 8.
+# max_concurrent_requests = 8
+
+# Checkout orders per account per hour. Default: 10.
+# checkouts_per_hour = 10
+
+# Invalid redeem codes per account per hour. Default: 10.
+# redeem_failures_per_hour = 10
+
+# Signup challenges per client IP per minute. Default: 10.
+# challenges_per_minute = 10
 
 # =============================================================================
 #  MCP (Model Context Protocol)
 # =============================================================================
 
 # [mcp]
+
+# Serve the Model Context Protocol server. Default: true.
 # enabled = true
-# max_media_bytes = 16777216       # largest audio/image returned inline by tools
+
+# Largest audio or image payload that MCP tools return inline. Must be between
+# 1 byte and 256 MiB (268435456). Default: 16 MiB (16777216).
+# max_media_bytes = 16777216
 
 # =============================================================================
 #  UPSTREAMS
 #  Each upstream is configured independently. base_url must be an http(s) URL
 #  without credentials, query, or fragment. fallbacks are ordered model names
-#  tried after availability errors (400/402/404/408/429/5xx) for JSON requests;
-#  at most 10, and each fallback must also pass the key's allowed_models list.
+#  tried after availability errors (400, 402, 404, 408, 429, or any 5xx) for
+#  JSON requests. At most 10 fallbacks are allowed, and each fallback must also
+#  pass the key's allowed_models list.
 # =============================================================================
 
 # Language models. Required for /v1/chat/completions and other JSON routes.
 [llm]
 base_url = "https://api.openai.com/v1"
 api_key = "sk-replace-with-your-upstream-key"
+
 # Model sent when the client omits one, and always with model_policy = "force".
-# Leave the string empty to require clients to choose a model.
-model = "gpt-4o-mini"
-# Ordered fallback models, for example ["gpt-4o", "gpt-4o-mini"].
+# An empty string requires clients to choose a model. Default: "".
+# model = "gpt-4o-mini"
+
+# Ordered fallback models, for example ["gpt-4o", "gpt-4o-mini"]. Default: [].
 # fallbacks = []
-# Per-upstream timeout in seconds (0 = upstream_timeout_seconds, max 3600).
+
+# Upstream timeout in seconds. 0 uses upstream_timeout_seconds. Maximum: 3600.
+# Default: 0.
 # timeout_seconds = 0
-# Extra request headers for this upstream (Authorization, Host and framing
-# headers cannot be set). Every upstream section accepts these two keys.
+
+# Extra request headers for this upstream. At most 20 entries. Authorization,
+# Host, Content-Type, Content-Length, Transfer-Encoding, Connection, Upgrade,
+# Accept-Encoding, and TE cannot be set. Every upstream section accepts
+# timeout_seconds and headers. Default: none.
 # headers = { "HTTP-Referer" = "https://api.example.com", "X-Title" = "My API" }
 
 # Text-to-speech. Required only for /v1/audio/speech.
 # [tts]
 # base_url = "https://api.openai.com/v1"
 # api_key = "sk-replace-with-your-upstream-key"
+
+# Model sent when the client omits one. Default: "".
 # model = "gpt-4o-mini-tts"
+
 # Voice sent when the client omits one, and always with voice_policy = "force".
+# Default: "".
 # voice = ""
+
+# Ordered fallback models. Default: [].
 # fallbacks = []
 
 # Speech-to-text. Required only for /v1/audio/transcriptions and
-# /v1/audio/translations. With model_policy = "force" (or "default" plus a
-# configured model), the multipart model field is rewritten to this value.
+# /v1/audio/translations. With model_policy = "force", or "default" plus a
+# configured model, the multipart model field is rewritten to this value.
 # [stt]
 # base_url = "https://api.openai.com/v1"
 # api_key = "sk-replace-with-your-upstream-key"
+
+# Model used for transcription and translation. Default: "".
 # model = "whisper-1"
+
+# Ordered fallback models. Default: [].
 # fallbacks = []
 
 # Image generation and editing. Required only for /v1/images,
-# /v1/images/generations, /v1/images/edits and /v1/images/variations. JSON
-# requests follow model_policy (reference images travel inline, for example
-# "input_references": [{"type":"image_url","image_url":{"url":"data:…"}}]);
-# multipart edits stream like other uploads.
+# /v1/images/generations, /v1/images/edits, and /v1/images/variations. JSON
+# requests follow model_policy. Reference images travel inline, for example
+# "input_references": [{"type":"image_url","image_url":{"url":"data:..."}}].
+# Multipart edits stream like other uploads.
 # [image]
 # base_url = "https://openrouter.ai/api/v1"
 # api_key = "sk-or-replace-with-your-upstream-key"
+
+# Model used for image generation. Default: "".
 # model = "meta/muse-image"
+
+# Ordered fallback models. Default: [].
 # fallbacks = []
 
 # =============================================================================
 #  PRICE TABLE
-#  The "default" entry covers models without their own section; model names
+#  The "default" entry covers models without their own section. Model names
 #  match case-insensitively. All values are USD decimal strings:
 #    input / output   per 1,000,000 input / output tokens
 #    cached_input     per 1,000,000 cached input tokens (absent = input price)
@@ -233,12 +343,19 @@ model = "gpt-4o-mini"
 #            (input-cached)*input + cached*cached_input + output*output
 #            + characters*characters (all /1e6) + seconds*audio_second
 #            + images*image
-#    upstream = usage + request (2xx only); billed = upstream * (1 + markup/100)
-#  Each value is rounded once to whole micro-USD (half away from zero); a
-#  positive cost never rounds down to zero. LLM responses without any usage
-#  report are estimated at ~4 characters per token and flagged "estimated".
+#    upstream = usage + request (request applies to 2xx responses only)
+#    billed   = upstream * (1 + markup/100)
+#  Each value is rounded once to whole micro-USD, with halves rounded away from
+#  zero. A positive cost never rounds down to zero. LLM responses without any
+#  usage report are estimated at about 4 characters per token and flagged
+#  "estimated".
+#  A [prices.*] table replaces the built-in price table. When you add a model
+#  override, keep a [prices.default] entry as well.
 # =============================================================================
 
+# Default price for models without their own entry. Built-in default: input
+# "0.5", output "1.5", "0" for audio_second, characters, image, and request,
+# and no cached_input (the input price applies).
 # [prices.default]
 # input = "0.5"
 # cached_input = "0.25"
@@ -248,7 +365,7 @@ model = "gpt-4o-mini"
 # image = "0"
 # request = "0"
 
-# Per-model override example. Quote model names containing dots, slashes, or
+# Per-model override example. Quote model names that contain dots, slashes, or
 # colons.
 # [prices."meta/muse-image"]
 # input = "0"
@@ -260,31 +377,60 @@ model = "gpt-4o-mini"
 
 # =============================================================================
 #  BRANDING (white label)
-#  Names, copy, logo, favicon, colours and CSS of the web app. Logos and
+#  Names, copy, logo, favicon, colours, and CSS of the web app. Logos and
 #  favicons are site paths (for example files in the theme directory, served
-#  at /theme/<file>) or http(s) URLs. css_vars override the built-in CSS
-#  custom properties (accent, accent-2, accent-ink, bg, panel, text, muted,
-#  border, radius, …) without the leading "--". With --theme-dir, a
-#  theme.css file is appended to the stylesheet and an index.html file
-#  replaces the page template ({{name}}, {{title}}, {{logo_url}}, …).
+#  at /theme/<file>) or http(s) URLs. css_vars override the built-in CSS custom
+#  properties (accent, accent-2, accent-ink, bg, panel, text, muted, border,
+#  radius, and so on) without the leading "--". With --theme-dir, a theme.css
+#  file is appended to the stylesheet, and an index.html file replaces the page
+#  template ({{name}}, {{title}}, {{logo_url}}, and so on).
+#  Limits: name 1 to 80 characters, other text fields 300 characters, at most
+#  10 footer links, at most 64 css_vars, and custom_css up to 64 KiB.
 # =============================================================================
 
 # [branding]
+
+# Product name shown in the header, titles, and footer. Default: "Reseller".
 # name = "Reseller"
+
+# Short line appended to page titles. Default: "API workspace".
 # tagline = "API workspace"
+
+# Page description for search engines and link previews.
 # description = "Your API workspace. Create keys, track usage, and manage your balance."
-# logo_url = ""            # e.g. "/theme/logo.svg"; empty = built-in mark
-# favicon_url = ""         # e.g. "/theme/favicon.png"; empty = built-in icon
+
+# Header logo: a site path such as "/theme/logo.svg" or an http(s) URL. Empty
+# uses the built-in mark. Default: "".
+# logo_url = ""
+
+# Favicon: a site path such as "/theme/favicon.png" or an http(s) URL. Empty
+# uses the built-in icon. Default: "".
+# favicon_url = ""
+
+# Browser UI colour. Default: "#0c0e0d".
 # theme_color = "#0c0e0d"
-# color_scheme = "dark"    # "dark" or "light"
+
+# Colour scheme advertised to the browser: "dark" or "light". Default: "dark".
+# color_scheme = "dark"
+
+# Extra CSS appended after the built-in theme. Must not contain "</style".
+# Default: "".
 # custom_css = ""
-# hero_eyebrow = ""        # landing page copy; empty keeps the built-in text
+
+# Landing page copy. Empty keeps the built-in text. Default: "".
+# hero_eyebrow = ""
 # hero_title = ""
 # hero_text = ""
+
+# Footer text next to the product name. Default: "independently hosted".
 # footer_text = "independently hosted"
+
+# Footer links. Default: one link to the project source.
 # footer_links = [{ label = "Source ↗", url = "https://github.com/reseller-rs/reseller" }]
-#
+
 # [branding.css_vars]
+# CSS custom properties without the leading "--". Names use a-z, 0-9, and
+# hyphens. The built-in theme applies when this table is empty.
 # accent = "#ff7a1a"
 # accent-2 = "#ff9f4a"
 # accent-ink = "#1d0d00"
@@ -294,31 +440,72 @@ model = "gpt-4o-mini"
 # =============================================================================
 
 # Stripe Checkout (cards). Set both values, then register
-# {public_url}/webhooks/stripe for checkout.session.completed and
-# checkout.session.async_payment_succeeded.
+# {public_url}/webhooks/stripe for the checkout.session.completed and
+# checkout.session.async_payment_succeeded events.
+
 # [stripe]
+
+# Stripe secret API key. Default: "".
 # secret_key = ""
+
+# Signing secret of the Stripe webhook endpoint. Default: "".
 # webhook_secret = ""
 
-# Payroof crypto payments: USDC/USDT and native coins (ETH, POL, BNB, …) on
-# the EVM chains your Payroof project watches. Set project and token (a prf_
-# project token with the "references" and "webhooks" permissions), then use
-# Admin -> Payments -> "Register webhook" (requires an https public_url) or
-# paste the whsec_ secret of a webhook pointing at {public_url}/webhooks/payroof.
+# Payroof crypto payments: USDC, USDT, and native coins (ETH, POL, BNB, and so
+# on) on the EVM chains your Payroof project watches. Set project and token,
+# then use Admin > Payments > "Register webhook". Registration requires an https
+# public_url. You can also paste the whsec_ secret of a webhook that points at
+# {public_url}/webhooks/payroof.
+
 # [payroof]
+
+# Payroof API origin. Default: "https://api.payroof.top".
 # api_url = "https://api.payroof.top"
+
+# Payroof project name: 1 to 63 lowercase letters, digits, or hyphens. Default: "".
 # project = ""
+
+# Project token that starts with prf_. It needs the "references" and "webhooks"
+# permissions. Default: "".
 # token = ""
+
+# Webhook signing secret that starts with whsec_ and encodes 32 bytes.
+# Default: "".
 # webhook_secret = ""
-# stablecoins = ["USDC", "USDT"]   # valued 1:1 with USD
-# native_coins = true              # quote native coins at the current rate
-# chains = []                      # CAIP-2 ids to offer; empty = all watched
-# rate_source = "coingecko"        # or "static" (native_rates_usd only)
+
+# Token symbols valued 1:1 with USD. Default: ["USDC", "USDT"].
+# stablecoins = ["USDC", "USDT"]
+
+# Offer native coins at the current USD rate. Default: true.
+# native_coins = true
+
+# CAIP-2 chain ids to offer. Empty offers every chain the project watches.
+# Default: [].
+# chains = []
+
+# Source of native coin USD rates: "coingecko" or "static". With "static", only
+# native_rates_usd is used. Default: "coingecko".
+# rate_source = "coingecko"
+
+# CoinGecko-compatible simple/price endpoint. Default:
+# "https://api.coingecko.com/api/v3/simple/price".
 # rate_url = "https://api.coingecko.com/api/v3/simple/price"
-# quote_ttl_minutes = 60           # quotes and native rates hold this long
+
+# How long a quote (addresses and amounts) stays valid, in minutes. Must be
+# between 1 and 1440. Default: 60.
+# quote_ttl_minutes = 60
+
+# Accepted underpayment in percent of the order price. Must be below 50.
+# Default: "0.5".
 # underpayment_tolerance_pct = "0.5"
-# native_rates_usd = { ETH = "3000" }   # fixed rates override the feed
-# [payroof.rate_ids]               # native symbol -> CoinGecko coin id
+
+# Fixed USD rates by native symbol, as decimal strings. They override the rate
+# feed. Default: {}.
+# native_rates_usd = { ETH = "3000" }
+
+# Native symbol to CoinGecko coin id. This table replaces the built-in map,
+# which also covers MATIC, AVAX, XDAI, FTM, S, and CELO.
+# [payroof.rate_ids]
 # ETH = "ethereum"
 # POL = "polygon-ecosystem-token"
 # BNB = "binancecoin"

@@ -1,9 +1,12 @@
 //! Runtime configuration.
 //!
-//! On first start the TOML file and bootstrap environment variables seed the
-//! `settings` row in SQLite; afterwards the database copy is authoritative and
-//! is edited through the administrator API (or replaced with
-//! `reseller config import`).
+//! On first start, the TOML file and bootstrap environment variables seed the
+//! `settings` row in SQLite. After that the database copy is authoritative.
+//!
+//! Change it in one of two ways:
+//!
+//! - Edit it through the administrator API.
+//! - Replace it with `reseller config import`.
 mod branding;
 mod keys;
 mod mcp;
@@ -24,8 +27,10 @@ use std::{collections::BTreeMap, path::Path};
 
 /// Minimum length of the administrator token and the key pepper.
 pub const MIN_SECRET_LEN: usize = 24;
-/// JSON pointers of every secret setting (redacted in API responses; a blank
-/// value in a settings patch keeps the stored secret).
+/// JSON pointers of every secret setting.
+///
+/// API responses redact these values. A blank value in a settings patch keeps
+/// the stored secret.
 pub const SECRET_PATHS: [&str; 10] = [
     "/admin_token",
     "/key_pepper",
@@ -49,9 +54,10 @@ pub struct Upstream {
     pub model: String,
     /// Voice applied to TTS requests according to [`Config::voice_policy`].
     pub voice: String,
-    /// Ordered models tried after retryable upstream failures (JSON only).
+    /// Ordered models tried after retryable upstream failures. The
+    /// `*_MODEL_FALLBACKS` environment variables set this list as well.
     pub fallbacks: Vec<String>,
-    /// Per-upstream timeout in seconds; 0 uses `upstream_timeout_seconds`.
+    /// Per-upstream timeout in seconds. Zero uses `upstream_timeout_seconds`.
     pub timeout_seconds: u64,
     /// Extra request headers sent to this upstream (for example
     /// `HTTP-Referer` / `X-Title` for OpenRouter attribution).
@@ -86,6 +92,7 @@ const RESERVED_HEADERS: [&str; 9] = [
 ];
 
 impl Upstream {
+    /// Checks the base URL, fallback count, timeout, and extra headers.
     fn validate(&self, name: &str) -> anyhow::Result<()> {
         let url = url::Url::parse(&self.base_url)
             .with_context(|| format!("[{name}].base_url is not a valid URL"))?;
@@ -145,7 +152,7 @@ pub enum Policy {
 pub struct Price {
     /// Per 1M input tokens.
     pub input: String,
-    /// Per 1M cached input tokens; absent means the `input` price.
+    /// Per 1M cached input tokens. When absent, the `input` price applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input: Option<String>,
     /// Per 1M output tokens.
@@ -191,6 +198,7 @@ impl Price {
     }
 }
 
+/// Complete runtime settings, stored as one JSON document in SQLite.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -332,6 +340,7 @@ impl Config {
         }
     }
 
+    /// Checks every setting and returns the first violation.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.admin_token.len() >= MIN_SECRET_LEN && self.key_pepper.len() >= MIN_SECRET_LEN,

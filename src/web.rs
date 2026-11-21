@@ -125,6 +125,8 @@ fn cors(origin: &str) -> CorsLayer {
             HeaderName::from_static("x-api-key"),
             HeaderName::from_static("x-admin-token"),
             HeaderName::from_static("mcp-protocol-version"),
+            HeaderName::from_static("mcp-method"),
+            HeaderName::from_static("mcp-name"),
         ])
         .expose_headers([
             HeaderName::from_static("x-request-id"),
@@ -171,8 +173,8 @@ async fn ready(State(app): State<App>) -> Result<Json<serde_json::Value>> {
 }
 
 /// Client address. Behind a trusted proxy, `CF-Connecting-IP` wins, then the
-/// rightmost `X-Forwarded-For` entry — the one appended by the proxy itself;
-/// entries further left are client-controlled.
+/// rightmost `X-Forwarded-For` entry, the one the proxy itself appends.
+/// Entries further left are client-controlled.
 fn client_ip(peer: SocketAddr, headers: &HeaderMap, trust_proxy: bool) -> IpAddr {
     if !trust_proxy {
         return peer.ip();

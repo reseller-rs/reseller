@@ -55,13 +55,14 @@ pub fn markup(micros: i64, pct: &str) -> Result<i64> {
         .ok_or_else(|| Error::bad("Billing overflow"))
 }
 
-/// Accepts a USD amount given as a JSON string or number.
+/// Parses a USD amount from a JSON string or number into micro-USD.
 pub fn value(v: &serde_json::Value) -> Result<i64> {
     usd(&decimal_text(v)?)
 }
 
-/// Accepts a percentage given as a JSON string or number and returns its
-/// canonical string form, validated by [`decimal`].
+/// Validates a percentage given as a JSON string or number with [`decimal`].
+///
+/// Returns the trimmed string form on success.
 pub fn percent(v: &serde_json::Value) -> Result<String> {
     let s = decimal_text(v)?;
     decimal(&s)?;

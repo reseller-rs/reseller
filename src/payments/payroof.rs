@@ -1,13 +1,18 @@
 //! Payroof crypto payments.
 //!
 //! Each order is a Payroof *reference* with its own deposit address per EVM
-//! chain. At checkout the order is quoted once per accepted asset (USD-pegged
-//! stablecoins 1:1, native coins at the current USD rate); quotes are fixed
-//! for `quote_ttl_minutes`. Payroof posts signed `seen` and `confirmed`
-//! webhooks; confirmed transfers are valued against their quote, and the order
-//! is paid once the confirmed value covers the price (within the configured
-//! underpayment tolerance). Payments in several assets or several transfers
-//! add up.
+//! chain.
+//!
+//! At checkout, the order is quoted once per accepted asset:
+//!
+//! - USD-pegged stablecoins, 1:1.
+//! - Native coins, at the current USD rate.
+//!
+//! Quotes stay fixed for `quote_ttl_minutes`. Payroof posts signed `seen` and
+//! `confirmed` webhooks. Confirmed transfers are valued against their quote.
+//! The order is paid once the confirmed value covers the price, within the
+//! configured underpayment tolerance. Payments in several assets, or several
+//! transfers, add up.
 use super::{complete, create_order, first_delivery, provider_error, unavailable};
 use crate::{
     App,
@@ -33,15 +38,20 @@ use std::{
 
 /// Accepted clock skew for webhook timestamps, in seconds.
 const SIGNATURE_TOLERANCE: u64 = 300;
+/// Timeout for each Payroof API call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the project catalog stays cached.
 const CATALOG_TTL: Duration = Duration::from_secs(600);
+/// How long a native-coin USD rate stays cached.
 const RATE_TTL: Duration = Duration::from_secs(120);
 /// Native quotes are rounded up to at most this many decimal places so they
 /// are practical to type into a wallet.
 const NATIVE_QUOTE_DECIMALS: u32 = 8;
+/// Parts-per-million scale used for ratios.
 const PPM: u128 = 1_000_000;
-/// Transfers are valued at most at 1000x their quote.
+/// Transfers are valued at most 1,000 times their quote.
 const MAX_VALUE_PPM: u128 = 1_000 * PPM;
+/// Route path of the Payroof webhook, appended to `public_url`.
 pub const WEBHOOK_PATH: &str = "/webhooks/payroof";
 
 /// One asset in the project's public catalog.
@@ -64,6 +74,7 @@ pub struct Chain {
 }
 
 impl Asset {
+    /// Whether this is a native coin, identified by a SLIP-44 CAIP-19 id.
     pub fn is_native(&self) -> bool {
         self.id.contains("/slip44:")
     }
@@ -88,7 +99,8 @@ pub fn webhook_key(secret: &str) -> Option<[u8; 32]> {
     base64url(secret.strip_prefix("whsec_")?)?.try_into().ok()
 }
 
-/// Unpadded (padding tolerated) base64url decoding.
+/// Decodes base64url. Trailing `=` padding is accepted. Input whose leftover
+/// bits are not zero is rejected.
 fn base64url(input: &str) -> Option<Vec<u8>> {
     let input = input.trim_end_matches('=');
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
@@ -115,8 +127,12 @@ fn base64url(input: &str) -> Option<Vec<u8>> {
     (bits < 6 && acc == 0).then_some(out)
 }
 
-/// Verifies `Payroof-Signature: v1=<hex HMAC-SHA256(key, "<ts>." || body)>`
-/// in constant time at Unix time `now`.
+/// Verifies a Payroof webhook signature in constant time at Unix time `now`.
+///
+/// The `Payroof-Signature` header holds comma-separated `v1=<hex>` entries.
+/// Each entry is an HMAC-SHA256 of `"<ts>." || body` under the webhook key.
+/// Any matching entry is enough. The timestamp must lie within
+/// `SIGNATURE_TOLERANCE` seconds of `now`.
 pub fn verify(secret: &str, timestamp: &str, signature: &str, body: &[u8], now: i64) -> Result<()> {
     let fail = || {
         Error::new(
@@ -146,6 +162,9 @@ pub fn verify(secret: &str, timestamp: &str, signature: &str, body: &[u8], now: 
 }
 
 /// Calls the Payroof API with the project token.
+///
+/// A 429 or 503 response maps to a 503 error. Any other failure maps to a 502
+/// error.
 async fn call(
     app: &App,
     config: &Payroof,
@@ -180,6 +199,7 @@ async fn call(
     })
 }
 
+/// Path of the project resource, such as `/v1/projects/<name>`.
 fn project_path(config: &Payroof) -> String {
     format!("/v1/projects/{}", config.project)
 }
@@ -291,14 +311,18 @@ async fn rates(app: &App, config: &Payroof, symbols: &[String]) -> HashMap<Strin
 }
 
 /// Price in base units for a stablecoin with `decimals`, rounded up.
+///
+/// Returns `None` on overflow.
 fn stable_amount(price_micro: i64, decimals: u32) -> Option<u128> {
     let price = u128::try_from(price_micro).ok()?;
     let scaled = price.checked_mul(10u128.checked_pow(decimals)?)?;
     Some(scaled.div_ceil(PPM))
 }
 
-/// Price in base units for a native coin at `rate` USD, rounded up to
-/// [`NATIVE_QUOTE_DECIMALS`] places.
+/// Price in base units for a native coin at `rate` USD, rounded up.
+///
+/// The amount keeps at most [`NATIVE_QUOTE_DECIMALS`] decimal places, and never
+/// more than the coin's own `decimals`.
 fn native_amount(price_micro: i64, rate: Decimal, decimals: u32) -> Option<u128> {
     let usd = Decimal::from(price_micro) / Decimal::from(1_000_000);
     let coins = usd.checked_div(rate)?.round_dp_with_strategy(
@@ -309,7 +333,9 @@ fn native_amount(price_micro: i64, rate: Decimal, decimals: u32) -> Option<u128>
     mantissa.checked_mul(10u128.checked_pow(decimals.checked_sub(coins.scale())?)?)
 }
 
-/// Formats base units as a decimal string (`1500000`, 6 -> `"1.5"`).
+/// Formats base units as a decimal string.
+///
+/// For example, `1500000` with 6 decimals formats as `"1.5"`.
 pub fn display_units(amount: &str, decimals: u32) -> String {
     let digits = amount.trim_start_matches('0');
     let decimals = decimals as usize;
@@ -513,6 +539,8 @@ struct Event {
     amount: String,
 }
 
+/// Reads a header as text, or returns an empty string when it is absent or
+/// not valid text.
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
     headers
         .get(name)
@@ -559,6 +587,10 @@ pub async fn webhook(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<Valu
     Ok(json!({"received": true}))
 }
 
+/// Stores a transfer and, for a confirmed one, values it against its quote.
+///
+/// The order completes once its confirmed transfers cover the price. A
+/// transfer that needs review is logged with a note.
 async fn record_transfer(
     conn: &mut SqliteConnection,
     order: &SqliteRow,
@@ -711,8 +743,10 @@ pub async fn status(app: &App) -> Result<Value> {
     Ok(out)
 }
 
-/// Subscribes `{public_url}/webhooks/payroof` to `seen` and `confirmed` and
-/// stores the returned signing secret in the settings.
+/// Subscribes `{public_url}/webhooks/payroof` to `seen` and `confirmed` events.
+///
+/// The returned signing secret is saved to the settings. Registration fails
+/// unless `public_url` uses https.
 pub async fn register_webhook(app: &App) -> Result<Value> {
     let config = app.config().await;
     let settings = &config.payroof;
@@ -793,7 +827,7 @@ mod tests {
         assert_eq!(stable_amount(20_000_000, 6), Some(20_000_000));
         assert_eq!(stable_amount(20_000_000, 18), Some(20 * 10u128.pow(18)));
         assert_eq!(stable_amount(1, 0), Some(1), "rounds up");
-        // $20 of ETH at $3000 = 0.0066666… rounded up to 8 places.
+        // $20 of ETH at $3000 is 0.0066666..., rounded up to 8 places.
         let eth = native_amount(20_000_000, Decimal::from(3000), 18).unwrap();
         assert_eq!(eth, 666_667 * 10u128.pow(10));
         assert_eq!(display_units(&eth.to_string(), 18), "0.00666667");

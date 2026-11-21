@@ -3,7 +3,7 @@
 //! [`Meter::begin`] admits a request (key status, balance, rate and usage
 //! limits) and logs it in the same write transaction, so concurrent requests
 //! cannot overshoot limits. [`Meter::finish`] prices observed usage and
-//! settles it exactly once; a meter dropped mid-stream settles in the
+//! settles it exactly once. A meter dropped mid-stream settles in the
 //! background with whatever usage was observed.
 use crate::{
     App,
@@ -29,15 +29,17 @@ pub struct Usage {
     /// Output tokens, including reasoning tokens (providers already count
     /// those within the completion total).
     pub output: i64,
+    /// Total tokens, as reported or as input plus output.
     pub total: i64,
+    /// Audio duration in milliseconds.
     pub audio_ms: i64,
     /// Generated images (images API responses, chat-completion images).
     pub images: i64,
     /// Unicode characters of text-to-speech input.
     pub characters: i64,
-    /// Provider-reported cost in micro-USD; replaces the token, audio,
-    /// image, and character components of the price table (including an
-    /// explicit zero). The flat per-request fee is always added on top.
+    /// Provider-reported cost in micro-USD. It replaces the token, audio,
+    /// image, and character components of the price table, including an
+    /// explicit zero. The flat per-request fee is always added on top.
     pub cost: Option<i64>,
     /// Token counts are our estimate: the upstream reported no usage.
     pub estimated: bool,
@@ -58,9 +60,11 @@ fn round_micro(usd: Decimal) -> Result<i64> {
 }
 
 impl Usage {
-    /// Reads an OpenAI-style `usage` object (chat, responses, audio, or
-    /// transcription: `{"type":"duration","seconds":…}` and
-    /// `{"type":"tokens","input_tokens":…}` forms included).
+    /// Reads an OpenAI-style `usage` object.
+    ///
+    /// Accepts both `prompt_tokens` and `input_tokens` spellings, and audio
+    /// durations in `audio_seconds` or `seconds`. Counts are clamped to sane
+    /// ranges.
     pub fn parse(v: &Value) -> Self {
         let tokens = |a: &str, b: &str| {
             v[a].as_i64()
@@ -127,7 +131,9 @@ impl Usage {
         };
     }
 
-    /// Upstream cost in micro-USD, rounded once from the exact decimal sum:
+    /// Returns the upstream cost of the request in micro-USD.
+    ///
+    /// The exact decimal sum is rounded once:
     ///
     /// ```text
     /// usage  = provider cost                      if the provider reported one
@@ -141,7 +147,7 @@ impl Usage {
     /// ```
     ///
     /// `success` means the upstream answered 2xx (or a realtime session was
-    /// established); failed requests are never charged the flat fee.
+    /// established). Failed requests are never charged the flat fee.
     pub fn cost(&self, config: &Config, model: &str, success: bool) -> Result<i64> {
         let price = config.price(model);
         let mut total = match (self.cost, price) {
@@ -192,7 +198,7 @@ pub struct Meter {
     config: Arc<Config>,
     pub model: String,
     pub status: u16,
-    /// The upstream answered successfully; gates the flat request fee.
+    /// The upstream answered successfully. It gates the flat request fee.
     /// Independent of `status`, which also records client-side outcomes
     /// such as 499.
     pub success: bool,
@@ -204,8 +210,8 @@ pub struct Meter {
     settled: bool,
 }
 
-/// Values persisted at settlement; detached from [`Meter`] so a dropped
-/// meter can settle on a background task.
+/// Values persisted at settlement. They are detached from [`Meter`] so a
+/// dropped meter can settle on a background task.
 struct Settlement {
     app: App,
     id: String,
@@ -232,9 +238,9 @@ impl Meter {
         Self::begin_with(app, identity, meta, true).await
     }
 
-    /// Like [`Meter::begin`]; with `check_model = false` the key's model
-    /// allowlist is not applied at admission because the model is only
-    /// learned while the body streams. The caller must then enforce it.
+    /// Like [`Meter::begin`], but with `check_model = false` the key's model
+    /// allowlist is not applied at admission. The model is only learned while
+    /// the body streams. The caller must then enforce it.
     pub async fn begin_with(
         app: &App,
         identity: Option<Identity>,
@@ -292,8 +298,10 @@ impl Meter {
         self.error = Some(error.into());
     }
 
-    /// Settles the request: bills usage, updates aggregates, closes the log.
-    /// A failed attempt is retried in the background with the same values.
+    /// Settles the request: bills usage, updates aggregates, and closes the log.
+    ///
+    /// If settlement fails, the same values are retried in the background and
+    /// the error is still returned.
     pub async fn finish(mut self) -> Result<()> {
         self.settled = true;
         let settlement = self.settlement();
@@ -323,8 +331,8 @@ impl Meter {
 }
 
 impl Drop for Meter {
-    /// Client disconnects drop the response stream before `finish` runs;
-    /// settle what was observed so streamed tokens are still billed.
+    /// Settles an unfinished meter in the background as a 499 interrupted
+    /// request, so streamed tokens are still billed.
     fn drop(&mut self) {
         if self.settled {
             return;
@@ -337,8 +345,9 @@ impl Drop for Meter {
 }
 
 impl Settlement {
-    /// Persists on a tracked background task (awaited at shutdown), with a
-    /// few retries for transient database contention.
+    /// Persists on a tracked background task that shutdown waits for.
+    ///
+    /// Retries up to three times to ride out transient database contention.
     fn retry_in_background(self) {
         let tasks = self.app.tasks.clone();
         tasks.spawn(async move {
@@ -452,7 +461,7 @@ async fn admit(
     identity: &Identity,
     model: Option<&str>,
 ) -> Result<()> {
-    // Status may have changed since authentication; recheck under the lock.
+    // Status may have changed since authentication. Recheck under the lock.
     let row = sqlx::query(
         "SELECT k.status,k.expires_at,a.status AS account_status \
          FROM api_keys k JOIN accounts a ON a.id=k.account_id WHERE k.id=?",
@@ -557,7 +566,9 @@ fn in_flight_since(config: &Config) -> i64 {
     now() - i64::try_from(timeout).unwrap_or(i64::MAX / 2)
 }
 
-/// Caps in-flight requests per account.
+/// Rejects a request when its account has too many requests in flight.
+///
+/// A configured limit of 0 disables the check.
 async fn check_concurrency(
     conn: &mut SqliteConnection,
     config: &Config,

@@ -3,6 +3,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Stripe Checkout settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Stripe {
@@ -11,6 +12,7 @@ pub struct Stripe {
 }
 
 impl Stripe {
+    /// Whether Stripe Checkout is offered (both secrets are set).
     pub fn enabled(&self) -> bool {
         !self.secret_key.is_empty() && !self.webhook_secret.is_empty()
     }
@@ -24,7 +26,7 @@ pub enum RateSource {
     /// as per-symbol overrides.
     #[default]
     Coingecko,
-    /// Only `native_rates_usd`; native coins without a rate are not offered.
+    /// Uses only `native_rates_usd`. Native coins without a rate are not offered.
     Static,
 }
 
@@ -36,14 +38,14 @@ pub struct Payroof {
     pub api_url: String,
     /// Payroof project name.
     pub project: String,
-    /// Project bearer token (`prf_…`) with the `references` permission
-    /// (and `webhooks` to register the webhook from the console).
+    /// Project bearer token (`prf_...`). It needs the `references` permission,
+    /// and the `webhooks` permission to register the webhook from the console.
     pub token: String,
-    /// Webhook signing secret (`whsec_…`).
+    /// Webhook signing secret (`whsec_...`).
     pub webhook_secret: String,
     /// Token symbols valued 1:1 with USD (for example USDC, USDT).
     pub stablecoins: Vec<String>,
-    /// Offer native coins (ETH, POL, BNB, …) at the current USD rate.
+    /// Offer native coins (ETH, POL, BNB, ...) at the current USD rate.
     pub native_coins: bool,
     /// Restrict payments to these CAIP-2 chain ids (empty: every chain the
     /// project watches).
@@ -51,9 +53,9 @@ pub struct Payroof {
     pub rate_source: RateSource,
     /// CoinGecko-compatible `simple/price` endpoint.
     pub rate_url: String,
-    /// Native symbol -> CoinGecko coin id.
+    /// Maps each native symbol to a CoinGecko coin id.
     pub rate_ids: BTreeMap<String, String>,
-    /// Fixed USD rates by native symbol (decimal strings); override the feed.
+    /// Fixed USD rates by native symbol, as decimal strings. These override the feed.
     pub native_rates_usd: BTreeMap<String, String>,
     /// How long a quote (addresses and amounts) is valid.
     pub quote_ttl_minutes: u32,
@@ -95,6 +97,7 @@ impl Default for Payroof {
 }
 
 impl Payroof {
+    /// Whether crypto checkout is offered (project, token, and webhook secret are set).
     pub fn enabled(&self) -> bool {
         !self.project.is_empty() && !self.token.is_empty() && !self.webhook_secret.is_empty()
     }
@@ -104,6 +107,7 @@ impl Payroof {
         self.api_url.trim_end_matches('/')
     }
 
+    /// Checks the URLs, project name, key formats, tolerance, and list sizes.
     pub fn validate(&self) -> anyhow::Result<()> {
         for (name, value) in [("api_url", &self.api_url), ("rate_url", &self.rate_url)] {
             let url = url::Url::parse(value).with_context(|| format!("payroof.{name}"))?;

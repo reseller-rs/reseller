@@ -27,7 +27,18 @@ use std::{
 };
 
 const ADMIN: &str = "admin-test-secret-123456789";
+const MODERN: &str = "2026-07-28";
+const LEGACY: &str = "2025-11-25";
 const PNG: [u8; 12] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+
+/// The required per-request metadata of a modern request.
+fn meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": MODERN,
+        "io.modelcontextprotocol/clientInfo": {"name": "test-client", "version": "1.0.0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    })
+}
 
 struct Test {
     app: App,
@@ -187,10 +198,34 @@ impl Test {
         Rpc::from(request.send().await.unwrap()).await
     }
 
-    async fn rpc(&self, token: Option<&str>, method: &str, params: Value) -> Rpc {
+    /// A modern (2026-07-28) request: per-request `_meta` and the standard
+    /// `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers.
+    async fn rpc(&self, token: Option<&str>, method: &str, mut params: Value) -> Rpc {
+        params["_meta"] = meta();
+        let name = params["name"].as_str().map(str::to_owned);
+        let mut headers = vec![("mcp-protocol-version", MODERN), ("mcp-method", method)];
+        if let Some(name) = &name {
+            headers.push(("mcp-name", name));
+        }
         self.raw(
             token,
-            &[],
+            &headers,
+            json!({"jsonrpc":"2.0","id":7,"method":method,"params":params}),
+        )
+        .await
+    }
+
+    /// A legacy (2025-11-25) request: no `_meta`, only the version header
+    /// (`initialize` is sent without it, before a version is negotiated).
+    async fn legacy(&self, method: &str, params: Value) -> Rpc {
+        let headers: &[(&str, &str)] = if method == "initialize" {
+            &[]
+        } else {
+            &[("mcp-protocol-version", LEGACY)]
+        };
+        self.raw(
+            None,
+            headers,
             json!({"jsonrpc":"2.0","id":7,"method":method,"params":params}),
         )
         .await
@@ -312,56 +347,408 @@ fn error_code(result: &Value) -> &str {
 // ---------------------------------------------------------------------------
 // Protocol
 
+/// The identity every modern result carries.
+fn assert_server_info(result: &Value) {
+    let info = &result["_meta"]["io.modelcontextprotocol/serverInfo"];
+    assert_eq!(info["name"], "reseller");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+}
+
 #[tokio::test]
-async fn initialize_negotiates_versions() {
+async fn discover_advertises_versions_capabilities_and_identity() {
     let t = Test::new().await;
-    for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
-        let r = t
-            .rpc(
-                None,
-                "initialize",
-                json!({"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"t","version":"1"}}),
-            )
-            .await;
-        assert_eq!(r.status, 200);
-        assert_eq!(r.body["jsonrpc"], "2.0");
-        assert_eq!(r.body["result"]["protocolVersion"], version);
-    }
-    let r = t
-        .rpc(None, "initialize", json!({"protocolVersion":"1999-01-01"}))
-        .await;
+    let r = t.rpc(None, "server/discover", json!({})).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["jsonrpc"], "2.0");
+    assert_eq!(r.body["id"], 7);
     let result = &r.body["result"];
-    assert_eq!(result["protocolVersion"], "2025-11-25");
-    assert_eq!(result["serverInfo"]["name"], "reseller");
-    assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
-    assert!(result["capabilities"]["tools"].is_object());
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["supportedVersions"], json!([MODERN, LEGACY]));
+    assert_eq!(result["capabilities"], json!({"tools": {}}));
+    assert_eq!(result["cacheScope"], "public");
+    assert!(result["ttlMs"].as_u64().unwrap() > 0);
+    assert_server_info(result);
     let instructions = result["instructions"].as_str().unwrap();
     for needle in ["Bearer", "create_account", "generate_text", "$0.25"] {
         assert!(instructions.contains(needle), "{needle}: {instructions}");
     }
-    let r = t.rpc(None, "initialize", json!({})).await;
-    assert_eq!(r.body["error"]["code"], -32602);
-    assert_eq!(
-        t.rpc(None, "ping", json!({})).await.body["result"],
-        json!({})
-    );
+    // Discovery and the tool list are identical for every caller.
+    for token in [Some(t.api_key()), Some(t.dashboard())] {
+        let again = t.rpc(token, "server/discover", json!({})).await;
+        assert_eq!(again.body["result"], r.body["result"]);
+    }
+    // No handshake, no ping, no sessions.
+    for method in [
+        "ping",
+        "initialize",
+        "resources/list",
+        "subscriptions/listen",
+    ] {
+        let r = t.rpc(None, method, json!({})).await;
+        assert_eq!(
+            (r.status, r.body["error"]["code"].as_i64()),
+            (404, Some(-32601)),
+            "{method}"
+        );
+    }
+    assert!(!r.headers.contains_key("mcp-session-id"));
 }
 
 #[tokio::test]
-async fn protocol_version_header_is_validated() {
+async fn modern_results_carry_result_type_and_identity() {
     let t = Test::new().await;
-    let ping = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
-    for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
-        let r = t
-            .raw(None, &[("mcp-protocol-version", version)], ping.clone())
-            .await;
-        assert_eq!(r.status, 200, "{version}");
-    }
+    let r = t.rpc(None, "tools/list", json!({})).await;
+    let result = &r.body["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["cacheScope"], "public");
+    assert!(result["ttlMs"].as_u64().unwrap() > 0);
+    assert!(result.get("nextCursor").is_none());
+    assert_server_info(result);
+    // A single page: no cursor is valid.
+    let r = t.rpc(None, "tools/list", json!({"cursor": "x"})).await;
+    assert_eq!(r.body["error"]["code"], -32602);
+
     let r = t
-        .raw(None, &[("mcp-protocol-version", "2024-11-05")], ping)
+        .rpc(
+            None,
+            "tools/call",
+            json!({"name":"list_plans","arguments":{}}),
+        )
         .await;
-    assert_eq!(r.status, 400);
-    assert_eq!(r.body["error"]["code"], "invalid_request");
+    let result = &r.body["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["isError"], false);
+    assert_server_info(result);
+    // Tool execution errors are complete results with `isError`, not JSON-RPC errors.
+    let r = t
+        .rpc(
+            None,
+            "tools/call",
+            json!({"name":"generate_text","arguments":{"prompt":"x"}}),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    let result = &r.body["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["isError"], true);
+    assert_server_info(result);
+    // Protocol errors (unknown tool) are JSON-RPC errors.
+    let r = t.rpc(None, "tools/call", json!({"name":"nope"})).await;
+    assert_eq!(r.body["error"]["code"], -32602);
+    assert!(r.body.get("result").is_none());
+}
+
+fn unsupported_version_payload(r: &Rpc, requested: &str) {
+    assert_eq!(r.status, 400, "{:?}", r.body);
+    assert_eq!(r.body["error"]["code"], -32022);
+    assert_eq!(
+        r.body["error"]["data"]["supported"],
+        json!([MODERN, LEGACY])
+    );
+    assert_eq!(r.body["error"]["data"]["requested"], requested);
+}
+
+#[tokio::test]
+async fn protocol_version_is_validated_per_request() {
+    let t = Test::new().await;
+    let discover = |version: Value| {
+        let mut m = meta();
+        m["io.modelcontextprotocol/protocolVersion"] = version;
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":m}})
+    };
+    let headers = |version: &'static str| {
+        [
+            ("mcp-protocol-version", version),
+            ("mcp-method", "server/discover"),
+        ]
+    };
+    // Unknown and no-longer-supported versions get the supported list.
+    for version in ["1900-01-01", "2025-06-18", "2025-03-26", "2024-11-05"] {
+        let r = t
+            .raw(None, &headers(version), discover(json!(version)))
+            .await;
+        unsupported_version_payload(&r, version);
+    }
+    // Header and body must agree.
+    let r = t
+        .raw(None, &headers(MODERN), discover(json!("1900-01-01")))
+        .await;
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_i64()),
+        (400, Some(-32020))
+    );
+    // The header is required.
+    let r = t
+        .raw(
+            None,
+            &[("mcp-method", "server/discover")],
+            discover(json!(MODERN)),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_i64()),
+        (400, Some(-32020))
+    );
+    // A header with an unknown version and no `_meta` version.
+    let r = t
+        .raw(
+            None,
+            &headers("2025-06-18"),
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover"}),
+        )
+        .await;
+    unsupported_version_payload(&r, "2025-06-18");
+    // Missing `_meta.protocolVersion` under the modern header: Invalid params.
+    for params in [
+        json!({}),
+        json!({"_meta": {}}),
+        json!({"_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}),
+    ] {
+        let r = t
+            .raw(
+                None,
+                &headers(MODERN),
+                json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":params}),
+            )
+            .await;
+        assert_eq!(
+            (r.status, r.body["error"]["code"].as_i64()),
+            (400, Some(-32602)),
+            "{params}"
+        );
+        assert_eq!(r.body["id"], 1);
+    }
+    // Other required `_meta` fields.
+    let mut no_caps = meta();
+    no_caps
+        .as_object_mut()
+        .unwrap()
+        .remove("io.modelcontextprotocol/clientCapabilities");
+    let mut bad_info = meta();
+    bad_info["io.modelcontextprotocol/clientInfo"] = json!({"name": "only-a-name"});
+    let mut no_info = meta();
+    no_info
+        .as_object_mut()
+        .unwrap()
+        .remove("io.modelcontextprotocol/clientInfo");
+    for (m, status) in [(no_caps, 400), (bad_info, 400), (no_info, 200)] {
+        let r = t
+            .raw(
+                None,
+                &headers(MODERN),
+                json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":m}}),
+            )
+            .await;
+        assert_eq!(r.status, status, "{m}: {:?}", r.body);
+        if status == 400 {
+            assert_eq!(r.body["error"]["code"], -32602);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_method_and_name_headers_must_match_the_body() {
+    let t = Test::new().await;
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"list_plans","arguments":{},"_meta":meta()}});
+    let mismatch = |r: &Rpc| {
+        assert_eq!(
+            (r.status, r.body["error"]["code"].as_i64()),
+            (400, Some(-32020)),
+            "{:?}",
+            r.body
+        );
+        assert_eq!(r.body["id"], 1);
+        assert!(
+            r.body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Header mismatch")
+        );
+    };
+    let ok = [
+        ("mcp-protocol-version", MODERN),
+        ("mcp-method", "tools/call"),
+        ("mcp-name", "list_plans"),
+    ];
+    let r = t.raw(None, &ok, call.clone()).await;
+    assert_eq!(
+        (r.status, r.body["result"]["isError"].clone()),
+        (200, json!(false))
+    );
+    // Base64 sentinel values are decoded before comparing.
+    let encoded = format!("=?base64?{}?=", STANDARD.encode("list_plans"));
+    let r = t
+        .raw(
+            None,
+            &[
+                ("mcp-protocol-version", MODERN),
+                ("mcp-method", "tools/call"),
+                ("mcp-name", &encoded),
+            ],
+            call.clone(),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    // Header names are case-insensitive.
+    let r = t
+        .raw(
+            None,
+            &[
+                ("MCP-Protocol-Version", MODERN),
+                ("MCP-METHOD", "tools/call"),
+                ("Mcp-Name", "list_plans"),
+            ],
+            call.clone(),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    // Wrong, missing and malformed headers.
+    let wrong_method = [
+        ("mcp-protocol-version", MODERN),
+        ("mcp-method", "tools/list"),
+        ("mcp-name", "list_plans"),
+    ];
+    mismatch(&t.raw(None, &wrong_method, call.clone()).await);
+    let wrong_name = [
+        ("mcp-protocol-version", MODERN),
+        ("mcp-method", "tools/call"),
+        ("mcp-name", "generate_text"),
+    ];
+    mismatch(&t.raw(None, &wrong_name, call.clone()).await);
+    let no_name = [
+        ("mcp-protocol-version", MODERN),
+        ("mcp-method", "tools/call"),
+    ];
+    mismatch(&t.raw(None, &no_name, call.clone()).await);
+    let no_method = [("mcp-protocol-version", MODERN), ("mcp-name", "list_plans")];
+    mismatch(&t.raw(None, &no_method, call.clone()).await);
+    let bad_base64 = [
+        ("mcp-protocol-version", MODERN),
+        ("mcp-method", "tools/call"),
+        ("mcp-name", "=?base64?!!?="),
+    ];
+    mismatch(&t.raw(None, &bad_base64, call.clone()).await);
+    // The mismatch is refused before the tool runs: nothing is metered.
+    assert!(t.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_initialize_flow_still_works() {
+    let t = Test::new().await;
+    let r = t
+        .legacy(
+            "initialize",
+            json!({"protocolVersion":LEGACY,"capabilities":{},"clientInfo":{"name":"t","version":"1"}}),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["jsonrpc"], "2.0");
+    let result = &r.body["result"];
+    assert_eq!(result["protocolVersion"], LEGACY);
+    assert_eq!(result["serverInfo"]["name"], "reseller");
+    assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(result["capabilities"]["tools"].is_object());
+    assert!(
+        result["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("generate_text")
+    );
+    assert!(result.get("resultType").is_none());
+    assert!(!r.headers.contains_key("mcp-session-id"));
+
+    let r = t
+        .raw(
+            None,
+            &[("mcp-protocol-version", LEGACY)],
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await;
+    assert_eq!((r.status, r.body), (202, Value::Null));
+    assert_eq!(t.legacy("ping", json!({})).await.body["result"], json!({}));
+    // Legacy results use the 2025-11-25 shape: no modern fields.
+    let list = t.legacy("tools/list", json!({})).await;
+    let result = &list.body["result"];
+    assert!(result["tools"].as_array().unwrap().len() > 10);
+    for field in ["resultType", "ttlMs", "cacheScope", "_meta"] {
+        assert!(result.get(field).is_none(), "{field}");
+    }
+    let call = t
+        .legacy("tools/call", json!({"name":"list_plans","arguments":{}}))
+        .await;
+    assert_eq!(call.body["result"]["isError"], false);
+    assert!(call.body["result"].get("resultType").is_none());
+    assert!(call.body["result"].get("_meta").is_none());
+    // The same tools, in the same order, as in the modern era.
+    let modern = t.rpc(None, "tools/list", json!({})).await;
+    assert_eq!(modern.body["result"]["tools"], result["tools"]);
+    // Modern-only methods do not exist in the legacy era.
+    let r = t.legacy("server/discover", json!({})).await;
+    assert_eq!(r.body["error"]["code"], -32601);
+    // Without a version header a request is refused.
+    let r = t
+        .raw(
+            None,
+            &[],
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_i64()),
+        (400, Some(-32020))
+    );
+    // A legacy-era request that names the version in `_meta` as well is fine.
+    let r = t
+        .raw(
+            None,
+            &[("mcp-protocol-version", LEGACY)],
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list",
+                "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":LEGACY}}}),
+        )
+        .await;
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn older_handshake_versions_are_rejected() {
+    let t = Test::new().await;
+    for version in ["2025-06-18", "2025-03-26", "1999-01-01", MODERN] {
+        let r = t
+            .legacy(
+                "initialize",
+                json!({"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"t","version":"1"}}),
+            )
+            .await;
+        assert_eq!(
+            (r.status, r.body["error"]["code"].as_i64()),
+            (400, Some(-32602)),
+            "{version}"
+        );
+        assert_eq!(
+            r.body["error"]["data"]["supported"],
+            json!([MODERN, LEGACY])
+        );
+        assert_eq!(r.body["error"]["data"]["requested"], version);
+        let message = r.body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(MODERN) && message.contains(LEGACY),
+            "{message}"
+        );
+    }
+    let r = t.legacy("initialize", json!({})).await;
+    assert_eq!(r.body["error"]["code"], -32602);
+    // Requests under an older version header are refused with the supported list.
+    for version in ["2025-06-18", "2025-03-26"] {
+        let r = t
+            .raw(
+                None,
+                &[("mcp-protocol-version", version)],
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            )
+            .await;
+        unsupported_version_payload(&r, version);
+    }
 }
 
 #[tokio::test]
@@ -371,7 +758,6 @@ async fn origin_is_checked_against_public_url_and_cors_origin() {
         c.cors_origin = "https://app.example.org".into();
     })
     .await;
-    let ping = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
     for (origin, status) in [
         ("https://reseller.example.com", 200),
         ("https://app.example.org", 200),
@@ -381,14 +767,20 @@ async fn origin_is_checked_against_public_url_and_cors_origin() {
         ("null", 403),
         ("not an origin", 403),
     ] {
-        let r = t.raw(None, &[("origin", origin)], ping.clone()).await;
+        let r = t
+            .raw(
+                None,
+                &[("origin", origin), ("mcp-protocol-version", MODERN), ("mcp-method", "server/discover")],
+                json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta()}}),
+            )
+            .await;
         assert_eq!(r.status, status, "{origin}");
         if status == 403 {
             assert_eq!(r.body["error"]["code"], "origin_not_allowed");
         }
     }
     // Non-browser clients send no Origin.
-    assert_eq!(t.raw(None, &[], ping).await.status, 200);
+    assert_eq!(t.rpc(None, "server/discover", json!({})).await.status, 200);
 }
 
 #[tokio::test]
@@ -398,6 +790,7 @@ async fn http_semantics() {
     for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
         let r = client
             .request(method, format!("{}/mcp", t.url()))
+            .header("mcp-session-id", "abc")
             .send()
             .await
             .unwrap();
@@ -407,15 +800,15 @@ async fn http_semantics() {
     // Notifications and client responses are accepted without a body.
     for message in [
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}),
         json!({"jsonrpc":"2.0","id":3,"result":{}}),
     ] {
         let r = t.raw(None, &[], message).await;
         assert_eq!(r.status, 202);
         assert_eq!(r.body, Value::Null);
     }
-    let r = t
-        .raw(None, &[], json!([{"jsonrpc":"2.0","id":1,"method":"ping"}]))
-        .await;
+    let ping = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+    let r = t.raw(None, &[], json!([ping])).await;
     assert_eq!(
         (r.status, r.body["error"]["code"].as_i64()),
         (400, Some(-32600))
@@ -444,18 +837,25 @@ async fn http_semantics() {
         .await;
     assert_eq!(r.status, 400);
     let r = t.rpc(None, "resources/list", json!({})).await;
-    assert_eq!(r.body["error"]["code"], -32601);
-    let r = t.rpc(None, "tools/call", json!({"name":"nope"})).await;
-    assert_eq!(r.body["error"]["code"], -32602);
-    // String ids are echoed.
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_i64()),
+        (404, Some(-32601))
+    );
+    // String ids are echoed. A stale session header is ignored and never echoed.
     let r = t
         .raw(
             None,
-            &[],
-            json!({"jsonrpc":"2.0","id":"abc","method":"ping"}),
+            &[
+                ("mcp-protocol-version", MODERN),
+                ("mcp-method", "server/discover"),
+                ("mcp-session-id", "abc"),
+                ("last-event-id", "5"),
+            ],
+            json!({"jsonrpc":"2.0","id":"abc","method":"server/discover","params":{"_meta":meta()}}),
         )
         .await;
     assert_eq!(r.body["id"], "abc");
+    assert!(!r.headers.contains_key("mcp-session-id"));
     assert!(
         r.headers["content-type"]
             .to_str()
@@ -467,13 +867,13 @@ async fn http_semantics() {
 #[tokio::test]
 async fn disabled_endpoint_is_not_found_and_management_limit_applies() {
     let t = Test::with(|c| c.mcp.enabled = false).await;
-    let r = t.rpc(None, "ping", json!({})).await;
+    let r = t.rpc(None, "server/discover", json!({})).await;
     assert_eq!(r.status, 404);
     let t = Test::with(|c| c.rate_limits.management_per_minute = 3).await;
     for _ in 0..3 {
-        assert_eq!(t.rpc(None, "ping", json!({})).await.status, 200);
+        assert_eq!(t.rpc(None, "server/discover", json!({})).await.status, 200);
     }
-    let r = t.rpc(None, "ping", json!({})).await;
+    let r = t.rpc(None, "server/discover", json!({})).await;
     assert_eq!(r.status, 429);
     assert!(r.headers.contains_key("retry-after"));
 }
@@ -593,7 +993,7 @@ async fn tools_need_the_right_credential() {
     assert!(t.requests().await.is_empty());
     assert!(seen.lock().unwrap().is_empty());
 
-    // Account tools take either credential; public tools need none.
+    // Account tools take either credential. Public tools need none.
     for token in [t.dashboard(), t.api_key()] {
         let r = t.tool(Some(token), "account_overview", json!({})).await;
         assert_eq!(r["isError"], false);
@@ -966,7 +1366,7 @@ async fn generate_image_returns_inline_images_and_never_fetches_urls() {
         PNG
     );
     assert!(content[1]["text"].as_str().unwrap().contains("/secret.png"));
-    // file: URLs are dropped; the summary line is last.
+    // file: URLs are dropped. The summary line is last.
     assert_eq!(content.len(), 3);
     assert_eq!(
         r["structuredContent"]["images"][0]["revised_prompt"],
@@ -1288,7 +1688,14 @@ fn local(t: &Test, token: Option<&str>) -> Local {
 }
 
 impl Local {
-    async fn send(&self, method: &str, params: Value) -> Value {
+    /// A modern request with per-request `_meta`.
+    async fn send(&self, method: &str, mut params: Value) -> Value {
+        params["_meta"] = meta();
+        self.send_raw(method, params).await
+    }
+
+    /// A request exactly as given (legacy clients send no `_meta`).
+    async fn send_raw(&self, method: &str, params: Value) -> Value {
         self.bridge
             .handle(json!({"jsonrpc":"2.0","id":5,"method":method,"params":params}))
             .await
@@ -1306,7 +1713,56 @@ impl Local {
 }
 
 #[tokio::test]
-async fn bridge_lists_local_tools_and_hides_remote_signup() {
+async fn bridge_discovers_and_requires_per_request_meta() {
+    let t = Test::new().await;
+    let b = local(&t, None);
+    let discover = b.send("server/discover", json!({})).await;
+    let result = &discover["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["supportedVersions"], json!([MODERN, LEGACY]));
+    assert_eq!(result["capabilities"], json!({"tools": {}}));
+    assert_eq!(result["cacheScope"], "public");
+    assert!(result["ttlMs"].as_u64().unwrap() > 0);
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "reseller-mcp-bridge"
+    );
+    let instructions = result["instructions"].as_str().unwrap();
+    assert!(instructions.contains("signup") && instructions.contains("Server instructions"));
+    // Modern requests need their `_meta`. Nothing is served before a handshake.
+    for method in ["server/discover", "tools/list"] {
+        assert_eq!(b.send_raw(method, json!({})).await["error"]["code"], -32602);
+    }
+    let mut no_caps = meta();
+    no_caps
+        .as_object_mut()
+        .unwrap()
+        .remove("io.modelcontextprotocol/clientCapabilities");
+    let r = b.send_raw("tools/list", json!({"_meta": no_caps})).await;
+    assert_eq!(r["error"]["code"], -32602);
+    // Unsupported versions: the modern error with the supported list.
+    for version in ["2025-06-18", "1900-01-01"] {
+        let mut m = meta();
+        m["io.modelcontextprotocol/protocolVersion"] = json!(version);
+        let r = b.send_raw("server/discover", json!({"_meta": m})).await;
+        assert_eq!(r["error"]["code"], -32022, "{version}");
+        assert_eq!(r["error"]["data"]["supported"], json!([MODERN, LEGACY]));
+        assert_eq!(r["error"]["data"]["requested"], version);
+    }
+    // No ping, no handshake under the modern era.
+    for method in ["ping", "initialize", "resources/list"] {
+        assert_eq!(
+            b.send(method, json!({})).await["error"]["code"],
+            -32601,
+            "{method}"
+        );
+    }
+    let r = b.send("tools/list", json!({"cursor": "x"})).await;
+    assert_eq!(r["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn bridge_legacy_initialize_still_works() {
     let t = Test::new().await;
     let b = local(&t, None);
     assert!(
@@ -1315,15 +1771,62 @@ async fn bridge_lists_local_tools_and_hides_remote_signup() {
             .await
             .is_none()
     );
+    // Older handshake versions are rejected and do not open the legacy era.
+    for version in ["2025-06-18", "2025-03-26"] {
+        let r = b
+            .send_raw("initialize", json!({"protocolVersion":version}))
+            .await;
+        assert_eq!(r["error"]["code"], -32602, "{version}");
+        assert_eq!(r["error"]["data"]["supported"], json!([MODERN, LEGACY]));
+    }
+    assert_eq!(b.send_raw("ping", json!({})).await["error"]["code"], -32602);
     let init = b
-        .send("initialize", json!({"protocolVersion":"2025-06-18"}))
+        .send_raw("initialize", json!({"protocolVersion":LEGACY}))
         .await;
-    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
-    let instructions = init["result"]["instructions"].as_str().unwrap();
+    let result = &init["result"];
+    assert_eq!(result["protocolVersion"], LEGACY);
+    assert_eq!(result["serverInfo"]["name"], "reseller-mcp-bridge");
+    assert!(result.get("resultType").is_none());
+    let instructions = result["instructions"].as_str().unwrap();
     assert!(instructions.contains("signup") && instructions.contains("Server instructions"));
-    assert_eq!(b.send("ping", json!({})).await["result"], json!({}));
+    assert_eq!(b.send_raw("ping", json!({})).await["result"], json!({}));
+    // Legacy results have the 2025-11-25 shape.
+    let list = b.send_raw("tools/list", json!({})).await;
+    for field in ["resultType", "ttlMs", "cacheScope", "_meta"] {
+        assert!(list["result"].get(field).is_none(), "{field}");
+    }
+    assert!(list["result"]["tools"].as_array().unwrap().len() > 5);
+    let who = b
+        .send_raw("tools/call", json!({"name":"whoami","arguments":{}}))
+        .await;
+    assert_eq!(who["result"]["structuredContent"]["signed_in"], false);
+    assert!(who["result"].get("resultType").is_none());
+    // A remote tool result is stripped of the modern fields as well.
+    let plans = b
+        .send_raw("tools/call", json!({"name":"list_plans","arguments":{}}))
+        .await;
+    assert_eq!(plans["result"]["isError"], false);
+    for field in ["resultType", "_meta"] {
+        assert!(plans["result"].get(field).is_none(), "{field}");
+    }
+    // The modern era keeps working in the same process.
+    let discover = b.send("server/discover", json!({})).await;
+    assert_eq!(discover["result"]["resultType"], "complete");
+    assert_eq!(b.send_raw("nope", json!({})).await["error"]["code"], -32601);
+}
 
+#[tokio::test]
+async fn bridge_lists_local_tools_and_hides_remote_signup() {
+    let t = Test::new().await;
+    let b = local(&t, None);
     let list = b.send("tools/list", json!({})).await;
+    assert_eq!(list["result"]["resultType"], "complete");
+    assert_eq!(list["result"]["cacheScope"], "public");
+    assert!(list["result"]["ttlMs"].as_u64().unwrap() > 0);
+    assert_eq!(
+        list["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "reseller-mcp-bridge"
+    );
     let names: Vec<&str> = list["result"]["tools"]
         .as_array()
         .unwrap()
@@ -1343,10 +1846,18 @@ async fn bridge_lists_local_tools_and_hides_remote_signup() {
         .await;
     assert_eq!(unknown["error"]["code"], -32602);
     assert_eq!(b.send("nope", json!({})).await["error"]["code"], -32601);
+    let plans = b
+        .send("tools/call", json!({"name":"list_plans","arguments":{}}))
+        .await;
+    assert_eq!(plans["result"]["resultType"], "complete");
+    assert_eq!(
+        plans["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "reseller-mcp-bridge"
+    );
     let batch = b.bridge.handle(json!([])).await.unwrap();
     assert_eq!(batch["error"]["code"], -32600);
 
-    // Public tools work before signing in; everything else asks to sign in.
+    // Public tools work before signing in. Everything else asks to sign in.
     assert_eq!(b.tool("list_plans", json!({})).await["isError"], false);
     let r = b.tool("generate_text", json!({"prompt":"x"})).await;
     assert_eq!(error_code(&r), "not_signed_in");
@@ -1382,7 +1893,7 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
     let api_key = entry["api_key"].as_str().unwrap().to_owned();
     let dashboard = entry["dashboard_token"].as_str().unwrap().to_owned();
     assert!(api_key.starts_with("sk-res-") && dashboard.starts_with("dash_"));
-    // Secrets are never returned by signup; the prefix and path are.
+    // Secrets are never returned by signup. The prefix and path are returned.
     let shown = signup.to_string();
     assert!(!shown.contains(&api_key) && !shown.contains(&dashboard));
     assert!(shown.contains(&api_key[..15]));
@@ -1605,13 +2116,72 @@ async fn bridge_reports_unreachable_and_rejecting_servers() {
     drop(free);
     let bridge = Bridge::new(options(&url)).unwrap();
     let list = bridge
-        .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":meta()}}))
         .await
         .unwrap();
     assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+    // A partial list must not be cached.
+    assert_eq!(list["result"]["ttlMs"], 0);
     let reply = bridge
-        .handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"signup","arguments":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"signup","arguments":{},"_meta":meta()}}))
         .await
         .unwrap();
+    assert_eq!(reply["result"]["resultType"], "complete");
     assert_eq!(error_code(&reply["result"]), "network_error");
+}
+
+#[tokio::test]
+async fn stdio_process_serves_both_eras() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let t = Test::new().await;
+    let url = t.url();
+    let credentials = t.dir.path().join("stdio-credentials.json");
+    let lines = [
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"whoami","arguments":{},"_meta":meta()}}),
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":LEGACY}}),
+    ];
+    let mut input = lines
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    input.push_str("\nnot json\n");
+    let output = tokio::task::spawn_blocking(move || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_reseller"))
+            .args(["mcp", "--url", &url, "--credentials"])
+            .arg(credentials)
+            .env_remove("RESELLER_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let reply = |id: Value| replies.iter().find(|r| r["id"] == id).unwrap();
+    assert_eq!(replies.len(), 4, "{replies:?}");
+    assert_eq!(
+        reply(json!(1))["result"]["supportedVersions"],
+        json!([MODERN, LEGACY])
+    );
+    assert_eq!(reply(json!(2))["result"]["resultType"], "complete");
+    assert_eq!(reply(json!(4))["result"]["protocolVersion"], LEGACY);
+    assert_eq!(reply(Value::Null)["error"]["code"], -32700);
 }

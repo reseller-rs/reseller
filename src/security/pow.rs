@@ -1,12 +1,13 @@
 //! ALTCHA-compatible (v1, SHA-256) proof-of-work challenges for anonymous
 //! signup.
 //!
-//! A challenge is `sha256(salt + number)` for a random `number` in
-//! `[0, maxnumber]`; the client finds the number by brute force. The salt
-//! carries its own expiry (`<hex>?expires=<unix>`) and the server signs the
-//! challenge with HMAC-SHA256 under a key derived from the pepper, so the
-//! server stays stateless until a solution is redeemed (single use, recorded
-//! in `pow_spent` by the caller).
+//! A challenge is `hex(sha256(salt + number))` for a random `number` in
+//! `[0, maxnumber]`. The client finds the number by brute force.
+//!
+//! The salt carries its own expiry (`<hex>?expires=<unix>`). The server signs
+//! each challenge with HMAC-SHA256 under a key derived from the pepper. This
+//! keeps the server stateless until a solution is redeemed. A redeemed
+//! solution is single use, and the caller records it in `pow_spent`.
 use crate::error::{Error, Result};
 use axum::http::StatusCode;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -15,10 +16,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+/// Algorithm name used in challenges and solutions.
 pub const ALGORITHM: &str = "SHA-256";
 /// Domain-separation label for the signing key.
 const KEY_LABEL: &[u8] = b"reseller/signup-pow/v1";
-/// Largest accepted base64 solution payload.
+/// Largest accepted base64 solution payload, in bytes.
 const MAX_PAYLOAD_BYTES: usize = 2048;
 
 /// A challenge as served to clients.
@@ -31,7 +33,7 @@ pub struct Challenge {
     pub signature: String,
 }
 
-/// A client's answer (the base64-encoded JSON `altcha` field).
+/// A client's answer, as decoded from the base64 `altcha` payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Solution {
     pub algorithm: String,
@@ -51,6 +53,7 @@ pub struct Verified {
     pub expires: i64,
 }
 
+/// Derives the HMAC signing key from the pepper and the domain label.
 fn signing_key(pepper: &str) -> [u8; 32] {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(pepper.as_bytes()).expect("HMAC accepts any key length");
@@ -58,6 +61,7 @@ fn signing_key(pepper: &str) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+/// Returns the hex HMAC-SHA256 of `challenge` under the signing key.
 fn sign(pepper: &str, challenge: &str) -> String {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(&signing_key(pepper)).expect("HMAC accepts any key length");
@@ -65,6 +69,7 @@ fn sign(pepper: &str, challenge: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Returns the hex SHA-256 of the salt followed by the decimal number.
 fn digest(salt: &str, number: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(salt.as_bytes());
@@ -72,6 +77,7 @@ fn digest(salt: &str, number: u64) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Compares two strings in constant time.
 fn equal(a: &str, b: &str) -> bool {
     bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
@@ -85,7 +91,7 @@ pub fn create(pepper: &str, max_number: u32, ttl_seconds: u32, now: i64) -> Chal
         hex::encode(&random[..12]),
         now + i64::from(ttl_seconds)
     );
-    // Rejection-free enough: the modulo bias over 2^64 is negligible.
+    // The modulo bias is negligible, because the 64-bit value far exceeds the range.
     let number =
         u64::from_le_bytes(random[12..].try_into().expect("8 bytes")) % (u64::from(max_number) + 1);
     let challenge = digest(&salt, number);
@@ -98,7 +104,10 @@ pub fn create(pepper: &str, max_number: u32, ttl_seconds: u32, now: i64) -> Chal
     }
 }
 
-/// Brute-forces the challenge (used by clients such as the stdio MCP bridge).
+/// Finds the number that solves `challenge`, or returns `None` if none matches.
+///
+/// Clients such as the stdio MCP bridge use this. It tries every number up to
+/// `maxnumber`.
 pub fn solve(challenge: &Challenge) -> Option<u64> {
     (0..=challenge.maxnumber).find(|n| digest(&challenge.salt, *n) == challenge.challenge)
 }
@@ -115,7 +124,7 @@ pub fn encode(challenge: &Challenge, number: u64) -> String {
     STANDARD.encode(serde_json::to_vec(&solution).expect("solution is serializable"))
 }
 
-/// `expires` Unix time from the salt's query string.
+/// Parses the `expires` Unix time from the salt's query string.
 fn expires(salt: &str) -> Option<i64> {
     let (_, query) = salt.split_once('?')?;
     url::form_urlencoded::parse(query.as_bytes())
@@ -128,7 +137,17 @@ fn invalid(message: &str) -> Error {
 }
 
 /// Verifies an `altcha` payload against the signing key, the current
-/// difficulty `max_number`, and the clock. Does not check for replays.
+/// difficulty, and the clock.
+///
+/// The checks run in this order:
+///
+/// 1. The algorithm name.
+/// 2. The signature over the challenge.
+/// 3. The expiry in the salt.
+/// 4. The number, which must not exceed `max_number`.
+/// 5. The hash of the salt and number.
+///
+/// This does not check for replays. The caller records `Verified::challenge`.
 pub fn verify(pepper: &str, payload: &str, max_number: u32, now: i64) -> Result<Verified> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(invalid("Proof of work payload is too large"));

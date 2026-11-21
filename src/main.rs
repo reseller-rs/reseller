@@ -22,7 +22,7 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
                   payments, and dashboards. Run without a subcommand to start the server."
 )]
 struct Cli {
-    /// Starter configuration, read on first start only
+    /// Starter config file, read only when the database has no settings yet
     #[arg(
         long,
         env = "RESELLER_CONFIG",
@@ -38,8 +38,10 @@ struct Cli {
         global = true
     )]
     database: PathBuf,
+    /// Address to listen on (`healthcheck` probes the same address)
     #[arg(long, env = "HOST", default_value = "0.0.0.0", global = true)]
     host: IpAddr,
+    /// Port to listen on
     #[arg(long, env = "PORT", default_value_t = 56787, global = true)]
     port: u16,
     /// Directory with white-label files (index.html, theme.css, logos,
@@ -62,7 +64,8 @@ enum Command {
     Token,
     /// Replace the administrator token in the database (server must be stopped)
     ResetAdmin,
-    /// Back up SQLite safely, including committed WAL data
+    /// Back up the database to a new file, including committed WAL data
+    /// (the destination must not exist)
     Backup { destination: PathBuf },
     /// Probe the local readiness endpoint (used by the container health check)
     Healthcheck,
@@ -94,11 +97,12 @@ enum Command {
 enum ConfigAction {
     /// Print the stored settings as TOML (secrets blanked unless requested)
     Export {
+        /// Include secret values (tokens, pepper, API keys) in the output
         #[arg(long)]
         include_secrets: bool,
     },
-    /// Validate a TOML file and replace the stored settings with it; blank
-    /// secrets (tokens, pepper, API keys) keep their stored values
+    /// Validate a TOML file and replace the stored settings with it. Blank
+    /// secrets (tokens, pepper, API keys) keep their stored values.
     Import { file: PathBuf },
 }
 
@@ -255,7 +259,7 @@ fn init(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Minimal HTTP/1.1 probe so the scratch container needs no curl.
+/// Probes `/readyz` over plain HTTP/1.1, so the scratch container needs no curl.
 fn healthcheck(host: IpAddr, port: u16) -> anyhow::Result<()> {
     let host = if host.is_unspecified() {
         IpAddr::V4(Ipv4Addr::LOCALHOST)

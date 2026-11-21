@@ -6,7 +6,9 @@ use sqlx::{
 };
 use std::{path::Path, time::Duration};
 
+/// Seconds in one hour.
 pub const HOUR: i64 = 3600;
+/// Seconds in one day.
 pub const DAY: i64 = 86_400;
 
 /// Current Unix time in seconds.
@@ -19,7 +21,10 @@ pub fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Opens (creating if needed) the database in WAL mode and runs migrations.
+/// Opens the database (creating it if needed) in WAL mode and runs migrations.
+///
+/// Enables foreign keys, waits up to 10 seconds on a busy lock, and uses at
+/// most 8 connections.
 pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         tokio::fs::create_dir_all(parent).await?;
@@ -56,7 +61,7 @@ pub async fn stored_settings(pool: &SqlitePool) -> anyhow::Result<Option<Config>
 
 /// Returns the stored settings, or seeds them from `seed` on first start.
 ///
-/// Missing secrets are generated during seeding; a generated administrator
+/// Missing secrets are generated during seeding. A generated administrator
 /// token is printed once because it cannot be recovered later.
 pub async fn settings(pool: &SqlitePool, mut seed: Config) -> anyhow::Result<Config> {
     if let Some(stored) = stored_settings(pool).await? {
@@ -100,7 +105,7 @@ pub async fn balance(conn: &mut SqliteConnection, account: &str) -> Result<i64> 
 }
 
 /// Closes request rows a previous process left in flight (crash or kill).
-/// Their usage is unknown, so nothing is billed; the rows are recorded as
+/// Their usage is unknown, so nothing is billed. The rows are recorded as
 /// failed with status 500. Returns how many were closed. Call before
 /// accepting connections, while no request of this process can be running.
 pub async fn close_interrupted_requests(pool: &SqlitePool) -> Result<u64> {

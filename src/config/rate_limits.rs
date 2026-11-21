@@ -1,13 +1,16 @@
-//! Abuse limits for public and credentialed endpoints. 0 disables each.
+//! Abuse limits for public and credentialed endpoints.
+//!
+//! Setting a limit to 0 disables it.
 use serde::{Deserialize, Serialize};
 
+/// Per-client and per-account request budgets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimits {
     /// Management API requests per client IP per minute.
     pub management_per_minute: u32,
-    /// Invalid-credential attempts per client IP per hour; once exhausted
-    /// every credentialed request from that IP is refused.
+    /// Invalid-credential attempts per client IP per hour. Once the budget is
+    /// spent, every credentialed request from that IP is refused.
     pub auth_failures_per_hour: u32,
     /// In-flight proxy requests per account.
     pub max_concurrent_requests: u32,

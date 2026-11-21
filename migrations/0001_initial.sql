@@ -1,4 +1,10 @@
+-- Initial schema for reseller (single migration).
+-- Money columns are whole micro-USD (1 USD = 1000000) stored as INTEGER.
+
+-- Single row holding the JSON-encoded settings (id is always 1).
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL CHECK(json_valid(value))) STRICT;
+-- Customer accounts. status is active or suspended.
+-- markup_pct overrides the global markup when set. debt_micro never goes below 0.
 CREATE TABLE accounts (
  id TEXT PRIMARY KEY, contact TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
@@ -7,6 +13,8 @@ CREATE TABLE accounts (
  created_at INTEGER NOT NULL, created_ip TEXT NOT NULL
 ) STRICT;
 CREATE INDEX accounts_status_created ON accounts(status,created_at DESC);
+-- API keys. Only HMAC hashes of the secret and dashboard token are stored.
+-- parent_key_id links child keys. limits holds the per-key limits as JSON.
 CREATE TABLE api_keys (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), parent_key_id TEXT REFERENCES api_keys(id),
  key_hash TEXT NOT NULL UNIQUE, dash_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
@@ -18,23 +26,30 @@ CREATE TABLE api_keys (
 CREATE INDEX keys_account ON api_keys(account_id);
 CREATE INDEX keys_ip_time ON api_keys(created_ip,created_at);
 CREATE INDEX keys_status_created ON api_keys(status,created_at DESC);
+-- Credit grants per account. remaining_micro counts down as credit is spent.
+-- A NULL expires_at means the credit never expires.
 CREATE TABLE credits (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), source TEXT NOT NULL,
  amount_micro INTEGER NOT NULL CHECK(amount_micro>0), remaining_micro INTEGER NOT NULL CHECK(remaining_micro>=0 AND remaining_micro<=amount_micro),
  expires_at INTEGER, created_at INTEGER NOT NULL, note TEXT NOT NULL DEFAULT ''
 ) STRICT;
 CREATE INDEX credits_account ON credits(account_id,expires_at);
+-- Subscription plans. Money is in micro-USD. duration_days is 1 to 3650.
 CREATE TABLE plans (
  code TEXT PRIMARY KEY, name TEXT NOT NULL, price_micro INTEGER NOT NULL CHECK(price_micro>0),
  credit_micro INTEGER NOT NULL CHECK(credit_micro>0), duration_days INTEGER NOT NULL CHECK(duration_days BETWEEN 1 AND 3650),
  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), description TEXT NOT NULL DEFAULT ''
 ) STRICT;
+-- Built-in plans: price and credit in micro-USD (20000000 = 20 USD).
 INSERT INTO plans VALUES ('monthly','Monthly',20000000,20000000,30,1,'Thirty days of API credit'),('extended','Extended',100000000,100000000,180,1,'Six months of API credit'),('year','Yearly',160000000,160000000,360,1,'360 days of API credit');
+-- Plan subscriptions. expires_at is when the plan period ends.
 CREATE TABLE subscriptions (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), plan_code TEXT NOT NULL REFERENCES plans(code),
  started_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX subscriptions_account ON subscriptions(account_id,expires_at);
+-- Redeem codes. Each code grants either a plan or a credit amount, not both.
+-- code_hash is an HMAC of the code, so the plain code is never stored.
 CREATE TABLE redeem_codes (
  id TEXT PRIMARY KEY, code_hash TEXT NOT NULL UNIQUE, code_prefix TEXT NOT NULL,
  plan_code TEXT REFERENCES plans(code), credit_micro INTEGER,
@@ -42,6 +57,8 @@ CREATE TABLE redeem_codes (
  created_at INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '',
  CHECK((plan_code IS NOT NULL AND credit_micro IS NULL) OR (plan_code IS NULL AND credit_micro>0))
 ) STRICT;
+-- Request log, one row per proxied request.
+-- estimated is 1 when token usage was estimated instead of reported.
 CREATE TABLE requests (
  id TEXT PRIMARY KEY, account_id TEXT REFERENCES accounts(id), key_id TEXT REFERENCES api_keys(id),
  created_at INTEGER NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL,
@@ -57,6 +74,7 @@ CREATE TABLE requests (
 CREATE INDEX requests_key_time ON requests(key_id,created_at);
 CREATE INDEX requests_account_time ON requests(account_id,created_at);
 CREATE INDEX requests_time ON requests(created_at);
+-- Hourly usage totals per key and model, used for limits and statistics.
 CREATE TABLE usage_buckets (
  hour INTEGER NOT NULL, key_id TEXT NOT NULL REFERENCES api_keys(id), account_id TEXT NOT NULL REFERENCES accounts(id), model TEXT NOT NULL,
  requests INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, upstream_micro INTEGER NOT NULL DEFAULT 0, billed_micro INTEGER NOT NULL DEFAULT 0,
@@ -64,8 +82,11 @@ CREATE TABLE usage_buckets (
 ) STRICT;
 CREATE INDEX usage_account_time ON usage_buckets(account_id,hour);
 CREATE INDEX usage_key_time ON usage_buckets(key_id,hour);
+-- Running totals across all requests (id is always 1).
 CREATE TABLE totals (id INTEGER PRIMARY KEY CHECK(id=1), requests INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, upstream_micro INTEGER NOT NULL DEFAULT 0, billed_micro INTEGER NOT NULL DEFAULT 0) STRICT;
 INSERT INTO totals(id) VALUES (1);
+-- Top-up orders paid through Stripe or Payroof. status is pending or paid.
+-- external_id is the provider's own identifier for the payment.
 CREATE TABLE payments (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), plan_code TEXT NOT NULL REFERENCES plans(code),
  provider TEXT NOT NULL CHECK(provider IN ('stripe','payroof')),
@@ -75,15 +96,18 @@ CREATE TABLE payments (
  received_micro INTEGER NOT NULL DEFAULT 0 CHECK(received_micro>=0),
  created_at INTEGER NOT NULL, expires_at INTEGER, paid_at INTEGER, paid_by TEXT
 ) STRICT;
+-- A provider payment id can be recorded only once per provider.
 CREATE UNIQUE INDEX payments_external ON payments(provider,external_id) WHERE external_id IS NOT NULL;
 CREATE INDEX payments_created ON payments(created_at DESC);
 CREATE INDEX payments_account_created ON payments(account_id,created_at DESC);
+-- Crypto quotes per payment and asset: address, amount, and USD rate.
 CREATE TABLE payment_quotes (
  payment_id TEXT NOT NULL REFERENCES payments(id), chain TEXT NOT NULL, chain_name TEXT NOT NULL,
  asset TEXT NOT NULL, symbol TEXT NOT NULL, decimals INTEGER NOT NULL CHECK(decimals BETWEEN 0 AND 36),
  address TEXT NOT NULL, amount TEXT NOT NULL, rate_usd TEXT NOT NULL,
  PRIMARY KEY(payment_id,asset)
 ) STRICT;
+-- On-chain transfers matched to a payment. status goes from seen to confirmed.
 CREATE TABLE payment_transfers (
  id TEXT PRIMARY KEY, payment_id TEXT NOT NULL REFERENCES payments(id),
  chain TEXT NOT NULL, asset TEXT NOT NULL, address TEXT NOT NULL, tx_hash TEXT NOT NULL, amount TEXT NOT NULL,
@@ -92,6 +116,8 @@ CREATE TABLE payment_transfers (
  seen_at INTEGER NOT NULL, confirmed_at INTEGER
 ) STRICT;
 CREATE INDEX payment_transfers_payment ON payment_transfers(payment_id,seen_at);
+-- Processed payment webhook event ids. Repeated deliveries are ignored.
 CREATE TABLE payment_events (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;
+-- Solved proof-of-work challenges, so each one counts only once until it expires.
 CREATE TABLE pow_spent (challenge TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
 CREATE INDEX pow_spent_expires ON pow_spent(expires_at);

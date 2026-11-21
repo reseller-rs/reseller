@@ -2,9 +2,11 @@
 //! settings, the generated theme stylesheet, and static theme files.
 //!
 //! A theme directory (`--theme-dir` / `RESELLER_THEME_DIR`) may contain:
-//! - `index.html`: replaces the built-in page template (same placeholders);
-//! - `theme.css`: appended to `/assets/theme.css` after the branding CSS;
-//! - any image or font, served at `/theme/<path>` (for `logo_url`, …).
+//!
+//! - `index.html`: replaces the built-in page template, with the same placeholders.
+//! - `theme.css`: appended to `/assets/theme.css` after the branding CSS.
+//! - Any image, font, or text file, served at `/theme/<path>`. Use these for
+//!   files such as a `logo_url`.
 use crate::{App, config::Branding};
 use axum::{
     body::Body,
@@ -16,8 +18,9 @@ use std::path::{Component, Path};
 
 const BUILTIN_TEMPLATE: &str = include_str!("../assets/index.html");
 const BUILTIN_LOGO: &str = "/assets/favicon.svg";
-/// Largest theme file served.
+/// Largest theme file served, in bytes.
 const MAX_THEME_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// Largest custom `index.html` template read, in bytes.
 const MAX_TEMPLATE_BYTES: u64 = 512 * 1024;
 
 /// Escapes text for HTML element content and quoted attributes.
@@ -108,7 +111,7 @@ pub fn render(template: &str, b: &Branding) -> String {
     } else {
         format!("{} — {}", b.name, b.tagline)
     };
-    // JSON inside <script type="application/json">: neutralise markup.
+    // Escape markup in the JSON so it cannot close the script element.
     let data = public_json(b)
         .to_string()
         .replace('<', "\\u003c")
@@ -154,7 +157,10 @@ async fn theme_file(app: &App, relative: &Path, limit: u64) -> Option<Vec<u8>> {
     tokio::fs::read(&path).await.ok()
 }
 
-/// The HTML shell for `/`, `/workspace/`, and `/admin/`.
+/// Returns the HTML shell for `/`, `/workspace/`, and `/admin/`.
+///
+/// Uses the theme's `index.html` when one exists, and the built-in template
+/// otherwise.
 pub async fn page(app: &App) -> Html<String> {
     let config = app.config().await;
     let custom = theme_file(app, Path::new("index.html"), MAX_TEMPLATE_BYTES)
@@ -177,8 +183,11 @@ pub async fn stylesheet(app: &App) -> Response {
     ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], css).into_response()
 }
 
-/// Serves `/theme/<path>` from the theme directory: plain relative paths with
-/// an allowed extension only; dot-files and traversal are rejected.
+/// Serves `/theme/<path>` from the theme directory.
+///
+/// Only plain relative paths with an allowed extension are served. Each path
+/// segment may use ASCII letters, digits, `.`, `_`, and `-`. Dot-files and
+/// traversal are rejected.
 pub async fn file(app: &App, path: &str) -> Response {
     let not_found = || StatusCode::NOT_FOUND.into_response();
     let relative = Path::new(path);

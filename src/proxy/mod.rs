@@ -1,8 +1,8 @@
 //! Streaming upstream proxy for `/v1/*`.
 //!
-//! JSON bodies are buffered (bounded) so the model/voice policy and fallbacks
-//! can be applied; every other body, including multipart uploads, streams to
-//! the upstream. Responses always stream back unchanged while an
+//! JSON bodies are buffered (bounded) so the model and voice policy and the
+//! fallbacks can be applied. Every other body, including multipart uploads,
+//! streams to the upstream. Responses always stream back unchanged while an
 //! [`Inspector`] extracts usage for the [`Meter`].
 mod inspect;
 mod multipart;
@@ -159,10 +159,10 @@ const STRIPPED_REQUEST: [&str; 12] = [
 ];
 /// Upstream headers never returned to clients.
 ///
-/// `content-length` is dropped because a declared length makes hyper stop
-/// polling the relay stream once that many bytes are written, which would
-/// drop the meter before end-of-stream usage is recorded; chunked framing
-/// is used instead.
+/// `content-length` is dropped. A declared length makes hyper stop polling
+/// the relay stream once that many bytes are written, which would drop the
+/// meter before end-of-stream usage is recorded. Chunked framing is used
+/// instead.
 const STRIPPED_RESPONSE: [&str; 4] = [
     "set-cookie",
     "access-control-allow-origin",
@@ -198,10 +198,10 @@ pub(crate) fn forward_headers(input: &HeaderMap, request: bool) -> HeaderMap {
 
 /// Request body after policy rewriting.
 enum Payload {
-    /// Buffered JSON object and its serialized form; re-serialized when a
-    /// fallback model is substituted.
+    /// Buffered JSON object and its serialized form. The form is re-serialized
+    /// when a fallback model is substituted.
     Json(Value, Bytes),
-    /// Streamed body; can be sent only once.
+    /// Streamed body. It can be sent only once.
     Stream(Option<reqwest::Body>),
 }
 
@@ -621,7 +621,7 @@ struct Prepared {
     /// Effective model (empty when unknown).
     model: String,
     payload: Payload,
-    /// The model is only learned while the upload streams; the allowlist is
+    /// The model is only learned while the upload streams. The allowlist is
     /// enforced there instead of at admission.
     model_pending: bool,
 }
@@ -692,7 +692,7 @@ async fn prepare(
         return Err(Error::too_large("Upload exceeds limit"));
     }
     // Multipart bodies are always parsed so the client's model is seen,
-    // whatever the policy; only the rewrite itself depends on it.
+    // whatever the policy. Only the rewrite itself depends on it.
     let configured = upstream.model.as_str();
     let mut parser = multipart::boundary(content_type).map(|boundary| {
         Multipart::new(

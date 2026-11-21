@@ -21,7 +21,7 @@ pub fn is_auth_failure(error: &Error) -> bool {
     AUTH_FAILURE_CODES.contains(&error.code)
 }
 
-/// Management API requests per client IP.
+/// Charges one management API request to `ip`, or fails with a retry hint.
 pub async fn management(app: &App, ip: &str) -> Result<()> {
     let limit = app.config().await.rate_limits.management_per_minute;
     app.limiter
@@ -32,7 +32,7 @@ pub async fn management(app: &App, ip: &str) -> Result<()> {
         })
 }
 
-/// Signup challenges per client IP.
+/// Charges one signup challenge request to `ip`, or fails with a retry hint.
 pub async fn challenge(app: &App, ip: &str) -> Result<()> {
     let limit = app.config().await.rate_limits.challenges_per_minute;
     app.limiter
@@ -46,8 +46,9 @@ pub async fn challenge(app: &App, ip: &str) -> Result<()> {
         })
 }
 
-/// Refuses credentialed requests from an IP that exhausted its failure
-/// budget; checked before any database lookup.
+/// Refuses credentialed requests from an IP that spent its failure budget.
+///
+/// This runs before any database lookup.
 pub async fn check_auth_failures(app: &App, ip: &str) -> Result<()> {
     let limit = app.config().await.rate_limits.auth_failures_per_hour;
     match app.limiter.blocked(&format!("authfail:{ip}"), limit, HOUR) {
@@ -82,8 +83,8 @@ pub async fn check_redeem(app: &App, account: &str) -> Result<()> {
     }
 }
 
-/// Charges one invalid redeem code to the account (and, because codes are
-/// account-independent, to the client IP's credential budget).
+/// Charges one invalid redeem code to the account and to the client IP's
+/// credential budget.
 pub async fn record_redeem_failure(app: &App, account: &str, ip: &str) {
     let limit = app.config().await.rate_limits.redeem_failures_per_hour;
     app.limiter

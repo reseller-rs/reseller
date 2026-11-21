@@ -20,9 +20,11 @@ pub struct Error {
     pub retry_after: Option<u64>,
 }
 
+/// Result alias whose error type defaults to [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
+    /// Creates an error with an explicit status, code, and message.
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -39,7 +41,7 @@ impl Error {
         self
     }
 
-    /// Sets the `Retry-After` hint, in seconds (at least one).
+    /// Sets the `Retry-After` hint in seconds, with a minimum of one.
     #[must_use]
     pub fn retry_after(mut self, seconds: u64) -> Self {
         self.retry_after = Some(seconds.max(1));
@@ -96,7 +98,7 @@ impl From<sqlx::Error> for Error {
     }
 }
 
-/// JSON errors originate from client input (request bodies, limits objects).
+/// Maps a JSON parse or shape error from client input to a 400 `invalid_request`.
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::bad(e.to_string())
@@ -118,7 +120,7 @@ impl IntoResponse for Error {
         }
         if self.status == StatusCode::UNAUTHORIZED {
             // RFC 6750 section 3: a request without credentials carries no
-            // error attribute; rejected credentials are `invalid_token`.
+            // error attribute. Rejected credentials are `invalid_token`.
             let challenge = if self.code == "missing_api_key" {
                 "Bearer realm=\"reseller\""
             } else {

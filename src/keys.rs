@@ -30,7 +30,7 @@ pub struct Limits {
     pub spend: Option<Spend>,
     /// Active child keys a proxy key may create.
     pub max_children: Option<u32>,
-    /// Case-insensitive model allowlist; empty allows every model.
+    /// Case-insensitive model allowlist. An empty list allows every model.
     pub allowed_models: Vec<String>,
 }
 
@@ -51,6 +51,9 @@ pub struct Spend {
 }
 
 impl Limits {
+    /// Rejects invalid windows, non-positive maxima, and oversized allowlists.
+    ///
+    /// The allowlist may hold at most 100 entries of 256 bytes each.
     pub fn validate(&self) -> Result<()> {
         let valid_window = |hours: u32| (1..=MAX_WINDOW_HOURS).contains(&hours);
         for w in [&self.requests, &self.tokens].into_iter().flatten() {
@@ -116,7 +119,8 @@ async fn mint(conn: &mut SqliteConnection, config: &Config, key: NewKey<'_>) -> 
     let secret_key = secret("sk-res-");
     let dashboard = secret("dash_");
     let kid = id();
-    // "sk-res-" plus 8 hex characters: enough to recognise, useless to attack.
+    // The stored prefix is "sk-res-" plus 8 hex characters: enough to recognise
+    // a key, not enough to use one.
     let prefix = &secret_key[..15];
     sqlx::query(
         "INSERT INTO api_keys(id,account_id,parent_key_id,key_hash,dash_hash,key_prefix,name,\
@@ -156,14 +160,16 @@ pub enum Requester<'a> {
     /// `altcha` is the base64 proof-of-work solution (required unless
     /// `signup.pow_max_number` is 0).
     Signup { altcha: Option<&'a str> },
-    /// A signed-in customer creating a child key; subject to creation guards.
+    /// A signed-in customer creating a child key. Creation guards apply.
     Customer(&'a Identity),
-    /// Administrator issuing a key on an existing account; bypasses guards
+    /// Administrator issuing a key on an existing account. This bypasses guards
     /// and may set custom limits.
     Admin { account: &'a str },
 }
 
-/// Creates a key, and a new account with trial credit for anonymous signups.
+/// Creates a key for the requester.
+///
+/// Anonymous signups also open a new account with trial credit.
 pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value) -> Result<Value> {
     let config = app.config().await;
     let proof = match requester {
@@ -263,9 +269,11 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     Ok(out)
 }
 
-/// Marks a proof-of-work solution as used (replays fail) and purges spent
-/// records whose challenges have expired anyway. Runs in the same transaction
-/// as the account it pays for, so a failed signup does not burn the solution.
+/// Marks a proof-of-work solution as used, so replays fail.
+///
+/// Also purges spent records whose challenges have expired. Runs in the same
+/// transaction as the account it pays for, so a failed signup does not burn
+/// the solution.
 async fn spend_proof(conn: &mut SqliteConnection, proof: &pow::Verified) -> Result<()> {
     sqlx::query("DELETE FROM pow_spent WHERE expires_at<=?")
         .bind(now())
@@ -287,12 +295,15 @@ async fn spend_proof(conn: &mut SqliteConnection, proof: &pow::Verified) -> Resu
     Ok(())
 }
 
-/// Seconds until the oldest of the `created` rows leaves a `window`.
+/// Returns the seconds until the oldest row leaves the window, or 60 when no
+/// row exists.
 fn window_retry(oldest: Option<i64>, window: i64) -> u64 {
     oldest.map_or(60, |t| (t + window - now()).max(1).unsigned_abs())
 }
 
-/// Global cap on self-service key creations (signup, child keys, rotations).
+/// Global cap on key creations in the last hour, across all accounts.
+///
+/// A limit of 0 disables the cap.
 async fn check_global_hourly(conn: &mut SqliteConnection, config: &Config) -> Result<()> {
     let limit = config.signup.global_hourly_limit;
     if limit == 0 {
@@ -312,7 +323,9 @@ async fn check_global_hourly(conn: &mut SqliteConnection, config: &Config) -> Re
     Ok(())
 }
 
-/// Per-account budget of keys created or rotated by the customer in 24 hours.
+/// Per-account cap on key creations in the last 24 hours.
+///
+/// A limit of 0 disables the cap.
 async fn check_daily_budget(
     conn: &mut SqliteConnection,
     config: &Config,
@@ -409,7 +422,7 @@ async fn check_creation_guards(
     Ok(())
 }
 
-/// Opens a new account and grants the configured trial credit.
+/// Opens a new account and grants the configured trial credit, if any.
 async fn open_trial_account(
     conn: &mut SqliteConnection,
     config: &Config,
@@ -436,10 +449,12 @@ async fn open_trial_account(
     Ok(account)
 }
 
-/// Replaces an active key with a fresh one carrying the same name, limits,
-/// markup, and expiry; the old key is blocked. `account` scopes ownership for
-/// customer requests (`None` for administrators, who are exempt from the
-/// rotation cooldown and creation budgets).
+/// Replaces an active key with a fresh one.
+///
+/// The new key keeps the name, limits, markup, and expiry of the old key, and
+/// the old key is blocked. `account` scopes ownership for customer requests.
+/// Pass `None` for administrators, who skip the rotation cooldown and the
+/// creation budgets.
 pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value> {
     let config = app.config().await;
     let mut tx = db::write(&app.db).await?;
@@ -473,7 +488,7 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
         check_global_hourly(&mut tx, &config).await?;
         check_daily_budget(&mut tx, &config, &aid).await?;
     }
-    // Rotation replaces a key; it must not become a way around the key cap.
+    // Rotation replaces a key. It must not become a way around the key cap.
     let others: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM api_keys WHERE account_id=? AND status='active' AND id<>?",
     )

@@ -1,18 +1,19 @@
 //! Self-hosted OpenAI-compatible API reseller.
 //!
-//! Module map:
-//! - [`web`]: HTTP router, static assets, and top-level dispatch.
+//! # Module map
+//!
+//! - [`web`]: HTTP router, static assets, and request dispatch.
 //! - [`proxy`]: streaming upstream transport (JSON, SSE, multipart, WebSocket).
 //! - [`meter`]: request admission, usage accounting, and settlement.
 //! - [`api`]: customer (`/v1/keys`, `/v1/account`) and administrator APIs.
-//! - [`identity`] / [`keys`]: authentication and API-key lifecycle.
+//! - [`identity`] / [`keys`]: authentication and API key lifecycle.
 //! - [`mcp`]: Model Context Protocol server (`/mcp`) and stdio bridge.
 //! - [`security`]: rate limiting and proof-of-work signup challenges.
-//! - [`billing`] / [`money`]: credit ledger, plans, redeem codes, micro-USD.
+//! - [`billing`] / [`money`]: credit ledger, plans, redeem codes, and micro-USD.
 //! - [`payments`]: plan checkout orders via Stripe (cards) and Payroof (crypto).
 //! - [`theme`]: white-label branding, the page template, and theme files.
 //! - [`stats`]: dashboards, usage series, and log retention.
-//! - [`config`] / [`db`] / [`error`]: settings, persistence, error type.
+//! - [`config`] / [`db`] / [`error`]: settings, persistence, and the error type.
 pub mod api;
 pub mod billing;
 pub mod config;
@@ -33,7 +34,7 @@ pub mod web;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockWriteGuard};
 
-/// Shared application state; cheap to clone.
+/// Shared application state. Cloning is cheap.
 #[derive(Clone)]
 pub struct App {
     pub db: sqlx::SqlitePool,
@@ -50,6 +51,7 @@ pub struct App {
 }
 
 impl App {
+    /// Creates the shared state with an HTTP client that never follows redirects.
     pub fn new(db: sqlx::SqlitePool, config: config::Config) -> anyhow::Result<Self> {
         Ok(Self {
             db,
@@ -65,8 +67,8 @@ impl App {
         })
     }
 
-    /// Serves white-label files (logo, favicon, fonts, `theme.css`,
-    /// `index.html`) from `dir`.
+    /// Sets the directory of white-label files (logo, favicon, fonts,
+    /// `theme.css`, and `index.html`).
     #[must_use]
     pub fn with_theme_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.theme_dir = dir.map(Arc::new);
@@ -78,8 +80,10 @@ impl App {
         self.config.read().await.clone()
     }
 
-    /// Exclusive, in-memory access to the settings. Requests already holding
-    /// a snapshot keep their copy; persist changes with [`db::save_settings`].
+    /// Returns exclusive, in-memory write access to the settings.
+    ///
+    /// Requests that already hold a snapshot keep their copy. Persist changes
+    /// with [`db::save_settings`].
     pub async fn config_mut(&self) -> RwLockMappedWriteGuard<'_, config::Config> {
         RwLockWriteGuard::map(self.config.write().await, Arc::make_mut)
     }

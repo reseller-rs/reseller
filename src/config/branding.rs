@@ -2,8 +2,8 @@
 //! CSS for the embedded web app.
 //!
 //! Branding is stored with the other settings (and editable in the console).
-//! Static files such as logos and fonts can additionally be served from a
-//! theme directory (see [`crate::web`]).
+//! Static files such as logos and fonts can also be served from a theme
+//! directory (see [`crate::theme`]).
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,7 +27,8 @@ pub struct Link {
 pub struct Branding {
     /// Product name shown in the header, titles, and footer.
     pub name: String,
-    /// Short line appended to page titles (`<name> — <tagline>`).
+    /// Short line shown after the name in page titles, separated by an em dash.
+    /// An empty tagline leaves the title as the name alone.
     pub tagline: String,
     /// `<meta name="description">` content.
     pub description: String,
@@ -79,8 +80,11 @@ impl Default for Branding {
     }
 }
 
-/// A safe CSS value: no characters that could close a declaration, block,
-/// or escape into markup.
+/// Whether `v` is a safe CSS value.
+///
+/// The value must be non-empty, at most 200 bytes, and free of control
+/// characters. It also must not contain characters that could close a
+/// declaration or block, or that could escape into markup.
 pub fn css_value(v: &str) -> bool {
     !v.trim().is_empty()
         && v.len() <= 200
@@ -89,7 +93,13 @@ pub fn css_value(v: &str) -> bool {
             .any(|c| matches!(c, ';' | '{' | '}' | '<' | '>' | '\\' | '"' | '\'') || c.is_control())
 }
 
-/// A same-site path (`/…`, not protocol-relative) or an absolute http(s) URL.
+/// Whether `v` is a link target this app accepts.
+///
+/// Accepted values are either:
+///
+/// - A same-site path that starts with `/` but not `//`, with no quotes,
+///   angle brackets, backslashes, or spaces.
+/// - An absolute http(s) URL with a host and no credentials.
 pub fn link_target(v: &str) -> bool {
     if v.starts_with('/') {
         return !v.starts_with("//") && !v.contains(['\\', '"', '<', '>', ' ']);
@@ -100,6 +110,7 @@ pub fn link_target(v: &str) -> bool {
 }
 
 impl Branding {
+    /// Checks every branding field against its length, URL, and CSS rules.
     pub fn validate(&self) -> anyhow::Result<()> {
         let name = self.name.trim();
         anyhow::ensure!(
@@ -180,7 +191,11 @@ impl Branding {
         Ok(())
     }
 
-    /// Generated stylesheet: colour variables followed by custom CSS.
+    /// Builds the branding stylesheet.
+    ///
+    /// The output starts with a `:root` block that sets the colour scheme and
+    /// the CSS variables. That block is omitted unless there are variables or
+    /// the scheme is `light`. The custom CSS follows.
     pub fn stylesheet(&self) -> String {
         let mut css = String::from("/* Generated from branding settings. */\n");
         if !self.css_vars.is_empty() || self.color_scheme == "light" {

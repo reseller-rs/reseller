@@ -4,27 +4,40 @@
 //! It runs on the agent's machine so credentials and the signup proof of
 //! work stay local. Transport is newline-delimited JSON-RPC on stdin/stdout
 //! (diagnostics go to stderr only). `tools/list` and `tools/call` are
-//! forwarded to the remote `/mcp` endpoint with the stored credential; a few
-//! local tools (`signup`, `login`, `logout`, `whoami`, `reveal_credentials`)
-//! manage that credential. Audio and image results are also saved to disk.
-use super::{Output, SUPPORTED_VERSIONS, ToolError, negotiate, requires_api_key, tools::Args};
+//! forwarded to the remote `/mcp` endpoint (modern 2026-07-28 protocol) with
+//! the stored credential. A few local tools (`signup`, `login`, `logout`,
+//! `whoami`, `reveal_credentials`) manage that credential. Audio and image
+//! results are also saved to disk.
+//!
+//! Toward the local client the bridge is dual-era: it answers
+//! `server/discover` and requests carrying per-request `_meta`
+//! (2026-07-28), and still accepts a 2025-11-25 `initialize`.
+use super::{
+    CACHE_TTL_MS, Era, LEGACY_VERSION, META_CLIENT_CAPABILITIES, META_CLIENT_INFO,
+    META_SERVER_INFO, META_VERSION, MODERN_VERSION, Output, RpcError, SUPPORTED_VERSIONS,
+    ToolError, cacheable, complete, encode_header_value, meta_version, requires_api_key,
+    tools::Args, validate_meta,
+};
 use crate::security::pow::{self, Challenge};
 use anyhow::{Context, bail};
 use axum::http::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{Mutex, mpsc},
-    task::JoinSet,
+    task::{AbortHandle, JoinSet},
 };
 
 /// Remote tools replaced by the local `signup` tool.
@@ -197,7 +210,7 @@ pub fn server_origin(raw: &str) -> anyhow::Result<String> {
 pub struct Options {
     /// Server origin, e.g. `https://reseller.example.com`.
     pub url: String,
-    /// Credential file; `None` selects the default location.
+    /// Credential file. `None` selects the default location.
     pub credentials: Option<PathBuf>,
     pub output_dir: PathBuf,
     /// A credential used without being stored.
@@ -212,6 +225,9 @@ pub struct Bridge {
     token: Option<String>,
     /// Serialises credential-file updates within this process.
     writes: Mutex<()>,
+    /// Set once the local client has opened the legacy (2025-11-25) era with
+    /// `initialize`. The era is scoped to the process.
+    legacy: AtomicBool,
 }
 
 fn is_secret(token: &str, prefix: &str) -> bool {
@@ -259,6 +275,7 @@ impl Bridge {
             output_dir,
             token: options.token,
             writes: Mutex::new(()),
+            legacy: AtomicBool::new(false),
         })
     }
 
@@ -266,7 +283,7 @@ impl Bridge {
         &self.origin
     }
 
-    /// One HTTP exchange with the server; returns the parsed JSON body.
+    /// One HTTP exchange with the server. Returns the parsed JSON body.
     async fn send(
         &self,
         method: Method,
@@ -274,10 +291,24 @@ impl Bridge {
         bearer: Option<&str>,
         body: Option<&Value>,
     ) -> Result<Value, ToolError> {
+        self.send_with(method, path, bearer, body, &[]).await
+    }
+
+    async fn send_with(
+        &self,
+        method: Method,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<&Value>,
+        headers: &[(&str, String)],
+    ) -> Result<Value, ToolError> {
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.origin))
             .header("accept", "application/json, text/event-stream");
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
@@ -339,16 +370,32 @@ impl Bridge {
         })
     }
 
-    /// A JSON-RPC call to the remote `/mcp` endpoint; returns its `result`.
+    /// A modern (2026-07-28) JSON-RPC call to the remote `/mcp` endpoint:
+    /// per-request `_meta` plus the `MCP-Protocol-Version`, `Mcp-Method` and
+    /// `Mcp-Name` headers. Returns the `result`.
     async fn rpc(
         &self,
         bearer: Option<&str>,
         method: &str,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, ToolError> {
+        let mut headers = vec![
+            ("mcp-protocol-version", MODERN_VERSION.to_owned()),
+            ("mcp-method", method.to_owned()),
+        ];
+        if method == "tools/call"
+            && let Some(name) = params["name"].as_str()
+        {
+            headers.push(("mcp-name", encode_header_value(name)));
+        }
+        params["_meta"] = json!({
+            META_VERSION: MODERN_VERSION,
+            META_CLIENT_INFO: {"name": "reseller-mcp-bridge", "version": env!("CARGO_PKG_VERSION")},
+            META_CLIENT_CAPABILITIES: {},
+        });
         let message = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut response = self
-            .send(Method::POST, "/mcp", bearer, Some(&message))
+            .send_with(Method::POST, "/mcp", bearer, Some(&message), &headers)
             .await?;
         if let Some(error) = response.get("error") {
             return Err(ToolError::new(
@@ -356,7 +403,14 @@ impl Bridge {
                 error["message"].as_str().unwrap_or("MCP error"),
             ));
         }
-        Ok(response["result"].take())
+        let result = response["result"].take();
+        match result["resultType"].as_str() {
+            None | Some("complete") => Ok(result),
+            Some(other) => Err(ToolError::new(
+                "unsupported_result",
+                format!("The server returned an unsupported result type: {other}"),
+            )),
+        }
     }
 
     /// Credentials in effect: `--token`, else the stored entry.
@@ -383,55 +437,148 @@ impl Bridge {
         first.clone().or_else(|| second.clone())
     }
 
-    /// Handles one JSON-RPC message; `None` for notifications and responses.
+    /// Handles one JSON-RPC message. Returns `None` for notifications and responses.
+    ///
+    /// Era selection follows the stdio rules: a request with modern `_meta`
+    /// is served statelessly; `initialize` opens the legacy 2025-11-25 era
+    /// for the rest of the process. Anything else without `_meta` is
+    /// malformed.
     pub async fn handle(&self, message: Value) -> Option<Value> {
-        let reply = |id: Value, outcome: Result<Value, (i64, String)>| {
-            Some(match outcome {
-                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                Err((code, message)) => {
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-                }
-            })
-        };
         if !message.is_object() || message["jsonrpc"] != "2.0" {
-            return reply(
-                Value::Null,
-                Err((
+            return Some(
+                RpcError::new(
                     -32600,
-                    "Expected a JSON-RPC 2.0 message (batches are not supported)".into(),
-                )),
+                    "Expected a JSON-RPC 2.0 message (batches are not supported)",
+                )
+                .to_json(Value::Null),
             );
         }
         let id = message.get("id")?.clone();
         let Some(method) = message["method"].as_str() else {
-            return reply(id, Err((-32600, "Missing method".into())));
+            return Some(RpcError::new(-32600, "Missing method").to_json(id));
         };
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-        match method {
-            "initialize" => {
-                let Some(requested) = params["protocolVersion"].as_str() else {
-                    return reply(id, Err((-32602, "protocolVersion is required".into())));
-                };
-                reply(id, Ok(self.initialize(requested).await))
+        let params = match message.get("params") {
+            None | Some(Value::Null) => json!({}),
+            Some(p) if p.is_object() => p.clone(),
+            Some(_) => {
+                return Some(RpcError::new(-32602, "params must be an object").to_json(id));
             }
-            "ping" => reply(id, Ok(json!({}))),
-            "tools/list" => reply(id, Ok(json!({"tools": self.list_tools().await}))),
-            "tools/call" => {
-                let Some(name) = params["name"].as_str() else {
-                    return reply(id, Err((-32602, "name is required".into())));
-                };
-                let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-                match self.call_tool(name, &arguments).await {
-                    Ok(Some(result)) => reply(id, Ok(result)),
-                    Ok(None) => reply(id, Err((-32602, format!("Unknown tool: {name}")))),
-                    Err(e) => reply(id, Ok(e.result())),
-                }
+        };
+        let outcome = match self.era(method, &params) {
+            Err(e) => Err(e),
+            Ok(Era::Legacy) => self.legacy_dispatch(method, &params).await,
+            Ok(Era::Modern) => self.modern_dispatch(method, &params).await,
+        };
+        Some(match outcome {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(e) => e.to_json(id),
+        })
+    }
+
+    fn era(&self, method: &str, params: &Value) -> Result<Era, RpcError> {
+        match meta_version(params)? {
+            None if method == "initialize" || self.legacy.load(Ordering::Relaxed) => {
+                Ok(Era::Legacy)
             }
-            other => reply(id, Err((-32601, format!("Method not found: {other}")))),
+            None => Err(RpcError::missing_meta(format!(
+                "_meta.{META_VERSION} is required (protocol {MODERN_VERSION}); legacy clients \
+                 must send initialize first"
+            ))),
+            Some(MODERN_VERSION) => validate_meta(params).map(|()| Era::Modern),
+            Some(LEGACY_VERSION) => Ok(Era::Legacy),
+            Some(other) => Err(RpcError::unsupported_version(other)),
         }
     }
 
-    async fn initialize(&self, requested: &str) -> Value {
+    fn info() -> Value {
+        json!({"name": "reseller-mcp-bridge", "version": env!("CARGO_PKG_VERSION")})
+    }
+
+    async fn legacy_dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        match method {
+            "initialize" => {
+                let requested = params["protocolVersion"]
+                    .as_str()
+                    .ok_or_else(|| RpcError::new(-32602, "protocolVersion is required"))?;
+                if requested != LEGACY_VERSION {
+                    return Err(RpcError::initialize_rejected(requested));
+                }
+                self.legacy.store(true, Ordering::Relaxed);
+                Ok(json!({
+                    "protocolVersion": LEGACY_VERSION,
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": Self::info(),
+                    "instructions": self.instructions().await.0,
+                }))
+            }
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({"tools": self.list_tools().await.0})),
+            "tools/call" => {
+                let mut result = self.tool_call(params).await?;
+                // Legacy results carry neither `resultType` nor `_meta` identity.
+                if let Some(result) = result.as_object_mut() {
+                    result.remove("resultType");
+                    if let Some(meta) = result.get_mut("_meta").and_then(Value::as_object_mut) {
+                        meta.remove(META_SERVER_INFO);
+                    }
+                    if result
+                        .get("_meta")
+                        .and_then(Value::as_object)
+                        .is_some_and(|m| m.is_empty())
+                    {
+                        result.remove("_meta");
+                    }
+                }
+                Ok(result)
+            }
+            other => Err(RpcError::new(-32601, format!("Method not found: {other}"))),
+        }
+    }
+
+    async fn modern_dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        let result = match method {
+            "server/discover" => {
+                let (instructions, fresh) = self.instructions().await;
+                cacheable(
+                    json!({
+                        "supportedVersions": SUPPORTED_VERSIONS,
+                        "capabilities": {"tools": {}},
+                        "instructions": instructions,
+                    }),
+                    if fresh { CACHE_TTL_MS } else { 0 },
+                )
+            }
+            "tools/list" => {
+                if params.get("cursor").is_some_and(|c| !c.is_null()) {
+                    return Err(RpcError::new(-32602, "Invalid cursor"));
+                }
+                let (tools, fresh) = self.list_tools().await;
+                cacheable(
+                    json!({"tools": tools}),
+                    if fresh { CACHE_TTL_MS } else { 0 },
+                )
+            }
+            "tools/call" => self.tool_call(params).await?,
+            other => return Err(RpcError::method_not_found(other)),
+        };
+        Ok(complete(result, &Self::info()))
+    }
+
+    async fn tool_call(&self, params: &Value) -> Result<Value, RpcError> {
+        let Some(name) = params["name"].as_str() else {
+            return Err(RpcError::new(-32602, "name is required"));
+        };
+        let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+        match self.call_tool(name, &arguments).await {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => Err(RpcError::new(-32602, format!("Unknown tool: {name}"))),
+            Err(e) => Ok(e.result()),
+        }
+    }
+
+    /// Instructions for the model. The flag tells whether the remote
+    /// server's part could be fetched (otherwise results must not be cached).
+    async fn instructions(&self) -> (String, bool) {
         let mut instructions = format!(
             "This is the local reseller bridge for {}. Use `signup` to create an account (the proof of \
              work is solved locally) or `login` to use existing credentials; secrets stay in a \
@@ -440,40 +587,27 @@ impl Bridge {
             self.origin,
             self.output_dir.display()
         );
-        let remote = self
-            .rpc(
-                None,
-                "initialize",
-                json!({
-                    "protocolVersion": negotiate(Some(requested)),
-                    "capabilities": {},
-                    "clientInfo": {"name": "reseller-mcp-bridge", "version": env!("CARGO_PKG_VERSION")},
-                }),
-            )
-            .await;
-        match remote {
+        let fresh = match self.rpc(None, "server/discover", json!({})).await {
             Ok(result) => {
                 if let Some(text) = result["instructions"].as_str() {
                     instructions.push_str("\n\nServer instructions:\n");
                     instructions.push_str(text);
                 }
+                true
             }
-            Err(e) => tracing::warn!("remote initialize failed: {}", e.message),
-        }
-        json!({
-            "protocolVersion": negotiate(Some(requested)),
-            "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {
-                "name": "reseller-mcp-bridge",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "instructions": instructions,
-        })
+            Err(e) => {
+                tracing::warn!("remote server/discover failed: {}", e.message);
+                false
+            }
+        };
+        (instructions, fresh)
     }
 
-    async fn list_tools(&self) -> Vec<Value> {
+    /// Local tools plus the remote ones. The flag tells whether the remote
+    /// list could be fetched.
+    async fn list_tools(&self) -> (Vec<Value>, bool) {
         let mut tools = local_tools();
-        match self.rpc(None, "tools/list", json!({})).await {
+        let fresh = match self.rpc(None, "tools/list", json!({})).await {
             Ok(result) => {
                 if let Some(remote) = result["tools"].as_array() {
                     tools.extend(
@@ -487,10 +621,14 @@ impl Bridge {
                             .cloned(),
                     );
                 }
+                true
             }
-            Err(e) => tracing::warn!("remote tools/list failed: {}", e.message),
-        }
-        tools
+            Err(e) => {
+                tracing::warn!("remote tools/list failed: {}", e.message);
+                false
+            }
+        };
+        (tools, fresh)
     }
 
     /// `Ok(None)` when the tool is unknown locally and the remote says so.
@@ -950,6 +1088,8 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     });
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut tasks = JoinSet::new();
+    // In-flight requests by JSON-RPC id, so `notifications/cancelled` can stop them.
+    let inflight: Arc<StdMutex<HashMap<String, AbortHandle>>> = Arc::default();
     while let Some(line) = input.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -957,16 +1097,34 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         let out = out.clone();
         match serde_json::from_str::<Value>(&line) {
             Ok(message) => {
+                if message["method"] == "notifications/cancelled" && message.get("id").is_none() {
+                    let key = message["params"]["requestId"].to_string();
+                    if let Some(handle) = inflight.lock().unwrap().remove(&key) {
+                        handle.abort();
+                    }
+                    continue;
+                }
+                let key = message.get("id").map(Value::to_string);
                 let bridge = bridge.clone();
-                tasks.spawn(async move {
+                let registry = inflight.clone();
+                let task_key = key.clone();
+                // Held until the handle is registered so a fast task cannot
+                // finish (and deregister) before it is inserted.
+                let mut registered = inflight.lock().unwrap();
+                let handle = tasks.spawn(async move {
                     if let Some(reply) = bridge.handle(message).await {
+                        if let Some(key) = &task_key {
+                            registry.lock().unwrap().remove(key);
+                        }
                         let _ = out.send(reply.to_string()).await;
                     }
                 });
+                if let Some(key) = key {
+                    registered.insert(key, handle);
+                }
             }
             Err(_) => {
-                let reply = json!({"jsonrpc": "2.0", "id": null,
-                    "error": {"code": -32700, "message": "Parse error"}});
+                let reply = RpcError::new(-32700, "Parse error").to_json(Value::Null);
                 let _ = out.send(reply.to_string()).await;
             }
         }

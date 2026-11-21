@@ -1,7 +1,7 @@
 //! Credit ledger, plans, subscriptions, and redeem codes.
 //!
 //! Credit is held in lots (`credits` rows) that may expire. Debits consume the
-//! soonest-expiring lots first; any shortfall becomes account debt, which is
+//! soonest-expiring lots first. Any shortfall becomes account debt, which is
 //! repaid from the next credit before a new lot is created.
 use crate::{
     App,
@@ -17,6 +17,9 @@ use sqlx::{Row, SqliteConnection};
 pub const CREDIT_SOURCES: [&str; 5] = ["free", "purchase", "admin", "refund", "subscription"];
 
 /// Adds a credit lot of `amount` micro-USD, repaying outstanding debt first.
+///
+/// Only the part left after repayment becomes spendable. Rejects amounts that
+/// are not positive, expiry times in the past, and unknown sources.
 pub async fn credit(
     conn: &mut SqliteConnection,
     account: &str,
@@ -111,8 +114,9 @@ pub async fn grant(conn: &mut SqliteConnection, account: &str, plan: &str) -> Re
     .await
 }
 
-/// Grants plan credit using terms captured earlier (for example at checkout),
-/// so later plan edits do not change what a customer paid for.
+/// Grants plan credit using terms captured earlier, for example at checkout.
+///
+/// Later plan edits do not change what a customer paid for.
 pub async fn grant_snapshot(
     conn: &mut SqliteConnection,
     account: &str,

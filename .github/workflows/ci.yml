@@ -1,11 +1,14 @@
 name: CI
+# Run on pushes to main and on every pull request.
 on:
   push:
     branches: [main]
   pull_request:
+# Read-only token for every job.
 permissions:
   contents: read
 jobs:
+  # Format, lint, test, and package on each OS in the matrix.
   test:
     strategy:
       matrix:
@@ -18,15 +21,18 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # Warnings are errors. --locked uses the versions pinned in Cargo.lock.
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo package --locked
+  # Check that the crate builds on the minimum supported Rust version (1.98).
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98
       - run: cargo check --locked
+  # Build the image and smoke test a running container.
   docker:
     runs-on: ubuntu-latest
     steps:
@@ -37,6 +43,7 @@ jobs:
           context: .
           load: true
           tags: reseller:test
+      # Start the container, then check readiness, version, healthcheck, and user.
       - name: Container smoke test
         run: |
           docker run -d --name reseller-test -p 56787:56787 reseller:test
@@ -48,5 +55,6 @@ jobs:
           fi
           docker exec reseller-test /usr/local/bin/reseller --version
           docker exec reseller-test /usr/local/bin/reseller healthcheck
+          # The image must run as UID:GID 10001:10001.
           test "$(docker inspect -f '{{.Config.User}}' reseller-test)" = "10001:10001"
           docker stop reseller-test

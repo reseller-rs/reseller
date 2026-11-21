@@ -1130,7 +1130,7 @@ fn starter_config_documents_every_option_and_validates() {
     // validation, and mention every configurable field at least once.
     let text = include_str!("../reseller.example.toml");
     let c: Config = toml::from_str(text).unwrap();
-    // Secrets are generated on first start; validation requires them.
+    // Secrets are generated on first start. Validation requires them.
     assert!(c.validate().is_err(), "empty secrets must not validate");
     let seeded = Config {
         admin_token: "a".repeat(24),

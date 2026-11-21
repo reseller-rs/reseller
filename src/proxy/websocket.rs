@@ -1,4 +1,4 @@
-//! WebSocket relay for realtime APIs (`/v1/realtime?model=…`).
+//! WebSocket relay for realtime APIs (`/v1/realtime?model=<name>`).
 use super::{
     Kind,
     inspect::{RealtimeEvent, realtime_event},
@@ -100,7 +100,7 @@ pub(super) async fn relay(
         header::AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", upstream.api_key)).map_err(Error::internal)?,
     );
-    // Offer the client's subprotocols; accept only the one upstream selects.
+    // Offer the client's subprotocols. Accept only the one upstream selects.
     if let Some(v) = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL) {
         request
             .headers_mut()

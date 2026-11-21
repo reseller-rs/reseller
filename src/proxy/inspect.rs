@@ -439,7 +439,7 @@ fn inline_images(v: &Value) -> i64 {
     data + chat
 }
 
-/// The last top-level-looking `"usage": {…}` object in the tail of a JSON
+/// The last top-level-looking `"usage": { ... }` object in the tail of a JSON
 /// body too large to buffer.
 fn trailing_usage(tail: &[u8]) -> Option<Value> {
     const KEY: &[u8] = b"\"usage\"";
@@ -463,7 +463,7 @@ fn trailing_usage(tail: &[u8]) -> Option<Value> {
 /// A realtime server event relevant to metering.
 #[derive(Debug, PartialEq)]
 pub enum RealtimeEvent {
-    /// A response started; its `response.done` is still to come.
+    /// A response started. Its `response.done` is still to come.
     Created,
     /// A response finished, with its usage if reported. Each `response.done`
     /// reports one response, so callers accumulate them.

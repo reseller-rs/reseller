@@ -1,6 +1,8 @@
-//! Plan purchases. Every checkout creates a server-side order that snapshots
-//! the plan's price, credit, and duration; a verified provider event (or an
-//! administrator) completes the order and grants exactly that snapshot, once.
+//! Plan purchases.
+//!
+//! Every checkout creates a server-side order that snapshots the plan's price,
+//! credit, and duration. A verified provider event, or an administrator,
+//! completes the order. Completion grants exactly that snapshot, once.
 //!
 //! Providers:
 //! - [`stripe`]: hosted card Checkout, completed by a signed webhook.
@@ -21,11 +23,12 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
 
-/// Customer-facing payment methods.
+/// Method name for card payments through Stripe.
 pub const STRIPE: &str = "stripe";
+/// Method name for crypto payments through Payroof.
 pub const CRYPTO: &str = "crypto";
 
-/// Payment methods currently available to customers.
+/// Payment methods currently available to customers, card first.
 pub fn methods(config: &Config) -> Vec<&'static str> {
     let mut out = Vec::new();
     if config.stripe.enabled() {
@@ -37,6 +40,7 @@ pub fn methods(config: &Config) -> Vec<&'static str> {
     out
 }
 
+/// Builds a 503 error for a payment method that is not available right now.
 pub(crate) fn unavailable(message: &str) -> Error {
     Error::new(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -45,6 +49,7 @@ pub(crate) fn unavailable(message: &str) -> Error {
     )
 }
 
+/// Builds a 502 error for a failed call to a payment provider.
 pub(crate) fn provider_error(message: &str) -> Error {
     Error::new(StatusCode::BAD_GATEWAY, "payment_provider_error", message)
 }
@@ -83,8 +88,10 @@ pub async fn checkout(app: &App, identity: &Identity, body: &Value) -> Result<Va
     }
 }
 
-/// Caps orders per account per hour so a signed-in client cannot spam the
-/// payment providers (stored orders survive restarts, unlike in-memory state).
+/// Caps checkout orders per account per hour, so a signed-in client cannot
+/// spam the payment providers.
+///
+/// The count comes from stored orders, so it survives restarts.
 async fn check_checkout_budget(app: &App, config: &Config, account: &str) -> Result<()> {
     let limit = config.rate_limits.checkouts_per_hour;
     if limit == 0 {
@@ -169,7 +176,8 @@ pub(crate) async fn complete(
     Ok(true)
 }
 
-/// Records a provider event id; `false` means it was already processed.
+/// Records a provider event id. Returns `false` when the event was already
+/// processed.
 pub(crate) async fn first_delivery(conn: &mut SqliteConnection, event: &str) -> Result<bool> {
     Ok(sqlx::query(
         "INSERT INTO payment_events(id,created_at) VALUES(?,?) ON CONFLICT(id) DO NOTHING",
@@ -214,6 +222,8 @@ pub async fn order(app: &App, order_id: &str, account: Option<&str>) -> Result<V
 }
 
 /// List view of a `payments` row.
+///
+/// A pending order past its expiry is reported as `expired`.
 pub fn summary(r: &SqliteRow) -> Value {
     let expires_at: Option<i64> = r.get("expires_at");
     let status: String = r.get("status");
@@ -236,7 +246,7 @@ pub fn summary(r: &SqliteRow) -> Value {
     })
 }
 
-/// The latest orders of one account.
+/// Lists up to 50 of the latest orders for one account.
 pub async fn account_orders(app: &App, account: &str) -> Result<Value> {
     let rows = sqlx::query(
         "SELECT * FROM payments WHERE account_id=? ORDER BY created_at DESC,id DESC LIMIT 50",

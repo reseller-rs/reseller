@@ -7,8 +7,8 @@ pub const MODEL_LIMIT: usize = 256;
 
 /// Streaming parser of a multipart/form-data body. The `model` form field is
 /// replaced (Force) or injected when missing (Default), or left alone
-/// (passthrough: `replace` and `inject` both false), while all other parts
-/// — including file payloads — stream through untouched. Whatever the policy,
+/// (passthrough: `replace` and `inject` both false). All other parts,
+/// including file payloads, stream through untouched. Whatever the policy,
 /// the effective model value is reported through [`Multipart::take_models`]
 /// as soon as its part is complete, so it can be metered and checked against
 /// key allowlists before the upload finishes.
@@ -59,7 +59,7 @@ impl Multipart {
     pub fn take_models(&mut self) -> Vec<String> {
         std::mem::take(&mut self.observed)
     }
-    /// Feed one input chunk; returns the bytes that should be forwarded.
+    /// Feeds one input chunk. Returns the bytes that should be forwarded.
     pub fn push(&mut self, chunk: &[u8]) -> std::result::Result<Vec<u8>, String> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(chunk.len() + self.model.len() + 64);
@@ -78,7 +78,7 @@ impl Multipart {
         match self.state {
             Part::Preamble => {
                 let Some(i) = find(&self.buf, &self.marker) else {
-                    // Preamble is ignored per RFC 2046; retain only a tail that
+                    // The preamble is ignored per RFC 2046. Retain only a tail that
                     // could still hold the first boundary.
                     if self.buf.len() > self.marker.len() {
                         let cut = self.buf.len() - self.marker.len();

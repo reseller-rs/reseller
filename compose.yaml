@@ -1,9 +1,15 @@
+# Single-service deployment. Set the values below in an .env file or the shell.
 services:
   reseller:
+    # Image published by the release workflow.
     image: ghcr.io/reseller-rs/reseller:latest
     restart: unless-stopped
+    # Publish the HTTP port on every host interface.
     ports:
       - "56787:56787"
+    # Bootstrap values. They seed the settings only on the first start. Later
+    # changes belong in Admin > Settings or reseller config import (see
+    # reseller.example.toml).
     environment:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -26,12 +32,15 @@ services:
       PAYROOF_PROJECT: ${PAYROOF_PROJECT:-}
       PAYROOF_TOKEN: ${PAYROOF_TOKEN:-}
       PAYROOF_WEBHOOK_SECRET: ${PAYROOF_WEBHOOK_SECRET:-}
-      # White-label files (logo, favicon, theme.css, index.html); see README.
+      # White-label files (logo, favicon, theme.css, index.html). See README.
       # RESELLER_THEME_DIR: /theme
+    # Named volume for the SQLite database and generated files.
     volumes:
       - reseller-data:/data
       # - ./theme:/theme:ro
+    # Time Docker waits for a graceful shutdown before it kills the container.
     stop_grace_period: 330s
+    # Hardening: block privilege escalation and drop all Linux capabilities.
     security_opt:
       - no-new-privileges:true
     cap_drop:

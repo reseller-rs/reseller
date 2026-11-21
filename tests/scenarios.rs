@@ -457,7 +457,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["account"]["balance_usd"], "175");
 
-    // Each grant carries its own window; the yearly plan is 360 days, not 365.
+    // Each grant carries its own window. The yearly plan is 360 days, not 365.
     let year_exp: i64 = sqlx::query_scalar("SELECT expires_at FROM credits WHERE note='year'")
         .fetch_one(&t.app.db)
         .await
@@ -521,7 +521,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
     assert_eq!((trial_left, year_left), (2_000_000, 160_000_000));
 
     // 6) One month later the $5 lot's remainder expires out of the spendable
-    // balance; the yearly window and the perpetual $10 are untouched, and the
+    // balance. The yearly window and the perpetual $10 are untouched, and the
     // ledger still shows the expired remainder for audit.
     sqlx::query("UPDATE credits SET expires_at=? WHERE note='trial5'")
         .bind(db::now() - 1)
@@ -590,7 +590,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
     assert_eq!(debt, 0);
 
     // 8) A plan that only left history behind (redeemed code, expired grant) is
-    // still undeletable; a never-referenced plan deletes normally.
+    // still undeletable. A never-referenced plan deletes normally.
     let (s, v) = t.admin("DELETE", "plans/trial5", json!({})).await;
     assert_eq!(s, 409, "{v}");
     let (s, _) = t
@@ -857,7 +857,7 @@ async fn revoking_one_key_does_not_affect_siblings() {
     task.abort();
 }
 
-/// Blocking is self-service and reversible by admins only; blocked keys keep
+/// Blocking is self-service and reversible by admins only. Blocked keys keep
 /// workspace access, cannot proxy, and cross-account writes must 404.
 #[tokio::test]
 async fn block_and_reactivate_cycle_is_enforced_across_accounts() {
@@ -959,7 +959,7 @@ async fn block_and_reactivate_cycle_is_enforced_across_accounts() {
     task.abort();
 }
 
-/// `max_keys_per_account` counts active keys only; blocking frees a slot and
+/// `keys.max_per_account` counts active keys only. Blocking frees a slot and
 /// rotation never exceeds the cap.
 #[tokio::test]
 async fn account_key_cap_counts_active_keys_and_rotation_respects_it() {
@@ -1020,7 +1020,7 @@ async fn account_key_cap_counts_active_keys_and_rotation_respects_it() {
 
 /// Child-key limits are enforced for API-key callers, but dashboard tokens
 /// (and therefore each rotation) start a fresh child budget. This documents
-/// the current behavior; the account-level key cap still bounds the account.
+/// the current behavior. The account-level key cap still bounds the account.
 #[tokio::test]
 async fn child_key_limit_applies_to_api_keys_and_resets_on_rotation() {
     let t = Test::new().await;
@@ -1405,7 +1405,7 @@ async fn model_allowlist_update_takes_effect_on_next_request() {
     task.abort();
 }
 
-/// Markup resolves key → account → global for each request.
+/// Markup resolves key, then account, then global for each request.
 #[tokio::test]
 async fn markup_resolution_prefers_key_then_account_then_global() {
     let t = Test::new().await;
@@ -1492,7 +1492,7 @@ async fn markup_resolution_prefers_key_then_account_then_global() {
 // ---------------------------------------------------------------------------
 
 /// Changing the key pepper invalidates existing keys and unredeemed codes;
-/// the admin token is unaffected; freshly issued credentials work.
+/// the admin token is unaffected. Freshly issued credentials work.
 #[tokio::test]
 async fn key_pepper_rotation_invalidates_keys_and_unredeemed_codes() {
     let t = Test::new().await;
@@ -1575,7 +1575,7 @@ async fn admin_token_rotation_only_affects_admin_access() {
     );
 }
 
-/// Default limits are snapshotted when keys are minted; existing keys keep the
+/// Default limits are snapshotted when keys are minted. Existing keys keep the
 /// limits they were created with.
 #[tokio::test]
 async fn default_limits_apply_to_new_keys_only() {
@@ -1648,7 +1648,7 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
         .execute(&t.app.db)
         .await
         .unwrap();
-    // The plan changes (and is deactivated) after checkout; the paid order must
+    // The plan changes (and is deactivated) after checkout. The paid order must
     // still grant the snapshot the customer paid for.
     let (s, _) = t
         .admin(
@@ -1733,7 +1733,7 @@ async fn workspace_panel_full_journey() {
         )
         .await;
     assert_eq!(s, 200);
-    // Rotation replaces an active key; the blocked one stays blocked.
+    // Rotation replaces an active key. The blocked one stays blocked.
     let (s, third) = t
         .customer(
             "POST",
@@ -1779,7 +1779,7 @@ async fn workspace_panel_full_journey() {
         "0.013"
     );
 
-    // Revoking the active key kills that key's credentials; the account's
+    // Revoking the active key kills that key's credentials. The account's
     // remaining (blocked) credentials can still open the workspace and mint a
     // replacement.
     let (s, _) = t
@@ -1991,7 +1991,7 @@ async fn concurrent_plan_code_redemption_grants_once() {
 }
 
 /// Regression: a real HTTP server must meter a buffered JSON response. The
-/// upstream sends Content-Length; if the proxy copies that header, hyper stops
+/// upstream sends Content-Length. If the proxy copies that header, hyper stops
 /// polling the relay stream after the declared bytes and drops the meter,
 /// settling the request as 499 with zero usage while the client still receives
 /// the full body.
@@ -2146,7 +2146,7 @@ async fn proxy_usage_drains_soonest_expiring_lot_first() {
     task.abort();
 }
 
-/// Overspending one admitted request becomes debt; the next request is
+/// Overspending one admitted request becomes debt. The next request is
 /// refused until an admin top-up settles the debt and exposes the surplus.
 #[tokio::test]
 async fn overspend_via_proxy_creates_debt_settled_by_admin_topup() {
@@ -2265,7 +2265,7 @@ async fn concurrent_rotations_are_serialized_and_only_active_keys_rotate() {
 }
 
 /// Blocked keys are paused credentials and cannot be rotated into a fresh
-/// active key — for customers or admins — until they are reactivated.
+/// active key, for customers or admins, until they are reactivated.
 #[tokio::test]
 async fn only_active_keys_can_be_rotated() {
     let t = Test::new().await;
@@ -2292,7 +2292,7 @@ async fn only_active_keys_can_be_rotated() {
             .0,
         400
     );
-    // Reactivation restores rotation; the replacement then inherits the
+    // Reactivation restores rotation. The replacement then inherits the
     // blocked state of the key it replaced.
     assert_eq!(
         t.admin("PATCH", &format!("keys/{kid}"), json!({"status":"active"}))
@@ -2313,7 +2313,7 @@ async fn only_active_keys_can_be_rotated() {
 }
 
 /// Customer key patches may rename and block, but must never change limits,
-/// markup, or expiry; admins validate the values they set.
+/// markup, or expiry. Admins validate the values they set.
 #[tokio::test]
 async fn customer_patches_cannot_escalate_limits_markup_or_expiry() {
     let t = Test::new().await;
@@ -2371,7 +2371,7 @@ async fn customer_patches_cannot_escalate_limits_markup_or_expiry() {
     );
 }
 
-/// Public signup cannot select its own limits; defaults from settings apply.
+/// Public signup cannot select its own limits. Defaults from settings apply.
 #[tokio::test]
 async fn public_signup_cannot_choose_limits() {
     let t = Test::new().await;
@@ -2477,7 +2477,7 @@ async fn checkout_validates_configuration_and_plan_pricing() {
         .0,
         400
     );
-    // The public plan list only exposes active plans; the console shows all.
+    // The public plan list only exposes active plans. The console shows all.
     let (s, _) = t
         .admin(
             "POST",
@@ -2601,7 +2601,7 @@ async fn admin_cannot_grant_inactive_plan() {
 }
 
 /// A blocked (for example, rotated-away) credential can still open the
-/// workspace and mint brand-new active keys; only revocation removes that
+/// workspace and mint brand-new active keys. Only revocation removes that
 /// power. This documents the containment boundary of "block" vs "revoke".
 #[tokio::test]
 async fn blocked_credential_can_still_mint_replacement_keys() {
@@ -2799,7 +2799,7 @@ async fn usage_limits_are_per_key_within_one_account() {
     task.abort();
 }
 
-/// Plans can be created, edited in place, retired, and deleted — but deletion
+/// Plans can be created, edited in place, retired, and deleted, but deletion
 /// is only allowed while no subscription, payment, or code references them.
 #[tokio::test]
 async fn plan_lifecycle_edits_retires_and_deletes_safely() {
@@ -2922,7 +2922,7 @@ async fn plan_lifecycle_edits_retires_and_deletes_safely() {
     assert_eq!(t.admin("DELETE", "plans/starter", json!({})).await.0, 409);
 }
 
-/// Unredeemed codes can be edited (expiry/note) or cancelled; redeemed codes
+/// Unredeemed codes can be edited (expiry/note) or cancelled. Redeemed codes
 /// are frozen audit records and the granted credit is untouched.
 #[tokio::test]
 async fn redeem_codes_can_be_edited_or_cancelled_until_redeemed() {
@@ -2943,7 +2943,7 @@ async fn redeem_codes_can_be_edited_or_cancelled_until_redeemed() {
         .unwrap()
         .to_owned();
 
-    // Edit expiry and note; a past expiry is rejected and changes nothing.
+    // Edit expiry and note. A past expiry is rejected and changes nothing.
     let (s, v) = t
         .admin(
             "PATCH",
@@ -3079,7 +3079,7 @@ async fn redeem_codes_can_be_issued_in_bulk_atomically() {
 
 /// Model policy semantics: "default" fills only a missing model, "force"
 /// always overrides the client, and "passthrough" forwards whatever the client
-/// sent — even a placeholder — without substitution.
+/// sent, even a placeholder, without substitution.
 #[tokio::test]
 async fn model_policy_default_force_and_passthrough() {
     let t = Test::new().await;

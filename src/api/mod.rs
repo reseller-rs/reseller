@@ -1,5 +1,8 @@
-//! JSON management APIs: the customer workspace (`/v1/keys`, `/v1/account`,
-//! `/v1/plans`) and the administrator console (`/admin/api/*`).
+//! JSON management APIs.
+//!
+//! - [`customer`]: the customer workspace under `/v1/`, including the public
+//!   plan catalogue and self-service signup.
+//! - [`admin`]: the administrator console under `/admin/api/`.
 mod admin;
 mod customer;
 
@@ -26,9 +29,12 @@ use std::collections::HashMap;
 /// Decoded query-string parameters.
 pub type Query = HashMap<String, String>;
 
+/// Largest management request body, in bytes.
 const MAX_BODY_BYTES: usize = 256 * 1024;
+/// Longest accepted text field, in bytes.
 const MAX_TEXT_BYTES: usize = 4096;
 
+/// Decodes the request's query string. A repeated key keeps its last value.
 pub fn query(req: &Request<Body>) -> Query {
     url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
         .into_owned()
@@ -47,7 +53,7 @@ fn segments(req: &Request<Body>, prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// Reads a JSON object body; an empty body is treated as `{}`.
+/// Reads a JSON object body. An empty body is treated as `{}`.
 async fn object(req: Request<Body>) -> Result<Value> {
     let v = json_body(req).await?;
     if !v.is_object() {
@@ -56,7 +62,8 @@ async fn object(req: Request<Body>) -> Result<Value> {
     Ok(v)
 }
 
-/// Reads any JSON body; an empty body is treated as `{}`.
+/// Reads any JSON body, refusing bodies over 256 KiB. An empty body is
+/// treated as `{}`.
 async fn json_body(req: Request<Body>) -> Result<Value> {
     let bytes = to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
@@ -67,7 +74,8 @@ async fn json_body(req: Request<Body>) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// `limit`/`offset` pagination.
+/// The `limit` (1 to 200, default 50) and `offset` (0 to 1,000,000) paging
+/// parameters of a list endpoint.
 #[derive(Clone, Copy)]
 struct Page {
     limit: i64,
@@ -75,6 +83,7 @@ struct Page {
 }
 
 impl Page {
+    /// Reads the paging parameters from the query string.
     fn from(q: &Query) -> Self {
         Self {
             limit: number(q, "limit", 50, 1, 200),
@@ -82,7 +91,7 @@ impl Page {
         }
     }
 
-    /// Wraps `items` under `key` with paging metadata.
+    /// Wraps `items` under `key` with `total`, `limit`, and `offset`.
     fn wrap(self, key: &str, items: Vec<Value>, total: i64) -> Value {
         let mut out = json!({"total": total, "limit": self.limit, "offset": self.offset});
         out[key] = Value::Array(items);
@@ -90,6 +99,8 @@ impl Page {
     }
 }
 
+/// Reads an integer query parameter. A missing or invalid value falls back to
+/// `default`, and the result is clamped to `min..=max`.
 fn number(q: &Query, key: &str, default: i64, min: i64, max: i64) -> i64 {
     q.get(key)
         .and_then(|v| v.parse().ok())
@@ -106,12 +117,15 @@ fn direction(q: &Query) -> &'static str {
     }
 }
 
-/// `%term%` for a `LIKE … ESCAPE '\'` search on `q` (matches everything
-/// when absent). `%`, `_` and `\` in the term match literally.
+/// Builds a `%term%` pattern for a `LIKE ... ESCAPE '\'` search on `q`.
+///
+/// A missing `q` matches everything. `%`, `_`, and `\` in the term match
+/// literally.
 fn search(q: &Query) -> String {
     like(q.get("q").map(String::as_str).unwrap_or(""))
 }
 
+/// Wraps `term` in `%` wildcards and escapes its LIKE metacharacters.
 fn like(term: &str) -> String {
     let mut out = String::with_capacity(term.len() + 2);
     out.push('%');
@@ -214,6 +228,8 @@ fn row_json(r: &SqliteRow) -> Value {
 }
 
 /// Paginated key listing, optionally scoped to one account.
+///
+/// Each item includes `usage_30d_usd`, the billed usage over the last 30 days.
 async fn list_keys(app: &App, account: Option<&str>, q: &Query) -> Result<Value> {
     let search = search(q);
     let status = status_filter(q);
@@ -293,6 +309,10 @@ enum Editor<'a> {
     Admin,
 }
 
+/// Applies a PATCH to a key and returns the updated key.
+///
+/// Customers may rename a key or block it. Administrators may also change the
+/// status, limits, markup, and expiry. A revoked key cannot be restored.
 async fn patch_key(app: &App, kid: &str, editor: Editor<'_>, b: &Value) -> Result<Value> {
     let account = match editor {
         Editor::Customer(account) => Some(account),

@@ -108,8 +108,11 @@ pub(super) async fn checkout(
     Ok(json!({"method": super::STRIPE, "url": url, "order_id": order}))
 }
 
-/// Verifies a `Stripe-Signature` header (`t=…,v1=…`) against `body` at Unix
-/// time `now`.
+/// Verifies a `Stripe-Signature` header (`t=...,v1=...`) against `body` at
+/// Unix time `now`.
+///
+/// Any matching `v1` entry is enough. The signed timestamp must lie within
+/// `SIGNATURE_TOLERANCE` seconds of `now`.
 pub fn verify(secret: &str, header: &str, body: &[u8], now: i64) -> Result<()> {
     let fail = || {
         Error::new(

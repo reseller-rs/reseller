@@ -187,7 +187,7 @@ async function api(path, method = 'GET', data, options = {}) {
   if (token) headers[admin ? 'x-admin-token' : 'authorization'] = admin ? token : `Bearer ${token}`;
   if (data !== undefined) headers['content-type'] = 'application/json';
   const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data), signal: options.signal });
-  // Proxies and crashes can return non-JSON bodies; surface the status instead of a parse error.
+  // Proxies and crashes can return non-JSON bodies. Surface the status instead of a parse error.
   const v = await r.json().catch(() => null);
   if (!r.ok) throw apiError(r, v);
   if (v === null) throw new Error(`Unexpected response from server (${r.status})`);
@@ -1081,7 +1081,7 @@ const views = {
         requestModelCache = { values: groups.map(g => g.label).filter(Boolean), expiresAt: Date.now() + 60_000 };
       } catch (e) {
         if (e.name === 'AbortError') throw e;
-        // Suggestions are optional; the filter form still works without them.
+        // Suggestions are optional. The filter form still works without them.
       }
     }
     const models = admin ? requestModelCache.values : [];

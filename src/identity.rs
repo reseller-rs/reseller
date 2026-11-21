@@ -1,9 +1,12 @@
 //! Credential generation, hashing, and request authentication.
 //!
-//! Every API key has two credentials: the proxy key (`sk-res-…`) and a
-//! dashboard token (`dash_…`) that can manage the account but cannot call the
-//! proxy. Only HMAC-SHA256 digests (keyed with the configured pepper) are
-//! stored.
+//! Each API key has two credentials:
+//!
+//! - the proxy key (`sk-res-<hex>`), used to call the proxy.
+//! - the dashboard token (`dash_<hex>`), used to manage the account. It cannot
+//!   call the proxy.
+//!
+//! Only HMAC-SHA256 digests, keyed with the configured pepper, are stored.
 use crate::{
     App,
     db::now,
@@ -53,7 +56,8 @@ pub fn hash(pepper: &str, token: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Extracts a bearer token or `x-api-key` header value.
+/// Extracts the bearer token from `Authorization`, or the `x-api-key` header
+/// when no bearer token is present.
 pub fn token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
@@ -65,11 +69,15 @@ pub fn token(headers: &HeaderMap) -> Option<&str> {
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
 }
 
-/// Resolves the request credential.
+/// Resolves the request credential into an [`Identity`].
 ///
-/// Returns `Ok(None)` for anonymous access, which is only possible on proxy
-/// routes when `require_key` is disabled, or on management routes without a
-/// credential (the caller decides whether that is acceptable).
+/// Returns `Ok(None)` for anonymous access. The caller decides whether that
+/// is acceptable. Anonymous access happens in these cases:
+///
+/// - A proxy route with `require_key` disabled and no credential sent.
+/// - A proxy route with `require_key` disabled, `accept_any_token` set, and an
+///   unknown credential.
+/// - A management route with no credential sent.
 pub async fn authenticate(
     app: &App,
     headers: &HeaderMap,
@@ -158,8 +166,11 @@ pub async fn required(app: &App, headers: &HeaderMap) -> Result<Identity> {
         })
 }
 
-/// Verifies the administrator token (`x-admin-token` or bearer) in constant
-/// time.
+/// Verifies the administrator token in constant time.
+///
+/// The token is read from `x-admin-token`. Without that header, the bearer or
+/// `x-api-key` credential is used. An empty configured token rejects every
+/// request.
 pub async fn admin(app: &App, headers: &HeaderMap) -> Result<()> {
     let config = app.config().await;
     let presented = headers

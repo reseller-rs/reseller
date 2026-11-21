@@ -7,6 +7,7 @@ pub const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Mcp {
+    /// Whether the MCP endpoint is served.
     pub enabled: bool,
     /// Largest audio/image payload MCP tools return inline.
     pub max_media_bytes: usize,
@@ -22,6 +23,7 @@ impl Default for Mcp {
 }
 
 impl Mcp {
+    /// Checks that `max_media_bytes` is between 1 and `MAX_MEDIA_BYTES`.
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             (1..=MAX_MEDIA_BYTES).contains(&self.max_media_bytes),

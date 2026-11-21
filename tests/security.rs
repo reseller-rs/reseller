@@ -1,5 +1,6 @@
-//! Abuse protection: proof-of-work signup, rate limits, creation budgets,
-//! and the 0.4 settings migration.
+//! Abuse protection: proof-of-work signup, key creation budgets and cooldowns,
+//! authentication failure lockouts, rate limits, and the HSTS header, which is
+//! sent only when public_url uses https.
 use axum::{
     body::{Body, to_bytes},
     extract::ConnectInfo,
@@ -337,7 +338,7 @@ async fn customers_cannot_rotate_young_keys_but_administrators_can() {
         .await;
     assert_eq!(admin.status, 200, "{}", admin.body);
 
-    // Once old enough the customer may rotate; the new key starts a new cooldown.
+    // Once old enough the customer may rotate. The new key starts a new cooldown.
     let new_id = admin.body["id"].as_str().unwrap();
     sqlx::query("UPDATE api_keys SET created_at=created_at-400")
         .execute(&t.app.db)

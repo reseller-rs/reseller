@@ -203,7 +203,7 @@ fn json_response(body: Value) -> Response {
 
 // ---------------------------------------------------------------------------
 
-/// The client drops the connection after the first SSE chunk; the upstream
+/// The client drops the connection after the first SSE chunk. The upstream
 /// then finishes and reports usage. The usage is still observed and billed.
 #[tokio::test]
 async fn client_disconnect_mid_stream_still_bills_final_usage() {
@@ -262,7 +262,7 @@ async fn client_disconnect_mid_stream_still_bills_final_usage() {
 }
 
 /// Without any upstream usage, tokens are estimated at four characters per
-/// token and the request is flagged; reported usage (even zero) never is.
+/// token and the request is flagged. Reported usage (even zero) never is.
 #[tokio::test]
 async fn missing_usage_is_estimated_and_flagged() {
     let mut t = Test::new(&[("m", price("2", "4"))]).await;
@@ -443,7 +443,7 @@ async fn tts_sse_usage_is_billed_in_tokens() {
 }
 
 /// Both transcription usage shapes are billed: whisper duration seconds and
-/// gpt-4o-transcribe tokens; text formats without usage pay the flat fee.
+/// gpt-4o-transcribe tokens. Text formats without usage pay the flat fee.
 #[tokio::test]
 async fn transcription_usage_shapes_and_flat_request_fee() {
     let stt = Price {
@@ -519,7 +519,7 @@ async fn zero_provider_cost_plus_request_fee() {
     assert_eq!(rows[0].get::<i64, _>("upstream_micro"), 12 + 2000);
 }
 
-/// Cached input tokens bill at the cached price; every aggregate (request
+/// Cached input tokens bill at the cached price. Every aggregate (request
 /// row, hourly bucket, totals, stats, balance) carries identical numbers,
 /// including the markup rounded once.
 #[tokio::test]
@@ -847,7 +847,7 @@ async fn stt_test(policy: reseller::config::Policy) -> (Test, Arc<std::sync::Mut
 }
 
 /// The client's multipart model is priced and metered under default and
-/// passthrough policies; the body reaches the upstream unchanged.
+/// passthrough policies. The body reaches the upstream unchanged.
 #[tokio::test]
 async fn multipart_model_is_priced_under_default_and_passthrough() {
     use reseller::config::Policy;
@@ -928,7 +928,7 @@ async fn multipart_model_over_limit_is_rejected() {
 }
 
 /// Requests left unfinished by a previous process are closed on startup
-/// without billing; settled rows are untouched.
+/// without billing. Settled rows are untouched.
 #[tokio::test]
 async fn startup_sweep_closes_interrupted_requests() {
     let t = Test::new(&[("m", price("1", "1"))]).await;

@@ -1,4 +1,5 @@
-//! Customer workspace API under `/v1/keys`, `/v1/account`, and `/v1/plans`.
+//! Customer workspace API under `/v1/`: keys, account, plans, and
+//! self-service signup.
 use super::{
     Editor, list_keys, number, object, owned_key, patch_key, query, requests, segments, text,
 };
@@ -14,6 +15,10 @@ use crate::{
 use axum::{body::Body, http::Request};
 use serde_json::{Value, json};
 
+/// Routes a `/v1/` request.
+///
+/// The plan catalogue, signup, and signup challenge routes are public. All
+/// other routes require a signed-in customer.
 pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
     let path = segments(&req, "/v1/");
     let path: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -80,8 +85,10 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
     }
 }
 
-/// ALTCHA challenge for anonymous signup (`{"required":false}` when the
-/// proof of work is disabled).
+/// Issues an ALTCHA challenge for anonymous signup.
+///
+/// Returns `{"required":false}` when the proof of work is disabled. Fails when
+/// self-service signup is disabled.
 async fn signup_challenge(app: &App, ip: &str) -> Result<Value> {
     let config = app.config().await;
     if !config.signup.enabled {

@@ -38,8 +38,9 @@ pub async fn overview(app: &App) -> Result<Value> {
     }))
 }
 
-/// Daily usage per model over the last `days` (1–365), optionally scoped to
-/// an account and/or key.
+/// Returns daily usage per model over the last `days`, clamped to 1 to 365.
+///
+/// The result can be scoped to one account and/or one key.
 pub async fn usage(
     app: &App,
     account: Option<&str>,
@@ -76,8 +77,11 @@ pub async fn usage(
     Ok(json!({"series": series}))
 }
 
-/// Deletes request logs beyond the retention window or entry cap, and usage
-/// buckets older than [`BUCKET_RETENTION_DAYS`].
+/// Prunes old statistics.
+///
+/// Deletes finished request logs beyond the retention window or the entry
+/// cap. Logs from the last minute are always kept. Also deletes usage buckets
+/// older than [`BUCKET_RETENTION_DAYS`].
 pub async fn prune(app: &App) -> Result<()> {
     let config = app.config().await;
     // Keep at least the last minute: the RPM limiter counts those rows.

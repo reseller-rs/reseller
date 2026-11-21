@@ -539,7 +539,7 @@ async fn payroof_checkout_quotes_assets_and_completes_on_confirmed_transfers() {
     assert_eq!((s, v["duplicate"].clone()), (200, json!(true)));
 
     // The remainder in native ETH (confirmed without a prior `seen`)
-    // completes the order: 8 USD of ETH at 2500.5 = 0.00319936… ETH.
+    // completes the order: 8 USD of ETH at 2500.5 = 0.00319936 ETH (rounded).
     let (s, _) = deliver(
         &t,
         &event(

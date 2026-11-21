@@ -22,6 +22,9 @@ use sqlx::{AssertSqlSafe, Row};
 
 const MAX_CODES_PER_BATCH: usize = 100;
 
+/// Routes an `/admin/api/` request.
+///
+/// Every request must pass the administrator token check first.
 pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
     identity::admin(app, req.headers()).await?;
     let path = segments(&req, "/admin/api/");
@@ -250,7 +253,8 @@ async fn save_plan(app: &App, b: &Value) -> Result<Value> {
     billing::plans(app, false).await
 }
 
-/// Deletes an unused plan; referenced plans must be deactivated instead.
+/// Deletes an unused plan. A plan that subscriptions, payments, or codes
+/// reference must be deactivated instead.
 async fn delete_plan(app: &App, code: &str) -> Result<Value> {
     let mut tx = db::write(&app.db).await?;
     let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plans WHERE code=?)")
@@ -467,8 +471,8 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
     ))
 }
 
-/// Map-valued settings that a patch replaces wholesale, so entries can be
-/// removed.
+/// Map-valued settings that a patch replaces wholesale. This lets a patch
+/// remove entries.
 const REPLACED_MAPS: [&str; 10] = [
     "/prices",
     "/signup/ip_overrides",
@@ -504,6 +508,9 @@ fn merge(base: &mut Value, patch: Value, path: &str) {
     }
 }
 
+/// Validates and saves a settings patch, then swaps in the new configuration.
+///
+/// The response notes that CORS changes apply only after a restart.
 async fn update_settings(app: &App, patch: Value) -> Result<Value> {
     let mut config = app.config_mut().await;
     let mut merged = serde_json::to_value(&*config)?;

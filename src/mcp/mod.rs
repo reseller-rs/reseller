@@ -1,7 +1,10 @@
 //! Model Context Protocol support.
 //!
-//! - `POST /mcp` ([`handle`]): a stateless Streamable HTTP server. Every POST
-//!   carries one JSON-RPC message and is answered with `application/json`.
+//! - `POST /mcp` ([`handle`]): a stateless Streamable HTTP server speaking
+//!   MCP 2026-07-28 (per-request `_meta`, `server/discover`, `Mcp-Method` /
+//!   `Mcp-Name` headers) and, for older clients, the 2025-11-25 `initialize`
+//!   handshake. Every POST carries one JSON-RPC message and is answered with
+//!   `application/json`.
 //!   Tools reuse the existing HTTP handlers (`api::customer`, `proxy::handle`)
 //!   through internal requests, so admission, limits, metering, fallbacks and
 //!   model policy are identical to the HTTP API.
@@ -21,29 +24,44 @@ use crate::{
 use axum::{
     Json,
     body::{Body, to_bytes},
-    http::{HeaderValue, Method, Request, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
 pub use tools::requires_api_key;
 
-/// Protocol revisions this server speaks, newest first.
-pub const SUPPORTED_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
+/// The stateless protocol revision (per-request `_meta`, no handshake).
+pub const MODERN_VERSION: &str = "2026-07-28";
+/// The only handshake-era revision still served (`initialize`).
+pub const LEGACY_VERSION: &str = "2025-11-25";
+/// Every revision this server speaks, newest first.
+pub const SUPPORTED_VERSIONS: [&str; 2] = [MODERN_VERSION, LEGACY_VERSION];
+/// Freshness hint for `tools/list` and `server/discover` results.
+pub(crate) const CACHE_TTL_MS: u64 = 300_000;
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+/// `HeaderMismatchError`.
+const HEADER_MISMATCH: i64 = -32020;
+/// `UnsupportedProtocolVersionError`.
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
-/// Chooses the protocol version for a client's request: its own when
-/// supported, otherwise the newest.
-pub fn negotiate(requested: Option<&str>) -> &'static str {
-    SUPPORTED_VERSIONS
-        .iter()
-        .copied()
-        .find(|v| Some(*v) == requested)
-        .unwrap_or(SUPPORTED_VERSIONS[0])
+pub(crate) const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+pub(crate) const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+pub(crate) const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+pub(crate) const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// The protocol semantics a request is served with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Era {
+    /// 2026-07-28: stateless, per-request `_meta`.
+    Modern,
+    /// 2025-11-25: `initialize` handshake.
+    Legacy,
 }
 
 /// Everything a tool needs to know about the caller.
@@ -133,36 +151,242 @@ impl Output {
     }
 }
 
-/// A JSON-RPC error object.
-struct RpcError {
-    code: i64,
-    message: String,
+/// A JSON-RPC error object plus the HTTP status it is served with.
+#[derive(Debug)]
+pub(crate) struct RpcError {
+    pub code: i64,
+    pub message: String,
+    pub data: Option<Value>,
+    pub status: StatusCode,
 }
 
 impl RpcError {
-    fn new(code: i64, message: impl Into<String>) -> Self {
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
+            data: None,
+            status: StatusCode::OK,
         }
+    }
+
+    /// Serves the error with `400 Bad Request` (malformed or rejected requests).
+    fn bad_request(mut self) -> Self {
+        self.status = StatusCode::BAD_REQUEST;
+        self
+    }
+
+    /// `UnsupportedProtocolVersionError` listing the supported versions.
+    pub fn unsupported_version(requested: &str) -> Self {
+        Self {
+            data: Some(json!({"supported": SUPPORTED_VERSIONS, "requested": requested})),
+            ..Self::new(UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version")
+        }
+        .bad_request()
+    }
+
+    /// A rejected `initialize` (legacy era) names every supported version.
+    pub fn initialize_rejected(requested: &str) -> Self {
+        Self {
+            data: Some(json!({"supported": SUPPORTED_VERSIONS, "requested": requested})),
+            ..Self::new(
+                INVALID_PARAMS,
+                format!(
+                    "Unsupported protocol version; this server supports {}",
+                    SUPPORTED_VERSIONS.join(", ")
+                ),
+            )
+        }
+        .bad_request()
+    }
+
+    /// A modern request that does not carry the required `_meta` fields.
+    pub fn missing_meta(message: impl Into<String>) -> Self {
+        Self::new(INVALID_PARAMS, message).bad_request()
+    }
+
+    pub fn method_not_found(method: &str) -> Self {
+        Self::new(METHOD_NOT_FOUND, format!("Method not found: {method}")).not_found()
+    }
+
+    fn not_found(mut self) -> Self {
+        self.status = StatusCode::NOT_FOUND;
+        self
+    }
+
+    pub fn to_json(&self, id: Value) -> Value {
+        let mut error = json!({"code": self.code, "message": self.message});
+        if let Some(data) = &self.data {
+            error["data"] = data.clone();
+        }
+        json!({"jsonrpc": "2.0", "id": id, "error": error})
     }
 }
 
-fn rpc_response(
-    status: StatusCode,
-    id: Value,
-    outcome: std::result::Result<Value, RpcError>,
-) -> Response {
-    let body = match outcome {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(e) => {
-            json!({"jsonrpc": "2.0", "id": id, "error": {"code": e.code, "message": e.message}})
-        }
-    };
-    (status, Json(body)).into_response()
+fn rpc_response(id: Value, outcome: std::result::Result<Value, RpcError>) -> Response {
+    match outcome {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": result})),
+        )
+            .into_response(),
+        Err(e) => (e.status, Json(e.to_json(id))).into_response(),
+    }
 }
 
-/// `Origin` must be this deployment (or the configured CORS origin); other
+/// The version a request declares in `_meta`, if any.
+pub(crate) fn meta_version(params: &Value) -> std::result::Result<Option<&str>, RpcError> {
+    let invalid = |m: &str| RpcError::missing_meta(m.to_owned());
+    match params.get("_meta") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(meta)) => match meta.get(META_VERSION) {
+            None => Ok(None),
+            Some(Value::String(v)) => Ok(Some(v)),
+            Some(_) => Err(invalid(&format!("{META_VERSION} must be a string"))),
+        },
+        Some(_) => Err(invalid("_meta must be an object")),
+    }
+}
+
+/// Checks the remaining required per-request `_meta` fields of a modern
+/// request: `clientCapabilities` (an object) and, when present, `clientInfo`.
+pub(crate) fn validate_meta(params: &Value) -> std::result::Result<(), RpcError> {
+    let meta = &params["_meta"];
+    if !meta[META_CLIENT_CAPABILITIES].is_object() {
+        return Err(RpcError::missing_meta(format!(
+            "_meta.{META_CLIENT_CAPABILITIES} is required and must be an object"
+        )));
+    }
+    if let Some(info) = meta.get(META_CLIENT_INFO)
+        && !(info["name"].is_string() && info["version"].is_string())
+    {
+        return Err(RpcError::missing_meta(format!(
+            "_meta.{META_CLIENT_INFO} needs string name and version"
+        )));
+    }
+    Ok(())
+}
+
+/// Turns a tool or list payload into a complete result: `resultType` plus the
+/// server's identity in `_meta`.
+pub(crate) fn complete(mut result: Value, server_info: &Value) -> Value {
+    result["resultType"] = json!("complete");
+    if !result["_meta"].is_object() {
+        result["_meta"] = json!({});
+    }
+    result["_meta"][META_SERVER_INFO] = server_info.clone();
+    result
+}
+
+/// Adds the caching hints of a cacheable result.
+pub(crate) fn cacheable(mut result: Value, ttl_ms: u64) -> Value {
+    result["ttlMs"] = json!(ttl_ms);
+    result["cacheScope"] = json!("public");
+    result
+}
+
+/// Encodes a header value for `Mcp-Name`: plain when it is safe ASCII,
+/// otherwise the `=?base64?...?=` sentinel form.
+pub(crate) fn encode_header_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.trim() == value
+        && value.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+        && !(value.starts_with("=?base64?") && value.ends_with("?="));
+    if plain {
+        value.to_owned()
+    } else {
+        format!("=?base64?{}?=", STANDARD.encode(value))
+    }
+}
+
+/// Inverse of [`encode_header_value`]. Returns `None` for malformed sentinel values.
+fn decode_header_value(value: &str) -> Option<String> {
+    match value
+        .strip_prefix("=?base64?")
+        .and_then(|v| v.strip_suffix("?="))
+    {
+        Some(encoded) => String::from_utf8(STANDARD.decode(encoded).ok()?).ok(),
+        None => Some(value.to_owned()),
+    }
+}
+
+fn server_info(config: &Config) -> Value {
+    json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "title": config.branding.name,
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+fn header_mismatch(message: impl Into<String>) -> RpcError {
+    RpcError::new(HEADER_MISMATCH, message).bad_request()
+}
+
+/// Chooses the era for a request and validates the transport headers that
+/// go with it.
+///
+/// - `initialize` without modern `_meta` opens the legacy era.
+/// - Every other request must carry `MCP-Protocol-Version`; when `_meta`
+///   carries the version too, the two must agree. The version then picks the
+///   era: 2026-07-28 needs the full modern `_meta` and the `Mcp-Method` /
+///   `Mcp-Name` headers, 2025-11-25 is served with legacy semantics, and any
+///   other value is an `UnsupportedProtocolVersionError`.
+fn route(headers: &HeaderMap, method: &str, params: &Value) -> std::result::Result<Era, RpcError> {
+    let header = |name: &str| -> std::result::Result<Option<&str>, RpcError> {
+        match headers.get(name) {
+            None => Ok(None),
+            Some(v) => v
+                .to_str()
+                .map(Some)
+                .map_err(|_| header_mismatch(format!("Malformed {name} header"))),
+        }
+    };
+    let declared = meta_version(params)?;
+    if method == "initialize" && declared.is_none() {
+        return Ok(Era::Legacy);
+    }
+    let Some(version) = header("mcp-protocol-version")? else {
+        return Err(header_mismatch(
+            "The MCP-Protocol-Version header is required",
+        ));
+    };
+    if let Some(declared) = declared
+        && declared != version
+    {
+        return Err(header_mismatch(format!(
+            "Header mismatch: MCP-Protocol-Version header value '{version}' does not match \
+             body value '{declared}'"
+        )));
+    }
+    match version {
+        LEGACY_VERSION => Ok(Era::Legacy),
+        MODERN_VERSION => {
+            if declared.is_none() {
+                return Err(RpcError::missing_meta(format!(
+                    "_meta.{META_VERSION} is required"
+                )));
+            }
+            if header("mcp-method")? != Some(method) {
+                return Err(header_mismatch(format!(
+                    "Header mismatch: Mcp-Method header must be '{method}'"
+                )));
+            }
+            if method == "tools/call"
+                && let Some(name) = params["name"].as_str()
+                && header("mcp-name")?.and_then(decode_header_value).as_deref() != Some(name)
+            {
+                return Err(header_mismatch(format!(
+                    "Header mismatch: Mcp-Name header must be '{name}'"
+                )));
+            }
+            validate_meta(params)?;
+            Ok(Era::Modern)
+        }
+        other => Err(RpcError::unsupported_version(other)),
+    }
+}
+
+/// `Origin` must be this deployment or the configured CORS origin. Other
 /// origins are refused so a web page cannot drive a local or private server
 /// through the user's browser (DNS rebinding).
 fn origin_allowed(config: &Config, origin: &str) -> bool {
@@ -217,31 +441,18 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
             "Origin is not allowed to use this MCP endpoint",
         ));
     }
-    if let Some(version) = headers.get("mcp-protocol-version")
-        && !version
-            .to_str()
-            .is_ok_and(|v| SUPPORTED_VERSIONS.contains(&v))
-    {
-        return Err(Error::bad(format!(
-            "Unsupported MCP-Protocol-Version; supported: {}",
-            SUPPORTED_VERSIONS.join(", ")
-        )));
-    }
     // Invalid credentials fail the whole request (and count against the
     // per-IP auth-failure budget in `web::route`).
     let identity = identity::authenticate(app, headers, Scope::Manage).await?;
     let bearer = identity::token(headers).map(str::to_owned);
+    let headers = headers.clone();
 
     let limit = config.mcp.max_media_bytes.saturating_mul(4) / 3 + 256 * 1024;
     let bytes = to_bytes(req.into_body(), limit)
         .await
         .map_err(|_| Error::too_large("MCP message exceeds the configured size limit"))?;
     let bad = |code, message: &str| {
-        rpc_response(
-            StatusCode::BAD_REQUEST,
-            Value::Null,
-            Err(RpcError::new(code, message)),
-        )
+        rpc_response(Value::Null, Err(RpcError::new(code, message).bad_request()))
     };
     let message: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -274,7 +485,6 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
         Some(p) if p.is_object() => p.clone(),
         Some(_) => {
             return Ok(rpc_response(
-                StatusCode::OK,
                 id,
                 Err(RpcError::new(INVALID_PARAMS, "params must be an object")),
             ));
@@ -286,11 +496,18 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
         bearer,
         identity,
     };
-    let outcome = dispatch(&ctx, &config, method, &params).await;
-    Ok(rpc_response(StatusCode::OK, id, outcome))
+    let outcome = match route(&headers, method, &params) {
+        Err(e) => Err(e),
+        Ok(Era::Legacy) => legacy_dispatch(&ctx, &config, method, &params).await,
+        Ok(Era::Modern) => modern_dispatch(&ctx, &config, method, &params)
+            .await
+            .map(|result| complete(result, &server_info(&config))),
+    };
+    Ok(rpc_response(id, outcome))
 }
 
-async fn dispatch(
+/// 2025-11-25 semantics: no `resultType`, no caching hints.
+async fn legacy_dispatch(
     ctx: &Ctx,
     config: &Config,
     method: &str,
@@ -301,40 +518,82 @@ async fn dispatch(
             let requested = params["protocolVersion"]
                 .as_str()
                 .ok_or_else(|| RpcError::new(INVALID_PARAMS, "protocolVersion is required"))?;
+            if requested != LEGACY_VERSION {
+                return Err(RpcError::initialize_rejected(requested));
+            }
             Ok(json!({
-                "protocolVersion": negotiate(Some(requested)),
+                "protocolVersion": LEGACY_VERSION,
                 "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {
-                    "name": env!("CARGO_PKG_NAME"),
-                    "title": config.branding.name,
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
+                "serverInfo": server_info(config),
                 "instructions": tools::instructions(config),
             }))
         }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools::definitions()})),
-        "tools/call" => {
-            let name = params["name"]
-                .as_str()
-                .ok_or_else(|| RpcError::new(INVALID_PARAMS, "name is required"))?;
-            if !tools::exists(name) {
-                return Err(RpcError::new(
-                    INVALID_PARAMS,
-                    format!("Unknown tool: {name}"),
-                ));
-            }
-            let arguments = params.get("arguments").unwrap_or(&Value::Null);
-            Ok(match tools::call(ctx, name, arguments).await {
-                Ok(output) => output.result(),
-                Err(e) => e.result(),
-            })
-        }
+        "tools/call" => call_tool(ctx, params).await,
         other => Err(RpcError::new(
             METHOD_NOT_FOUND,
             format!("Method not found: {other}"),
         )),
     }
+}
+
+/// 2026-07-28 semantics. There is no `ping`, `initialize`, or subscription
+/// support. The server only offers tools.
+async fn modern_dispatch(
+    ctx: &Ctx,
+    config: &Config,
+    method: &str,
+    params: &Value,
+) -> std::result::Result<Value, RpcError> {
+    match method {
+        "server/discover" => Ok(cacheable(
+            json!({
+                "supportedVersions": SUPPORTED_VERSIONS,
+                "capabilities": {"tools": {}},
+                "instructions": tools::instructions(config),
+            }),
+            CACHE_TTL_MS,
+        )),
+        "tools/list" => {
+            // The list is a single page: no cursor can be valid.
+            if params.get("cursor").is_some_and(|c| !c.is_null()) {
+                return Err(RpcError::new(INVALID_PARAMS, "Invalid cursor"));
+            }
+            Ok(cacheable(
+                json!({"tools": tools::definitions()}),
+                CACHE_TTL_MS,
+            ))
+        }
+        "tools/call" => call_tool(ctx, params).await,
+        "initialize" => Err(RpcError::new(
+            METHOD_NOT_FOUND,
+            format!(
+                "Method not found: initialize; this request uses protocol {MODERN_VERSION}, which \
+                 has no handshake (supported versions: {})",
+                SUPPORTED_VERSIONS.join(", ")
+            ),
+        )
+        .not_found()),
+        other => Err(RpcError::method_not_found(other)),
+    }
+}
+
+async fn call_tool(ctx: &Ctx, params: &Value) -> std::result::Result<Value, RpcError> {
+    let name = params["name"]
+        .as_str()
+        .ok_or_else(|| RpcError::new(INVALID_PARAMS, "name is required"))?;
+    if !tools::exists(name) {
+        return Err(RpcError::new(
+            INVALID_PARAMS,
+            format!("Unknown tool: {name}"),
+        ));
+    }
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+    Ok(match tools::call(ctx, name, arguments).await {
+        Ok(output) => output.result(),
+        Err(e) => e.result(),
+    })
 }
 
 /// Builds an internal request carrying the caller's credential.
@@ -353,4 +612,110 @@ pub(crate) fn internal(
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
     builder.body(body).map_err(Error::internal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_values_round_trip() {
+        for value in [
+            "list_plans",
+            "with space",
+            " padded ",
+            "line1\nline2",
+            "Hello, 世界",
+            "=?base64?literal?=",
+            "",
+        ] {
+            let encoded = encode_header_value(value);
+            assert!(
+                encoded.bytes().all(|b| b == b' ' || b.is_ascii_graphic()),
+                "{encoded}"
+            );
+            assert_eq!(decode_header_value(&encoded).as_deref(), Some(value));
+        }
+        assert_eq!(encode_header_value("list_plans"), "list_plans");
+        // Spec examples.
+        assert_eq!(
+            encode_header_value("Hello, 世界"),
+            "=?base64?SGVsbG8sIOS4lueVjA==?="
+        );
+        assert_eq!(encode_header_value(" padded "), "=?base64?IHBhZGRlZCA=?=");
+        assert_eq!(
+            encode_header_value("=?base64?literal?="),
+            "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?="
+        );
+        assert_eq!(decode_header_value("=?base64?!!?="), None);
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        map
+    }
+
+    fn modern_params(extra: Value) -> Value {
+        let mut params = json!({"_meta": {
+            META_VERSION: MODERN_VERSION,
+            META_CLIENT_CAPABILITIES: {},
+        }});
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        params
+    }
+
+    #[test]
+    fn era_is_chosen_from_meta_headers_and_initialize() {
+        let modern = [
+            ("mcp-protocol-version", MODERN_VERSION),
+            ("mcp-method", "tools/list"),
+        ];
+        let route = |h: &[(&'static str, &str)], m: &str, p: &Value| {
+            route(&headers(h), m, p).map_err(|e| (e.code, e.status))
+        };
+        let params = modern_params(json!({}));
+        assert_eq!(route(&modern, "tools/list", &params), Ok(Era::Modern));
+        // `initialize` without modern `_meta` opens the legacy era, headerless.
+        assert_eq!(route(&[], "initialize", &json!({})), Ok(Era::Legacy));
+        let legacy = [("mcp-protocol-version", LEGACY_VERSION)];
+        assert_eq!(route(&legacy, "tools/list", &json!({})), Ok(Era::Legacy));
+        let bad = StatusCode::BAD_REQUEST;
+        assert_eq!(route(&[], "tools/list", &json!({})), Err((-32020, bad)));
+        assert_eq!(route(&modern, "tools/list", &json!({})), Err((-32602, bad)));
+        let old = [("mcp-protocol-version", "2025-06-18")];
+        assert_eq!(route(&old, "tools/list", &json!({})), Err((-32022, bad)));
+        let mut mismatched = params.clone();
+        mismatched["_meta"][META_VERSION] = json!(LEGACY_VERSION);
+        assert_eq!(
+            route(&modern, "tools/list", &mismatched),
+            Err((-32020, bad))
+        );
+        let wrong_method = [
+            ("mcp-protocol-version", MODERN_VERSION),
+            ("mcp-method", "tools/call"),
+        ];
+        assert_eq!(
+            route(&wrong_method, "tools/list", &params),
+            Err((-32020, bad))
+        );
+    }
+
+    #[test]
+    fn complete_adds_result_type_and_identity() {
+        let info = json!({"name": "x", "version": "1"});
+        let result = complete(json!({"_meta": {"a": 1}, "isError": false}), &info);
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["_meta"]["a"], 1);
+        assert_eq!(result["_meta"][META_SERVER_INFO], info);
+        let list = cacheable(json!({"tools": []}), 5);
+        assert_eq!(
+            (list["ttlMs"].clone(), list["cacheScope"].clone()),
+            (json!(5), json!("public"))
+        );
+    }
 }
