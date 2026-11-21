@@ -106,17 +106,12 @@ impl Multipart {
                     // Closing boundary: inject the configured model part when
                     // the client never supplied one.
                     if self.inject && !self.model_seen {
-                        if self.leading_crlf {
-                            // Reuse the leading CRLF as the separator before
-                            // the injected part.
-                            out.extend_from_slice(b"\r\n");
-                        } else {
-                            // Empty body: open the injected part with the
-                            // marker that is already buffered.
-                            out.extend_from_slice(&self.buf[..tail]);
-                        }
+                        // Open a new part (delimiter line, then headers)
+                        // before the closing delimiter.
+                        out.extend_from_slice(&self.buf[..start]);
+                        out.extend_from_slice(&self.marker);
                         out.extend_from_slice(
-                            b"Content-Disposition: form-data; name=\"model\"\r\n\r\n",
+                            b"\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n",
                         );
                         out.extend_from_slice(&self.model);
                         out.extend_from_slice(b"\r\n");
@@ -327,13 +322,34 @@ mod tests {
         b.extend_from_slice(b"AUDIO");
         b.extend_from_slice(b"\r\n--b--\r\n");
         let out = rewrite(&[b], "configured", true, true);
-        let s = String::from_utf8_lossy(&out);
-        assert!(
-            s.contains(
-                "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nconfigured\r\n--b--\r\n"
-            ),
-            "{s}"
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nAUDIO\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nconfigured\r\n--b--\r\n"
         );
+        // A body without parts gains exactly one model part.
+        let out = rewrite(&[b"--b--\r\n".to_vec()], "configured", true, true);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nconfigured\r\n--b--\r\n"
+        );
+    }
+    #[test]
+    fn injected_body_is_identical_for_every_split() {
+        let body =
+            b"--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nX\r\n--b--\r\n".to_vec();
+        let expected = rewrite(std::slice::from_ref(&body), "configured", false, true);
+        assert!(String::from_utf8_lossy(&expected).contains(
+            "X\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nconfigured\r\n--b--"
+        ));
+        for split in 1..body.len() {
+            let chunks = vec![body[..split].to_vec(), body[split..].to_vec()];
+            assert_eq!(
+                rewrite(&chunks, "configured", false, true),
+                expected,
+                "split {split}"
+            );
+        }
     }
     #[test]
     fn default_fills_missing_but_keeps_client_model() {
