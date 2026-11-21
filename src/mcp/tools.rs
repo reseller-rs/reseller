@@ -203,7 +203,7 @@ const SECRET_WARNING: &str = "The credentials in the result are shown ONCE and c
 
 /// Every tool with its schema, annotations and auth requirement.
 pub(super) fn definitions() -> Vec<Value> {
-    let audio_formats = ["mp3", "wav", "opus", "aac", "flac", "pcm"];
+    let audio_formats = ["wav", "mp3", "opus", "aac", "flac", "pcm"];
     vec![
         tool(
             "generate_text",
@@ -240,13 +240,18 @@ pub(super) fn definitions() -> Vec<Value> {
         tool(
             "generate_speech",
             "Generate speech",
-            "Convert text to speech. Returns an audio content block (base64) and the billed cost.",
+            "Convert text to speech. Returns an audio content block (base64, WAV by default) and the billed cost.",
             object(
                 json!({
                     "text": {"type": "string", "minLength": 1, "maxLength": 4096},
                     "voice": {"type": "string", "minLength": 1, "maxLength": 100},
                     "model": {"type": "string", "minLength": 1, "maxLength": 200},
-                    "format": {"type": "string", "enum": audio_formats, "default": "mp3"},
+                    "format": {
+                        "type": "string",
+                        "enum": audio_formats,
+                        "default": "wav",
+                        "description": "wav is built from upstream pcm and works with every provider. Other formats are passed to the provider as is.",
+                    },
                 }),
                 &["text"],
             ),

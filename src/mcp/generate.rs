@@ -17,6 +17,7 @@ const MAX_TEXT_CHARS: usize = 200_000;
 
 struct Reply {
     request_id: Option<String>,
+    content_type: Option<String>,
     body: Bytes,
 }
 
@@ -39,6 +40,11 @@ async fn send(ctx: &Ctx, req: Request<Body>, cap: usize) -> Result<Reply, ToolEr
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let content_type = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     // The proxy settles the request before it closes the body, so once the
     // body has been read the billing row is final.
     let body = to_bytes(body, cap).await.map_err(|_| {
@@ -51,7 +57,11 @@ async fn send(ctx: &Ctx, req: Request<Body>, cap: usize) -> Result<Reply, ToolEr
     if !parts.status.is_success() {
         return Err(upstream_error(parts.status, &body, request_id.as_deref()));
     }
-    Ok(Reply { request_id, body })
+    Ok(Reply {
+        request_id,
+        content_type,
+        body,
+    })
 }
 
 fn upstream_error(status: StatusCode, body: &[u8], request_id: Option<&str>) -> ToolError {
@@ -219,26 +229,33 @@ pub(super) async fn text(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolErr
     })
 }
 
+/// Speech formats offered to MCP clients, with their MIME types.
+const SPEECH_FORMATS: [(&str, &str); 6] = [
+    ("wav", "audio/wav"),
+    ("mp3", "audio/mpeg"),
+    ("opus", "audio/ogg"),
+    ("aac", "audio/aac"),
+    ("flac", "audio/flac"),
+    ("pcm", "audio/pcm"),
+];
+
+/// Generates speech. The default format is `wav`, built from upstream `pcm`
+/// (16-bit little-endian samples), because every OpenAI-compatible speech
+/// API supports `pcm` while some, such as Gemini TTS, support nothing else.
+/// The result is playable everywhere, and the billed request is unchanged.
 pub(super) async fn speech(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolError> {
-    const FORMATS: [(&str, &str); 6] = [
-        ("mp3", "audio/mpeg"),
-        ("wav", "audio/wav"),
-        ("opus", "audio/ogg"),
-        ("aac", "audio/aac"),
-        ("flac", "audio/flac"),
-        ("pcm", "audio/pcm"),
-    ];
     let a = Args::new(arguments, &["text", "voice", "model", "format"])?;
     let format = a
-        .one_of("format", &FORMATS.map(|(f, _)| f))?
-        .unwrap_or("mp3");
-    let mime = FORMATS
+        .one_of("format", &SPEECH_FORMATS.map(|(f, _)| f))?
+        .unwrap_or("wav");
+    let mime = SPEECH_FORMATS
         .iter()
         .find(|(f, _)| *f == format)
-        .map_or("audio/mpeg", |(_, m)| m);
+        .map_or("audio/wav", |(_, m)| m);
+    let upstream_format = if format == "wav" { "pcm" } else { format };
     let mut body = json!({
         "input": a.required_str("text", 1, 4096)?,
-        "response_format": format,
+        "response_format": upstream_format,
     });
     if let Some(voice) = a.str("voice", 1, 100)? {
         body["voice"] = voice.into();
@@ -254,19 +271,78 @@ pub(super) async fn speech(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolE
             "The provider returned no audio",
         ));
     }
+    let audio = if format == "wav" {
+        pcm_to_wav(reply.content_type.as_deref(), &reply.body)?
+    } else {
+        reply.body.to_vec()
+    };
     let billing = billing(ctx, reply.request_id.as_deref()).await?;
     Ok(Output {
         content: vec![
-            json!({"type": "audio", "data": STANDARD.encode(&reply.body), "mimeType": mime}),
+            json!({"type": "audio", "data": STANDARD.encode(&audio), "mimeType": mime}),
             json!({"type": "text", "text": billing_line(&billing)}),
         ],
         structured: Some(json!({
             "format": format,
             "mime_type": mime,
-            "bytes": reply.body.len(),
+            "bytes": audio.len(),
             "billing": billing,
         })),
     })
+}
+
+/// Wraps 16-bit PCM in a WAV header. The sample rate and channel count come
+/// from the `rate` and `channels` Content-Type parameters (for example
+/// `audio/pcm;rate=24000;channels=1`). Without them, OpenAI's PCM layout
+/// applies: 24 kHz mono. A body that is already WAV is returned unchanged.
+fn pcm_to_wav(content_type: Option<&str>, pcm: &[u8]) -> Result<Vec<u8>, ToolError> {
+    if pcm.starts_with(b"RIFF") {
+        return Ok(pcm.to_vec());
+    }
+    let param = |name: &str| -> Option<u32> {
+        content_type?.split(';').skip(1).find_map(|p| {
+            let (key, value) = p.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().trim_matches('"').parse().ok())
+                .flatten()
+        })
+    };
+    let invalid = || {
+        ToolError::new(
+            "invalid_upstream_response",
+            "The provider returned PCM audio that cannot be converted to WAV",
+        )
+    };
+    let rate = param("rate").unwrap_or(24_000);
+    let channels = param("channels").unwrap_or(1);
+    let channels = u16::try_from(channels)
+        .ok()
+        .filter(|c| (1..=8).contains(c))
+        .ok_or_else(invalid)?;
+    if !(8_000..=192_000).contains(&rate) {
+        return Err(invalid());
+    }
+    let block_align = channels * 2;
+    let data_len = u32::try_from(pcm.len()).map_err(|_| invalid())?;
+    if !pcm.len().is_multiple_of(usize::from(block_align)) || data_len > u32::MAX - 36 {
+        return Err(invalid());
+    }
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // integer PCM
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    Ok(wav)
 }
 
 /// A conservative MIME type from the file extension.

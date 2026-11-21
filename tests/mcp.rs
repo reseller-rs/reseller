@@ -1174,7 +1174,7 @@ async fn generate_speech_returns_audio_and_is_billed_by_characters() {
         .tool(
             Some(t.api_key()),
             "generate_speech",
-            json!({"text":"héllo 世界!","voice":"alloy"}),
+            json!({"text":"héllo 世界!","voice":"alloy","format":"mp3"}),
         )
         .await;
     assert_eq!(r["isError"], false, "{r}");
@@ -1198,13 +1198,20 @@ async fn generate_speech_returns_audio_and_is_billed_by_characters() {
     assert_eq!(rows[0].get::<String, _>("kind"), "tts");
 
     let r = t
-        .tool(
-            Some(t.api_key()),
-            "generate_speech",
-            json!({"text":"x","format":"wav"}),
-        )
+        .tool(Some(t.api_key()), "generate_speech", json!({"text":"x"}))
         .await;
+    // The default is WAV, built from upstream PCM (24 kHz mono by default).
     assert_eq!(r["content"][0]["mimeType"], "audio/wav");
+    assert_eq!(r["structuredContent"]["format"], "wav");
+    let wav = STANDARD
+        .decode(r["content"][0]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&wav[..4], b"RIFF");
+    assert_eq!(&wav[44..], &audio[..]);
+    assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 24_000);
+    assert_eq!(r["structuredContent"]["bytes"], audio.len() + 44);
+    let body: Value = serde_json::from_slice(&seen.lock().unwrap()[1].1).unwrap();
+    assert_eq!(body["response_format"], "pcm");
     for arguments in [
         json!({"text":"x","format":"ogg"}),
         json!({"text":""}),
@@ -1215,6 +1222,45 @@ async fn generate_speech_returns_audio_and_is_billed_by_characters() {
             .await;
         assert_eq!(error_code(&r), "invalid_arguments");
     }
+}
+
+#[tokio::test]
+async fn generate_speech_wraps_pcm_using_the_declared_layout() {
+    let mut t = Test::new().await;
+    t.mock(
+        tts,
+        Router::new().fallback(any(|body: axum::body::Bytes| async move {
+            let format: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(format["response_format"], "pcm");
+            // Odd-length input produces PCM that is not whole 16-bit stereo frames.
+            let samples = if format["input"] == "odd" { 6 } else { 8 };
+            let mut response = Response::new(Body::from(vec![5u8; samples]));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("audio/pcm; rate=16000; channels=2"),
+            );
+            response
+        })),
+    )
+    .await;
+    let r = t
+        .tool(Some(t.api_key()), "generate_speech", json!({"text":"ok"}))
+        .await;
+    assert_eq!(r["isError"], false, "{r}");
+    let wav = STANDARD
+        .decode(r["content"][0]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(wav.len(), 52);
+    assert_eq!(&wav[8..16], b"WAVEfmt ");
+    assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2, "channels");
+    assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+    assert_eq!(u32::from_le_bytes(wav[28..32].try_into().unwrap()), 64_000);
+    assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 8);
+
+    let r = t
+        .tool(Some(t.api_key()), "generate_speech", json!({"text":"odd"}))
+        .await;
+    assert_eq!(error_code(&r), "invalid_upstream_response");
 }
 
 #[tokio::test]
@@ -1927,7 +1973,9 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
     assert_eq!(entry["key_id"], key_id);
 
     // Media is saved locally and announced.
-    let speech = b.tool("generate_speech", json!({"text":"hello"})).await;
+    let speech = b
+        .tool("generate_speech", json!({"text":"hello","format":"mp3"}))
+        .await;
     let blocks = speech["content"].as_array().unwrap();
     assert_eq!(blocks[0]["type"], "audio");
     let saved = blocks
@@ -1938,7 +1986,9 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
     let path = std::path::Path::new(saved);
     assert!(path.starts_with(&b.output) && path.extension().unwrap() == "mp3");
     assert_eq!(std::fs::read(path).unwrap(), vec![1u8, 2, 3]);
-    let second = b.tool("generate_speech", json!({"text":"hello"})).await;
+    let second = b
+        .tool("generate_speech", json!({"text":"hello","format":"mp3"}))
+        .await;
     let second = second["content"]
         .as_array()
         .unwrap()
