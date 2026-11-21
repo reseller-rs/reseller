@@ -7,6 +7,7 @@ use crate::{
     error::{Error, Result},
     identity::{Identity, hash, secret},
     money,
+    security::pow,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -151,9 +152,12 @@ async fn mint(conn: &mut SqliteConnection, config: &Config, key: NewKey<'_>) -> 
 /// Who is asking for a new key.
 #[derive(Clone, Copy, Debug)]
 pub enum Requester<'a> {
-    /// Self-service signup (`None`) or a signed-in customer creating a child
-    /// key; subject to creation guards.
-    Public(Option<&'a Identity>),
+    /// Anonymous self-service signup: opens an account with trial credit.
+    /// `altcha` is the base64 proof-of-work solution (required unless
+    /// `signup.pow_max_number` is 0).
+    Signup { altcha: Option<&'a str> },
+    /// A signed-in customer creating a child key; subject to creation guards.
+    Customer(&'a Identity),
     /// Administrator issuing a key on an existing account; bypasses guards
     /// and may set custom limits.
     Admin { account: &'a str },
@@ -162,10 +166,32 @@ pub enum Requester<'a> {
 /// Creates a key, and a new account with trial credit for anonymous signups.
 pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value) -> Result<Value> {
     let config = app.config().await;
+    let proof = match requester {
+        Requester::Signup { altcha } => {
+            if !config.signup.enabled {
+                return Err(Error::forbidden(
+                    "signup_disabled",
+                    "Self-service signup is disabled",
+                ));
+            }
+            match config.signup.pow_max_number {
+                0 => None,
+                max => {
+                    let payload = altcha.ok_or_else(|| {
+                        Error::bad("Solve the proof-of-work challenge to sign up")
+                            .with_code("pow_required")
+                    })?;
+                    Some(pow::verify(&config.key_pepper, payload, max, now())?)
+                }
+            }
+        }
+        _ => None,
+    };
     let mut tx = db::write(&app.db).await?;
     let (identity, existing) = match requester {
-        Requester::Public(identity) => (identity, identity.map(|i| i.account_id.clone())),
+        Requester::Customer(identity) => (Some(identity), Some(identity.account_id.clone())),
         Requester::Admin { account } => (None, Some(account.to_owned())),
+        Requester::Signup { .. } => (None, None),
     };
     let admin = matches!(requester, Requester::Admin { .. });
     let mut bypass_ip = admin;
@@ -184,7 +210,7 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
         .bind(account)
         .fetch_one(&mut *tx)
         .await?;
-        if active >= i64::from(config.max_keys_per_account) {
+        if active >= i64::from(config.keys.max_per_account) {
             return Err(Error::too_many(
                 "account_key_limit",
                 "Account key limit reached",
@@ -202,6 +228,12 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     if !admin {
         check_creation_guards(&mut tx, &config, identity, ip, bypass_ip).await?;
     }
+    if let Some(account) = identity.map(|i| i.account_id.as_str()) {
+        check_daily_budget(&mut tx, &config, account).await?;
+    }
+    if let Some(proof) = &proof {
+        spend_proof(&mut tx, proof).await?;
+    }
     let account = match existing {
         Some(account) => account,
         None => open_trial_account(&mut tx, &config, ip, body).await?,
@@ -212,7 +244,7 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
             limits.validate()?;
             limits
         }
-        _ => config.default_limits.clone(),
+        _ => config.keys.default_limits.clone(),
     };
     let out = mint(
         &mut tx,
@@ -231,6 +263,82 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     Ok(out)
 }
 
+/// Marks a proof-of-work solution as used (replays fail) and purges spent
+/// records whose challenges have expired anyway. Runs in the same transaction
+/// as the account it pays for, so a failed signup does not burn the solution.
+async fn spend_proof(conn: &mut SqliteConnection, proof: &pow::Verified) -> Result<()> {
+    sqlx::query("DELETE FROM pow_spent WHERE expires_at<=?")
+        .bind(now())
+        .execute(&mut *conn)
+        .await?;
+    let inserted = sqlx::query("INSERT OR IGNORE INTO pow_spent(challenge,expires_at) VALUES(?,?)")
+        .bind(&proof.challenge)
+        .bind(proof.expires)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    if inserted == 0 {
+        return Err(Error::new(
+            StatusCode::CONFLICT,
+            "pow_replayed",
+            "This proof of work was already used; request a new challenge",
+        ));
+    }
+    Ok(())
+}
+
+/// Seconds until the oldest of the `created` rows leaves a `window`.
+fn window_retry(oldest: Option<i64>, window: i64) -> u64 {
+    oldest.map_or(60, |t| (t + window - now()).max(1).unsigned_abs())
+}
+
+/// Global cap on self-service key creations (signup, child keys, rotations).
+async fn check_global_hourly(conn: &mut SqliteConnection, config: &Config) -> Result<()> {
+    let limit = config.signup.global_hourly_limit;
+    if limit == 0 {
+        return Ok(());
+    }
+    let (recent, oldest): (i64, Option<i64>) =
+        sqlx::query_as("SELECT COUNT(*),MIN(created_at) FROM api_keys WHERE created_at>?")
+            .bind(now() - HOUR)
+            .fetch_one(&mut *conn)
+            .await?;
+    if recent >= i64::from(limit) {
+        return Err(
+            Error::too_many("creation_rate_limited", "Key creation hourly limit reached")
+                .retry_after(window_retry(oldest, HOUR)),
+        );
+    }
+    Ok(())
+}
+
+/// Per-account budget of keys created or rotated by the customer in 24 hours.
+async fn check_daily_budget(
+    conn: &mut SqliteConnection,
+    config: &Config,
+    account: &str,
+) -> Result<()> {
+    let limit = config.keys.max_new_per_day;
+    if limit == 0 {
+        return Ok(());
+    }
+    let (recent, oldest): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*),MIN(created_at) FROM api_keys WHERE account_id=? AND created_at>?",
+    )
+    .bind(account)
+    .bind(now() - DAY)
+    .fetch_one(&mut *conn)
+    .await?;
+    if recent >= i64::from(limit) {
+        return Err(Error::too_many(
+            "key_creation_daily_limit",
+            "Daily key creation limit reached for this account",
+        )
+        .retry_after(window_retry(oldest, DAY)));
+    }
+    Ok(())
+}
+
 /// Abuse guards for self-service creation: global hourly cap, child-key cap,
 /// and (unless exempt) the per-IP monthly allowance and cooldown.
 async fn check_creation_guards(
@@ -240,18 +348,7 @@ async fn check_creation_guards(
     ip: &str,
     bypass_ip: bool,
 ) -> Result<()> {
-    if config.global_hourly_limit > 0 {
-        let recent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE created_at>?")
-            .bind(now() - HOUR)
-            .fetch_one(&mut *conn)
-            .await?;
-        if recent >= i64::from(config.global_hourly_limit) {
-            return Err(Error::too_many(
-                "creation_rate_limited",
-                "Key creation hourly limit reached",
-            ));
-        }
-    }
+    check_global_hourly(conn, config).await?;
     if let Some(parent) = identity.filter(|i| !i.dashboard)
         && let Some(max) = parent.limits.max_children
     {
@@ -272,10 +369,11 @@ async fn check_creation_guards(
         return Ok(());
     }
     let limit = config
+        .signup
         .ip_overrides
         .get(ip)
         .copied()
-        .unwrap_or(config.ip_limit_per_month);
+        .unwrap_or(config.signup.ip_limit_per_month);
     if limit > 0 {
         let month = chrono::Utc::now().format("%Y-%m-01 00:00:00").to_string();
         let created: i64 = sqlx::query_scalar(
@@ -293,17 +391,19 @@ async fn check_creation_guards(
             ));
         }
     }
-    if config.cooldown_seconds > 0 {
+    let cooldown = i64::from(config.signup.cooldown_seconds);
+    if cooldown > 0 {
         let last: Option<i64> =
             sqlx::query_scalar("SELECT MAX(created_at) FROM api_keys WHERE created_ip=?")
                 .bind(ip)
                 .fetch_one(&mut *conn)
                 .await?;
-        if last.is_some_and(|t| t + i64::from(config.cooldown_seconds) > now()) {
+        if let Some(t) = last.filter(|t| t + cooldown > now()) {
             return Err(Error::too_many(
                 "creation_cooldown",
                 "Please wait before creating another key",
-            ));
+            )
+            .retry_after(window_retry(Some(t), cooldown)));
         }
     }
     Ok(())
@@ -327,10 +427,10 @@ async fn open_trial_account(
         .bind(ip)
         .execute(&mut *conn)
         .await?;
-    let amount = money::usd(&config.free_credit_usd)?;
+    let amount = money::usd(&config.signup.free_credit_usd)?;
     if amount > 0 {
-        let expires = (config.free_credit_expiry_days > 0)
-            .then(|| now() + i64::from(config.free_credit_expiry_days) * DAY);
+        let expires = (config.signup.free_credit_expiry_days > 0)
+            .then(|| now() + i64::from(config.signup.free_credit_expiry_days) * DAY);
         crate::billing::credit(conn, &account, amount, "free", expires, "").await?;
     }
     Ok(account)
@@ -338,7 +438,8 @@ async fn open_trial_account(
 
 /// Replaces an active key with a fresh one carrying the same name, limits,
 /// markup, and expiry; the old key is blocked. `account` scopes ownership for
-/// customer requests (`None` for administrators).
+/// customer requests (`None` for administrators, who are exempt from the
+/// rotation cooldown and creation budgets).
 pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value> {
     let config = app.config().await;
     let mut tx = db::write(&app.db).await?;
@@ -359,6 +460,19 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
             "Only active keys can be rotated",
         ));
     }
+    if account.is_some() {
+        let cooldown = i64::from(config.keys.rotate_cooldown_seconds);
+        let age = now() - row.get::<i64, _>("created_at");
+        if age < cooldown {
+            return Err(Error::too_many(
+                "rotate_cooldown",
+                "This key was created recently; wait before rotating it",
+            )
+            .retry_after((cooldown - age).unsigned_abs()));
+        }
+        check_global_hourly(&mut tx, &config).await?;
+        check_daily_budget(&mut tx, &config, &aid).await?;
+    }
     // Rotation replaces a key; it must not become a way around the key cap.
     let others: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM api_keys WHERE account_id=? AND status='active' AND id<>?",
@@ -367,7 +481,7 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
     .bind(kid)
     .fetch_one(&mut *tx)
     .await?;
-    if others >= i64::from(config.max_keys_per_account) {
+    if others >= i64::from(config.keys.max_per_account) {
         return Err(Error::too_many(
             "account_key_limit",
             "Account key limit reached",

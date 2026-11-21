@@ -6,7 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
-COPY README.md LICENSE ./
+COPY README.md LICENSE reseller.example.toml ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --locked --release && cp target/release/reseller /reseller

@@ -35,9 +35,17 @@ impl Test {
         let c = Config {
             admin_token: ADMIN.into(),
             key_pepper: "pepper-test-secret-12345678".into(),
-            cooldown_seconds: 0,
-            ip_limit_per_month: 0,
-            global_hourly_limit: 0,
+            signup: reseller::config::Signup {
+                cooldown_seconds: 0,
+                ip_limit_per_month: 0,
+                global_hourly_limit: 0,
+                pow_max_number: 0,
+                ..Default::default()
+            },
+            keys: reseller::config::KeyPolicy {
+                rotate_cooldown_seconds: 0,
+                ..Default::default()
+            },
             ..Config::default()
         };
         let c = db::settings(&pool, c).await.unwrap();
@@ -49,7 +57,7 @@ impl Test {
     async fn key(&self) -> Value {
         keys::create(
             &self.app,
-            keys::Requester::Public(None),
+            keys::Requester::Signup { altcha: None },
             "127.0.0.1",
             &json!({"name":"test"}),
         )
@@ -956,7 +964,7 @@ async fn block_and_reactivate_cycle_is_enforced_across_accounts() {
 #[tokio::test]
 async fn account_key_cap_counts_active_keys_and_rotation_respects_it() {
     let t = Test::new().await;
-    t.app.config_mut().await.max_keys_per_account = 2;
+    t.app.config_mut().await.keys.max_per_account = 2;
     let k1 = t.key().await;
     let token = k1["dashboard_token"].as_str().unwrap();
     let (s, k2) = t
@@ -1577,7 +1585,7 @@ async fn default_limits_apply_to_new_keys_only() {
         .admin(
             "PATCH",
             "settings",
-            json!({"default_limits":{"rpm":3,"allowed_models":["configured"]}}),
+            json!({"keys":{"default_limits":{"rpm":3,"allowed_models":["configured"]}}}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2211,7 +2219,7 @@ async fn overspend_via_proxy_creates_debt_settled_by_admin_topup() {
 #[tokio::test]
 async fn concurrent_rotations_are_serialized_and_only_active_keys_rotate() {
     let t = Test::new().await;
-    t.app.config_mut().await.max_keys_per_account = 3;
+    t.app.config_mut().await.keys.max_per_account = 3;
     let k1 = t.key().await;
     let dash = k1["dashboard_token"].as_str().unwrap().to_owned();
     let (s, k2) = t
@@ -2370,7 +2378,7 @@ async fn public_signup_cannot_choose_limits() {
     let (s, v) = t
         .call(
             "POST",
-            "/v1/keys",
+            "/v1/signup",
             None,
             json!({"name":"anonymous","limits":{"rpm":1,"max_children":99}}),
         )

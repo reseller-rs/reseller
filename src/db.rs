@@ -98,3 +98,17 @@ pub async fn balance(conn: &mut SqliteConnection, account: &str) -> Result<i64> 
     .fetch_one(conn)
     .await?)
 }
+
+/// Closes request rows a previous process left in flight (crash or kill).
+/// Their usage is unknown, so nothing is billed; the rows are recorded as
+/// failed with status 500. Returns how many were closed. Call before
+/// accepting connections, while no request of this process can be running.
+pub async fn close_interrupted_requests(pool: &SqlitePool) -> Result<u64> {
+    let done = sqlx::query(
+        "UPDATE requests SET finished=1,status=500,error='interrupted by server restart' \
+         WHERE finished=0",
+    )
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}

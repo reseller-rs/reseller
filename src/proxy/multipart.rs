@@ -1,10 +1,17 @@
 //! Streaming `multipart/form-data` rewriter that applies the model policy to
 //! uploads (for example speech-to-text) without buffering file payloads.
 
-/// Streaming rewrite of a multipart/form-data body: the `model` form field is
-/// replaced (Force) or injected when missing (Default), while all other parts
-/// — including file payloads — stream through untouched. Opaque multipart
-/// uploads therefore follow the same model policy as JSON requests.
+/// Longest accepted `model` form value, in bytes (matches the allowlist entry
+/// limit).
+pub const MODEL_LIMIT: usize = 256;
+
+/// Streaming parser of a multipart/form-data body. The `model` form field is
+/// replaced (Force) or injected when missing (Default), or left alone
+/// (passthrough: `replace` and `inject` both false), while all other parts
+/// — including file payloads — stream through untouched. Whatever the policy,
+/// the effective model value is reported through [`Multipart::take_models`]
+/// as soon as its part is complete, so it can be metered and checked against
+/// key allowlists before the upload finishes.
 pub struct Multipart {
     marker: Vec<u8>,
     delim: Vec<u8>,
@@ -14,6 +21,10 @@ pub struct Multipart {
     model_seen: bool,
     leading_crlf: bool,
     discard: bool,
+    /// Client value of the model part being read (not replaced).
+    capture: Option<Vec<u8>>,
+    /// Effective model values completed since the last `take_models`.
+    observed: Vec<String>,
     state: Part,
     buf: Vec<u8>,
 }
@@ -37,12 +48,16 @@ impl Multipart {
             model_seen: false,
             leading_crlf: false,
             discard: false,
+            capture: None,
+            observed: Vec::new(),
             state: Part::Preamble,
             buf: Vec::new(),
         }
     }
-    pub fn model_seen(&self) -> bool {
-        self.model_seen
+    /// Effective model values whose parts completed since the last call, in
+    /// body order. An injected model is reported when the body closes.
+    pub fn take_models(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.observed)
     }
     /// Feed one input chunk; returns the bytes that should be forwarded.
     pub fn push(&mut self, chunk: &[u8]) -> std::result::Result<Vec<u8>, String> {
@@ -107,6 +122,8 @@ impl Multipart {
                         out.extend_from_slice(b"\r\n");
                         out.extend_from_slice(&self.marker);
                         out.extend_from_slice(b"--");
+                        self.observed
+                            .push(String::from_utf8_lossy(&self.model).into_owned());
                     } else {
                         out.extend_from_slice(&self.buf[..tail + 2]);
                     }
@@ -137,6 +154,8 @@ impl Multipart {
                     if self.replace {
                         out.extend_from_slice(&self.model);
                         self.discard = true;
+                    } else {
+                        self.capture = Some(Vec::new());
                     }
                 }
                 self.state = Part::Body;
@@ -151,12 +170,22 @@ impl Multipart {
                         if !self.discard {
                             out.extend_from_slice(&self.buf[..cut]);
                         }
+                        self.capture_value(cut)?;
                         self.buf.drain(..cut);
                     }
                     return Ok(false);
                 };
                 if !self.discard {
                     out.extend_from_slice(&self.buf[..i]);
+                }
+                self.capture_value(i)?;
+                if let Some(value) = self.capture.take() {
+                    let value = String::from_utf8(value)
+                        .map_err(|_| "model must be valid UTF-8".to_owned())?;
+                    self.observed.push(value);
+                } else if self.discard {
+                    self.observed
+                        .push(String::from_utf8_lossy(&self.model).into_owned());
                 }
                 self.buf.drain(..i);
                 self.leading_crlf = true;
@@ -168,6 +197,18 @@ impl Multipart {
                 Ok(false)
             }
         }
+    }
+}
+impl Multipart {
+    /// Appends `self.buf[..end]` to the model value being captured.
+    fn capture_value(&mut self, end: usize) -> std::result::Result<(), String> {
+        if let Some(value) = &mut self.capture {
+            value.extend_from_slice(&self.buf[..end]);
+            if value.len() > MODEL_LIMIT {
+                return Err(format!("model exceeds {MODEL_LIMIT} bytes"));
+            }
+        }
+        Ok(())
     }
 }
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -320,6 +361,41 @@ mod tests {
         // Byte-at-a-time streaming must also survive.
         let chunks: Vec<Vec<u8>> = body.iter().map(|b| vec![*b]).collect();
         assert_eq!(rewrite(&chunks, "configured", true, true), expected);
+    }
+    /// The model is reported once its part completes, under every policy and
+    /// every chunking, and passthrough forwards the body byte for byte.
+    #[test]
+    fn model_is_observed_for_every_split_and_policy() {
+        let body = body();
+        for (model, replace, inject, want) in [
+            ("configured", true, true, "configured"),
+            ("configured", false, true, "whisper-1"),
+            ("", false, false, "whisper-1"),
+        ] {
+            for split in 1..body.len() {
+                let mut m = Multipart::new("b", model, replace, inject);
+                let mut out = m.push(&body[..split]).unwrap();
+                let mut seen = m.take_models();
+                out.extend(m.push(&body[split..]).unwrap());
+                out.extend(m.finish());
+                seen.extend(m.take_models());
+                assert_eq!(seen, [want], "split {split}");
+                if !replace && !inject {
+                    assert_eq!(out, body, "passthrough must not rewrite (split {split})");
+                }
+            }
+        }
+    }
+    #[test]
+    fn injected_model_is_observed_and_oversize_is_rejected() {
+        let mut m = Multipart::new("b", "configured", false, true);
+        m.push(b"--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nX\r\n--b--\r\n")
+            .unwrap();
+        assert_eq!(m.take_models(), ["configured"]);
+        let mut m = Multipart::new("b", "", false, false);
+        let mut huge = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n".to_vec();
+        huge.extend(vec![b'x'; MODEL_LIMIT + 32]);
+        assert!(m.push(&huge).is_err());
     }
     #[test]
     fn quoted_boundary_is_parsed() {

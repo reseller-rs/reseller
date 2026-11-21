@@ -9,3 +9,4 @@
 !migrations/**
 !README.md
 !LICENSE
+!reseller.example.toml

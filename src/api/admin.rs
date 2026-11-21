@@ -471,8 +471,8 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
 /// removed.
 const REPLACED_MAPS: [&str; 10] = [
     "/prices",
-    "/ip_overrides",
-    "/default_limits",
+    "/signup/ip_overrides",
+    "/keys/default_limits",
     "/branding/css_vars",
     "/payroof/rate_ids",
     "/payroof/native_rates_usd",

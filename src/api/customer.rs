@@ -5,12 +5,14 @@ use super::{
 use crate::{
     App, billing,
     error::{Error, Result},
-    identity::{self, Scope},
+    identity,
     keys::{self, Requester},
-    payments, stats,
+    payments,
+    security::{self, pow},
+    stats,
 };
 use axum::{body::Body, http::Request};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
     let path = segments(&req, "/v1/");
@@ -25,10 +27,15 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             plans["payment_methods"] = payments::methods(&*app.config().await).into();
             return Ok(plans);
         }
-        (["keys"], "POST") => {
-            let creator = identity::authenticate(app, req.headers(), Scope::Manage).await?;
+        (["signup", "challenge"], "GET") => return signup_challenge(app, ip).await,
+        (["signup"], "POST") => {
             let body = object(req).await?;
-            return keys::create(app, Requester::Public(creator.as_ref()), ip, &body).await;
+            let altcha = match body.get("altcha") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(_) => return Err(Error::bad("altcha must be a string")),
+            };
+            return keys::create(app, Requester::Signup { altcha }, ip, &body).await;
         }
         _ => {}
     }
@@ -40,11 +47,21 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["keys", kid], "PATCH") => {
             patch_key(app, kid, Editor::Customer(account), &object(req).await?).await
         }
+        (["keys"], "POST") => {
+            keys::create(app, Requester::Customer(&me), ip, &object(req).await?).await
+        }
         (["keys", kid, "rotate"], "POST") => keys::rotate(app, kid, Some(account)).await,
         (["account"], "GET") => billing::account(app, account).await,
         (["account", "redeem"], "POST") => {
             let body = object(req).await?;
-            billing::redeem(app, account, text(&body, "code")?).await
+            security::check_redeem(app, account).await?;
+            let redeemed = billing::redeem(app, account, text(&body, "code")?).await;
+            if let Err(e) = &redeemed
+                && e.code == "invalid_code"
+            {
+                security::record_redeem_failure(app, account, ip).await;
+            }
+            redeemed
         }
         (["account", "checkout"], "POST") => {
             payments::checkout(app, &me, &object(req).await?).await
@@ -61,4 +78,26 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["account", "requests"], "GET") => requests(app, Some(account), &q, false).await,
         _ => Err(Error::not_found("not_found", "Unknown customer endpoint")),
     }
+}
+
+/// ALTCHA challenge for anonymous signup (`{"required":false}` when the
+/// proof of work is disabled).
+async fn signup_challenge(app: &App, ip: &str) -> Result<Value> {
+    let config = app.config().await;
+    if !config.signup.enabled {
+        return Err(Error::forbidden(
+            "signup_disabled",
+            "Self-service signup is disabled",
+        ));
+    }
+    if config.signup.pow_max_number == 0 {
+        return Ok(json!({"required": false}));
+    }
+    security::challenge(app, ip).await?;
+    Ok(serde_json::to_value(pow::create(
+        &config.key_pepper,
+        config.signup.pow_max_number,
+        config.signup.pow_ttl_seconds,
+        crate::db::now(),
+    ))?)
 }

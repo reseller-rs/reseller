@@ -16,6 +16,8 @@ pub struct Error {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Seconds a client should wait before retrying (429 responses).
+    pub retry_after: Option<u64>,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -26,7 +28,22 @@ impl Error {
             status,
             code,
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    /// Replaces the machine-readable code.
+    #[must_use]
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
+    }
+
+    /// Sets the `Retry-After` hint, in seconds (at least one).
+    #[must_use]
+    pub fn retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds.max(1));
+        self
     }
 
     /// 400 `invalid_request`.
@@ -94,9 +111,23 @@ impl IntoResponse for Error {
         )
             .into_response();
         if self.status == StatusCode::TOO_MANY_REQUESTS {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from(self.retry_after.unwrap_or(60)),
+            );
+        }
+        if self.status == StatusCode::UNAUTHORIZED {
+            // RFC 6750 section 3: a request without credentials carries no
+            // error attribute; rejected credentials are `invalid_token`.
+            let challenge = if self.code == "missing_api_key" {
+                "Bearer realm=\"reseller\""
+            } else {
+                "Bearer realm=\"reseller\", error=\"invalid_token\""
+            };
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(challenge),
+            );
         }
         response
     }

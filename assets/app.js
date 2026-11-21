@@ -134,6 +134,54 @@ function flashCopied(button) {
   }, 1400);
 }
 
+const ERROR_HINTS = {
+  rotate_cooldown: 'This key was created or rotated too recently to rotate again.',
+  key_creation_daily_limit: 'Daily limit for creating or rotating keys reached.',
+  pow_required: 'Human verification is required. Please try again.',
+  pow_invalid: 'Human verification failed. Please try again.',
+  pow_replayed: 'That verification was already used. Please try again.',
+  signup_disabled: 'Self-service signup is currently disabled.',
+};
+function apiError(r, v) {
+  const code = v?.error?.code || v?.error?.type || '';
+  let message = v?.error?.message || ERROR_HINTS[code] || `Request failed (${r.status})`;
+  const wait = Number.parseInt(r.headers.get('retry-after'), 10);
+  if (r.status === 429) {
+    if (!v?.error?.message && !ERROR_HINTS[code]) message = 'Too many requests. Please slow down.';
+    if (wait > 0) message = `${message.replace(/[.!]?$/, '.')} Try again in ${wait >= 120 ? `${Math.ceil(wait / 60)} minutes` : `${wait} second${wait === 1 ? '' : 's'}`}.`;
+  }
+  return Object.assign(new Error(message), { status: r.status, code, retryAfter: wait > 0 ? wait : null });
+}
+
+/* Proof of work (ALTCHA v1): find n with sha256(salt + n) == challenge. Solved on
+   the main thread in async batches (CSP forbids blob workers), yielding to the UI. */
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+async function solveChallenge(c, onProgress, signal) {
+  if (!globalThis.crypto?.subtle) throw new Error('Human verification needs a secure (HTTPS) connection.');
+  const enc = new TextEncoder();
+  const BATCH = 250;
+  for (let start = 0; start <= c.maxnumber; start += BATCH) {
+    if (signal?.aborted) throw new Error('Verification cancelled.');
+    const end = Math.min(start + BATCH - 1, c.maxnumber);
+    const digests = [];
+    for (let n = start; n <= end; n++) digests.push(crypto.subtle.digest('SHA-256', enc.encode(c.salt + n)));
+    const results = await Promise.all(digests);
+    for (let i = 0; i < results.length; i++) if (hex(results[i]) === c.challenge) return start + i;
+    onProgress?.(Math.min(1, (end + 1) / (c.maxnumber + 1)));
+    await new Promise(r => setTimeout(r));
+  }
+  throw new Error('Could not complete human verification. Please try again.');
+}
+async function signup(fields, onProgress, signal) {
+  const c = await api('/v1/signup/challenge');
+  let altcha;
+  if (c.required !== false) {
+    const number = await solveChallenge(c, onProgress, signal);
+    altcha = btoa(JSON.stringify({ algorithm: c.algorithm, challenge: c.challenge, number, salt: c.salt, signature: c.signature }));
+  }
+  return api('/v1/signup', 'POST', { ...fields, ...(altcha ? { altcha } : {}) });
+}
+
 async function api(path, method = 'GET', data, options = {}) {
   const headers = {};
   if (token) headers[admin ? 'x-admin-token' : 'authorization'] = admin ? token : `Bearer ${token}`;
@@ -141,7 +189,7 @@ async function api(path, method = 'GET', data, options = {}) {
   const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data), signal: options.signal });
   // Proxies and crashes can return non-JSON bodies; surface the status instead of a parse error.
   const v = await r.json().catch(() => null);
-  if (!r.ok) throw new Error(v?.error?.message || `Request failed (${r.status})`);
+  if (!r.ok) throw apiError(r, v);
   if (v === null) throw new Error(`Unexpected response from server (${r.status})`);
   return v;
 }
@@ -316,16 +364,31 @@ function secrets(v) {
 }
 
 function keyForm() {
-  modal('Create an API key', `
+  const signedIn = Boolean(token);
+  modal(signedIn ? 'Create an API key' : 'Create an account', `
     <form>
       <label for="key-name">Key name</label>
       <input id="key-name" name="name" maxlength="80" value="${esc(suggestedName())}" placeholder="My application" required>
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
-      <p class="section">New accounts receive evaluation credit. Additional keys share your existing balance.</p>
+      <p class="field-help">New accounts receive evaluation credit. Additional keys share your existing balance.</p>
+      <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Verifying you're human…</span></div><progress max="100" value="0"></progress></div>
       <div class="actions"><button class="primary" type="submit">Create key →</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
-    const v = await api('/v1/keys', 'POST', b);
+    const pow = d.querySelector('.pow');
+    const bar = pow.querySelector('progress');
+    const ctl = new AbortController();
+    d.addEventListener('close', () => ctl.abort(), { once: true });
+    let v;
+    try {
+      if (signedIn) v = await api('/v1/keys', 'POST', b);
+      else {
+        pow.hidden = false;
+        v = await signup(b, p => { bar.value = Math.round(p * 100); }, ctl.signal);
+      }
+    } finally {
+      pow.hidden = true;
+    }
     d.close();
     secrets(v);
     if (document.querySelector('#content')) await load();

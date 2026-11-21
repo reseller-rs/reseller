@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 #[derive(Parser)]
 #[command(
@@ -65,6 +66,23 @@ enum Command {
     Backup { destination: PathBuf },
     /// Probe the local readiness endpoint (used by the container health check)
     Healthcheck,
+    /// Run a local MCP server on stdio that forwards to a remote reseller
+    /// (credentials and signup proof of work stay on this machine)
+    Mcp {
+        /// Origin of the reseller server, e.g. https://reseller.example.com
+        #[arg(long, env = "RESELLER_URL")]
+        url: String,
+        /// Credential file [default: $XDG_CONFIG_HOME/reseller/credentials.json
+        /// or ~/.config/reseller/credentials.json]
+        #[arg(long, env = "RESELLER_CREDENTIALS")]
+        credentials: Option<PathBuf>,
+        /// Directory where generated audio and images are saved
+        #[arg(long, env = "RESELLER_OUTPUT_DIR", default_value = "reseller-output")]
+        output_dir: PathBuf,
+        /// API key or dashboard token to use without storing it
+        #[arg(long, env = "RESELLER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+    },
     /// Export or replace the stored settings (server must be stopped to import)
     Config {
         #[command(subcommand)]
@@ -86,20 +104,41 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut cli = Cli::parse();
+    // The stdio bridge owns stdout for protocol messages: log to stderr only.
+    let writer = if matches!(cli.command, Some(Command::Mcp { .. })) {
+        BoxMakeWriter::new(std::io::stderr)
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "reseller=info".into()),
         )
         .with_target(false)
+        .with_writer(writer)
         .init();
-    let mut cli = Cli::parse();
     match cli.command.take().unwrap_or(Command::Serve) {
         Command::Token => {
             println!("{}", identity::secret("admin_"));
             Ok(())
         }
         Command::Init => init(&cli.config),
+        Command::Mcp {
+            url,
+            credentials,
+            output_dir,
+            token,
+        } => {
+            reseller::mcp::bridge::run(reseller::mcp::bridge::Options {
+                url,
+                credentials,
+                output_dir,
+                token,
+            })
+            .await
+        }
         Command::Healthcheck => healthcheck(cli.host, cli.port),
         Command::Doctor => {
             let (pool, config) = open(&cli).await?;
@@ -208,7 +247,7 @@ fn init(path: &Path) -> anyhow::Result<()> {
     let mut file = options
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(include_bytes!("../assets/reseller.example.toml"))?;
+    file.write_all(include_bytes!("../reseller.example.toml"))?;
     println!(
         "Created {} with every option documented. Set [llm].api_key, then run reseller.",
         path.display()
@@ -268,6 +307,14 @@ fn doctor(cli: &Cli, config: &Config) {
             println!("Upstream {name}: {} ({model})", upstream.base_url);
         }
     }
+    println!(
+        "Signup: {}",
+        match (config.signup.enabled, config.signup.pow_max_number) {
+            (false, _) => "disabled".to_owned(),
+            (true, 0) => "open (no proof of work)".to_owned(),
+            (true, n) => format!("open (proof of work up to {n})"),
+        }
+    );
     println!("Stripe: {}", state(config.stripe.enabled(), "disabled"));
     println!(
         "Payroof crypto payments: {}",
@@ -286,6 +333,13 @@ fn doctor(cli: &Cli, config: &Config) {
 }
 
 async fn serve(cli: &Cli, app: App) -> anyhow::Result<()> {
+    let interrupted = db::close_interrupted_requests(&app.db).await?;
+    if interrupted > 0 {
+        tracing::warn!(
+            count = interrupted,
+            "closed requests interrupted by the previous shutdown"
+        );
+    }
     let router = web::router(app.clone()).await;
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(cli.host, cli.port))
         .await

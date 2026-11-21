@@ -76,11 +76,6 @@ public_url = "http://localhost:56787"
 # is key -> account -> this global default. "0" bills at upstream cost.
 # markup_pct = "30"
 
-# Credit granted to every new self-service account, and how many days it stays
-# spendable. Use "0" for no trial credit; 0 days means it never expires.
-# free_credit_usd = "0.25"
-# free_credit_expiry_days = 30
-
 # --- access control ----------------------------------------------------------
 # Require a valid API key on proxy routes. When false, requests without
 # credentials are served anonymously and are not billed.
@@ -89,16 +84,6 @@ public_url = "http://localhost:56787"
 # Only meaningful with require_key = false: treat any non-empty token as an
 # anonymous request instead of rejecting unknown credentials.
 # accept_any_token = false
-
-# Self-service key creation guards. Setting a guard to 0 disables it.
-#   ip_limit_per_month   new keys allowed per source IP per calendar month
-#   cooldown_seconds     minimum wait between key creations from one IP
-#   global_hourly_limit  new keys allowed per hour across all accounts
-#   max_keys_per_account active keys allowed per account (must be greater than 0)
-# ip_limit_per_month = 2
-# cooldown_seconds = 30
-# global_hourly_limit = 100
-# max_keys_per_account = 10
 
 # Trust CF-Connecting-IP, else the last X-Forwarded-For entry, for client IPs,
 # key allowances, and request logs. Enable only when the app is reachable
@@ -123,6 +108,63 @@ public_url = "http://localhost:56787"
 # max_log_entries rows. Both values must be greater than 0.
 # log_retention_days = 30
 # max_log_entries = 5000
+
+# =============================================================================
+#  SIGNUP (anonymous self-service accounts)
+#  Setting a guard to 0 disables it.
+# =============================================================================
+
+# [signup]
+# enabled = true
+# free_credit_usd = "0.25"       # trial credit; "0" for none
+# free_credit_expiry_days = 30   # 0 = never expires
+# ip_limit_per_month = 2         # new keys per source IP per calendar month
+# cooldown_seconds = 30          # minimum wait between creations from one IP
+# global_hourly_limit = 100      # key creations per hour (signup, child keys, rotations)
+# pow_max_number = 100000        # proof-of-work difficulty (ALTCHA); 0 disables it
+# pow_ttl_seconds = 300          # how long a challenge stays solvable
+# [signup.ip_overrides]          # per-IP replacement for ip_limit_per_month
+# "203.0.113.7" = 10
+# "198.51.100.9" = 0             # unlimited
+
+# =============================================================================
+#  KEY POLICY
+#  default_limits are copied onto every newly minted key; existing keys keep
+#  the limits they were created with. Window hours must be 1-8760.
+# =============================================================================
+
+# [keys]
+# max_per_account = 10           # active keys per account (greater than 0)
+# max_new_per_day = 20           # keys a customer creates or rotates per rolling 24h
+# rotate_cooldown_seconds = 300  # customers may rotate keys only this old or older
+#
+# [keys.default_limits]
+# rpm = 60
+# requests = { max = 2000, window_hours = 24 }
+# tokens = { max = 1000000, window_hours = 720 }
+# spend = { max_usd = "5", window_hours = 720 }
+# max_children = 2
+# allowed_models = []
+
+# =============================================================================
+#  RATE LIMITS (0 disables each)
+# =============================================================================
+
+# [rate_limits]
+# management_per_minute = 120      # per client IP: signup, keys, account, plans, admin API
+# auth_failures_per_hour = 20      # per client IP; then credentialed requests get 429
+# max_concurrent_requests = 8      # per account, in-flight proxy requests
+# checkouts_per_hour = 10          # per account
+# redeem_failures_per_hour = 10    # per account
+# challenges_per_minute = 10       # per client IP, signup challenges
+
+# =============================================================================
+#  MCP (Model Context Protocol)
+# =============================================================================
+
+# [mcp]
+# enabled = true
+# max_media_bytes = 16777216       # largest audio/image returned inline by tools
 
 # =============================================================================
 #  UPSTREAMS
@@ -178,17 +220,33 @@ model = "gpt-4o-mini"
 
 # =============================================================================
 #  PRICE TABLE
-#  USD per 1,000,000 input/output tokens, USD per second of audio, and USD per
-#  generated image. The "default" entry covers models without their own
-#  section; model names match case-insensitively. Provider-reported
-#  usage.cost always takes precedence, including an explicit zero.
+#  The "default" entry covers models without their own section; model names
+#  match case-insensitively. All values are USD decimal strings:
+#    input / output   per 1,000,000 input / output tokens
+#    cached_input     per 1,000,000 cached input tokens (absent = input price)
+#    audio_second     per second of audio (STT JSON usage, WAV/PCM TTS output)
+#    characters       per 1,000,000 input characters (TTS, e.g. "15" for tts-1)
+#    image            per generated image
+#    request          flat fee per successful (2xx) request
+#  Upstream cost of a request:
+#    usage = provider usage.cost when reported (an explicit 0 counts), else
+#            (input-cached)*input + cached*cached_input + output*output
+#            + characters*characters (all /1e6) + seconds*audio_second
+#            + images*image
+#    upstream = usage + request (2xx only); billed = upstream * (1 + markup/100)
+#  Each value is rounded once to whole micro-USD (half away from zero); a
+#  positive cost never rounds down to zero. LLM responses without any usage
+#  report are estimated at ~4 characters per token and flagged "estimated".
 # =============================================================================
 
 # [prices.default]
 # input = "0.5"
+# cached_input = "0.25"
 # output = "1.5"
 # audio_second = "0"
+# characters = "0"
 # image = "0"
+# request = "0"
 
 # Per-model override example. Quote model names containing dots, slashes, or
 # colons.
@@ -196,31 +254,9 @@ model = "gpt-4o-mini"
 # input = "0"
 # output = "0"
 # audio_second = "0"
+# characters = "0"
 # image = "0.01"
-
-# =============================================================================
-#  DEFAULT KEY LIMITS
-#  Copied onto every newly minted key; existing keys keep the limits they were
-#  created with. Omit entries you do not want. Window hours must be 1-8760.
-# =============================================================================
-
-# [default_limits]
-# rpm = 60
-# requests = { max = 2000, window_hours = 24 }
-# tokens = { max = 1000000, window_hours = 720 }
-# spend = { max_usd = "5", window_hours = 720 }
-# max_children = 2
-# allowed_models = []
-
-# =============================================================================
-#  PER-IP CREATION OVERRIDES
-#  Replace ip_limit_per_month for specific addresses. 0 means unlimited
-#  creations from that address.
-# =============================================================================
-
-# [ip_overrides]
-# "203.0.113.7" = 10
-# "198.51.100.9" = 0   # unlimited
+# request = "0"
 
 # =============================================================================
 #  BRANDING (white label)

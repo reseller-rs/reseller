@@ -3,7 +3,7 @@
 use crate::{
     App, api,
     error::{Error, Result},
-    identity, payments, proxy, stats, theme,
+    identity, mcp, payments, proxy, security, stats, theme,
 };
 use axum::{
     Json, Router,
@@ -33,7 +33,13 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; st
 /// Builds the application router. CORS is read once here, so CORS changes
 /// require a restart.
 pub async fn router(app: App) -> Router {
-    let cors_origin = app.config().await.cors_origin.clone();
+    let (cors_origin, https) = {
+        let config = app.config().await;
+        (
+            config.cors_origin.clone(),
+            config.public_url.starts_with("https://"),
+        )
+    };
     let mut router = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -83,12 +89,16 @@ pub async fn router(app: App) -> Router {
         )
         .fallback(dispatch)
         .with_state(app);
-    for (name, value) in [
+    let mut headers = vec![
         (header::CACHE_CONTROL, "no-store"),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::REFERRER_POLICY, "no-referrer"),
         (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
-    ] {
+    ];
+    if https {
+        headers.push((header::STRICT_TRANSPORT_SECURITY, "max-age=31536000"));
+    }
+    for (name, value) in headers {
         router = router.layer(SetResponseHeaderLayer::overriding(
             name,
             HeaderValue::from_static(value),
@@ -114,6 +124,7 @@ fn cors(origin: &str) -> CorsLayer {
             header::CONTENT_TYPE,
             HeaderName::from_static("x-api-key"),
             HeaderName::from_static("x-admin-token"),
+            HeaderName::from_static("mcp-protocol-version"),
         ])
         .expose_headers([
             HeaderName::from_static("x-request-id"),
@@ -141,6 +152,8 @@ async fn discovery() -> Json<serde_json::Value> {
         "api_base": "/v1",
         "keys": "/v1/keys",
         "plans": "/v1/plans",
+        "signup": "/v1/signup",
+        "mcp": "/mcp",
         "routes": {
             "llm": ["/v1/chat/completions", "/v1/responses", "/v1/completions", "/v1/embeddings", "/v1/realtime"],
             "tts": ["/v1/audio/speech"],
@@ -211,20 +224,57 @@ async fn route(app: App, peer: SocketAddr, req: Request<Body>) -> Result<Respons
         };
         return Ok(Json(handled).into_response());
     }
+    let management = ["/v1/keys", "/v1/account", "/v1/plans", "/v1/signup", "/mcp"]
+        .into_iter()
+        .any(is_api)
+        || path.starts_with("/admin/api/");
+    // Signup challenges have their own, tighter per-IP budget.
+    if management && path != "/v1/signup/challenge" {
+        security::management(&app, &ip).await?;
+    }
+    // Credentialed requests: refuse before any database lookup once this IP
+    // has exhausted its invalid-credential budget.
+    let credentialed = (management || path.starts_with("/v1/"))
+        && (identity::token(req.headers()).is_some()
+            || req.headers().contains_key("x-admin-token"));
+    if credentialed {
+        security::check_auth_failures(&app, &ip).await?;
+    }
+    let result = serve(&app, req, &path, &method, &ip).await;
+    if credentialed
+        && let Err(e) = &result
+        && security::is_auth_failure(e)
+    {
+        security::record_auth_failure(&app, &ip).await;
+    }
+    result
+}
+
+async fn serve(
+    app: &App,
+    req: Request<Body>,
+    path: &str,
+    method: &Method,
+    ip: &str,
+) -> Result<Response> {
+    let is_api = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
     if path == "/admin/api/events" && method == Method::GET {
-        return admin_events(app, req.headers().clone()).await;
+        return admin_events(app.clone(), req.headers().clone()).await;
+    }
+    if path == "/mcp" {
+        return mcp::handle(app, req, ip).await;
     }
     if path.starts_with("/admin/api/") {
-        return Ok(Json(api::admin(&app, req, &ip).await?).into_response());
+        return Ok(Json(api::admin(app, req, ip).await?).into_response());
     }
-    if ["/v1/keys", "/v1/account", "/v1/plans"]
+    if ["/v1/keys", "/v1/account", "/v1/plans", "/v1/signup"]
         .into_iter()
         .any(is_api)
     {
-        return Ok(Json(api::customer(&app, req, &ip).await?).into_response());
+        return Ok(Json(api::customer(app, req, ip).await?).into_response());
     }
     if path.starts_with("/v1/") {
-        return proxy::handle(app, req, ip).await;
+        return proxy::handle(app.clone(), req, ip.to_owned()).await;
     }
     Err(Error::not_found("not_found", "Endpoint not found"))
 }

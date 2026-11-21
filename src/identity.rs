@@ -118,7 +118,7 @@ pub async fn authenticate(
     if proxy {
         if dashboard {
             return Err(Error::unauthorized(
-                "invalid_api_key",
+                "dashboard_token_not_allowed",
                 "Dashboard tokens cannot call the proxy",
             ));
         }

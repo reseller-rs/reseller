@@ -5,12 +5,19 @@
 //! is edited through the administrator API (or replaced with
 //! `reseller config import`).
 mod branding;
+mod keys;
+mod mcp;
 mod payments;
+mod rate_limits;
+mod signup;
 
 pub use branding::{Branding, Link};
+pub use keys::KeyPolicy;
+pub use mcp::Mcp;
 pub use payments::{Payroof, RateSource, Stripe};
+pub use rate_limits::RateLimits;
+pub use signup::Signup;
 
-use crate::keys::Limits;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -132,25 +139,55 @@ pub enum Policy {
     Passthrough,
 }
 
-/// Upstream price: USD per million input/output tokens, per audio second,
-/// and per generated image.
+/// Upstream price in USD (decimal strings).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Price {
+    /// Per 1M input tokens.
     pub input: String,
+    /// Per 1M cached input tokens; absent means the `input` price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input: Option<String>,
+    /// Per 1M output tokens.
     pub output: String,
+    /// Per second of audio.
     pub audio_second: String,
+    /// Per 1M input characters (text-to-speech).
+    pub characters: String,
+    /// Per generated image.
     pub image: String,
+    /// Flat fee per successful (2xx) request.
+    pub request: String,
 }
 
 impl Default for Price {
     fn default() -> Self {
         Self {
             input: "0.5".into(),
+            cached_input: None,
             output: "1.5".into(),
             audio_second: "0".into(),
+            characters: "0".into(),
             image: "0".into(),
+            request: "0".into(),
         }
+    }
+}
+
+impl Price {
+    /// Every configured amount, for validation.
+    fn amounts(&self) -> impl Iterator<Item = &String> {
+        [
+            Some(&self.input),
+            self.cached_input.as_ref(),
+            Some(&self.output),
+            Some(&self.audio_second),
+            Some(&self.characters),
+            Some(&self.image),
+            Some(&self.request),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -169,21 +206,14 @@ pub struct Config {
     pub model_policy: Policy,
     pub voice_policy: Policy,
     pub markup_pct: String,
-    pub free_credit_usd: String,
-    /// Days the signup credit stays spendable; 0 means it never expires.
-    pub free_credit_expiry_days: u32,
+    pub signup: Signup,
+    pub keys: KeyPolicy,
+    pub rate_limits: RateLimits,
+    pub mcp: Mcp,
     /// Price table keyed by model name (case-insensitive) plus `default`.
     pub prices: BTreeMap<String, Price>,
     pub require_key: bool,
     pub accept_any_token: bool,
-    /// Self-service keys per source IP per calendar month; 0 disables the guard.
-    pub ip_limit_per_month: u32,
-    pub cooldown_seconds: u32,
-    pub global_hourly_limit: u32,
-    pub max_keys_per_account: u32,
-    /// Per-IP replacements for `ip_limit_per_month`; 0 means unlimited.
-    pub ip_overrides: BTreeMap<String, u32>,
-    pub default_limits: Limits,
     pub trust_proxy: bool,
     pub cors_origin: String,
     pub max_json_body_bytes: usize,
@@ -209,17 +239,13 @@ impl Default for Config {
             model_policy: Policy::Default,
             voice_policy: Policy::Default,
             markup_pct: "30".into(),
-            free_credit_usd: "0.25".into(),
-            free_credit_expiry_days: 30,
+            signup: Signup::default(),
+            keys: KeyPolicy::default(),
+            rate_limits: RateLimits::default(),
+            mcp: Mcp::default(),
             prices: BTreeMap::from([("default".into(), Price::default())]),
             require_key: true,
             accept_any_token: false,
-            ip_limit_per_month: 2,
-            cooldown_seconds: 30,
-            global_hourly_limit: 100,
-            max_keys_per_account: 10,
-            ip_overrides: BTreeMap::new(),
-            default_limits: Limits::default(),
             trust_proxy: false,
             cors_origin: String::new(),
             max_json_body_bytes: 50 * 1024 * 1024,
@@ -290,7 +316,7 @@ impl Config {
             ("ADMIN_TOKEN", &mut self.admin_token),
             ("KEY_PEPPER", &mut self.key_pepper),
             ("MARKUP_PCT", &mut self.markup_pct),
-            ("FREE_CREDIT_USD", &mut self.free_credit_usd),
+            ("FREE_CREDIT_USD", &mut self.signup.free_credit_usd),
             ("PUBLIC_URL", &mut self.public_url),
             ("BRAND_NAME", &mut self.branding.name),
             ("STRIPE_SECRET_KEY", &mut self.stripe.secret_key),
@@ -316,24 +342,19 @@ impl Config {
         }
         self.branding.validate()?;
         crate::money::decimal(&self.markup_pct).context("markup_pct")?;
-        crate::money::usd(&self.free_credit_usd).context("free_credit_usd")?;
+        self.signup.validate()?;
+        self.keys.validate()?;
+        self.mcp.validate()?;
         for (model, price) in &self.prices {
-            for v in [
-                &price.input,
-                &price.output,
-                &price.audio_second,
-                &price.image,
-            ] {
+            for v in price.amounts() {
                 crate::money::decimal(v).with_context(|| format!("prices.{model}"))?;
             }
         }
-        self.default_limits.validate().context("default_limits")?;
         anyhow::ensure!(
-            self.max_keys_per_account > 0
-                && self.max_json_body_bytes > 0
+            self.max_json_body_bytes > 0
                 && self.max_stream_body_bytes > 0
                 && self.upstream_timeout_seconds > 0,
-            "max_keys_per_account, body limits and upstream_timeout_seconds must be positive"
+            "body limits and upstream_timeout_seconds must be positive"
         );
         anyhow::ensure!(
             self.max_json_body_bytes <= 512 * 1024 * 1024
@@ -343,10 +364,6 @@ impl Config {
         anyhow::ensure!(
             self.log_retention_days > 0 && self.max_log_entries > 0,
             "log_retention_days and max_log_entries must be positive"
-        );
-        anyhow::ensure!(
-            self.free_credit_expiry_days <= 3650,
-            "free_credit_expiry_days must be at most 3650"
         );
         let public = url::Url::parse(&self.public_url).context("public_url")?;
         anyhow::ensure!(
@@ -497,5 +514,75 @@ mod tests {
             .headers
             .insert("Authorization".into(), "Bearer x".into());
         assert!(config.validate().is_err());
+    }
+
+    fn valid() -> Config {
+        Config {
+            admin_token: "a".repeat(MIN_SECRET_LEN),
+            key_pepper: "p".repeat(MIN_SECRET_LEN),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn new_sections_are_validated() {
+        let mut c = valid();
+        c.validate().unwrap();
+        c.signup.pow_max_number = signup::MAX_POW_NUMBER + 1;
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.signup.pow_ttl_seconds = 1;
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.signup.free_credit_usd = "-1".into();
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.keys.max_per_account = 0;
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.keys.default_limits.requests = Some(crate::keys::Window {
+            max: 0,
+            window_hours: 1,
+        });
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.mcp.max_media_bytes = 0;
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.prices.get_mut("default").unwrap().cached_input = Some("abc".into());
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn price_fields_round_trip_and_optional_cached_input_is_omitted() {
+        let mut c = valid();
+        let toml = c.to_toml(true).unwrap();
+        assert!(!toml.contains("cached_input"));
+        c.prices.insert(
+            "m".into(),
+            Price {
+                cached_input: Some("0.25".into()),
+                characters: "15".into(),
+                request: "0.001".into(),
+                ..Price::default()
+            },
+        );
+        c.validate().unwrap();
+        let back: Config = toml::from_str(&c.to_toml(true).unwrap()).unwrap();
+        assert_eq!(back, c);
+        let parsed: Config = toml::from_str(
+            "[signup]\nfree_credit_usd=\"1\"\n[signup.ip_overrides]\n\"1.2.3.4\"=0\n[keys.default_limits]\nrpm=5\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.signup.ip_overrides["1.2.3.4"], 0);
+        assert_eq!(parsed.keys.default_limits.rpm, Some(5));
+        assert!(toml::from_str::<Config>("ip_limit_per_month = 1").is_err());
+    }
+
+    #[test]
+    fn free_credit_env_maps_to_signup_section() {
+        let mut c = Config::default();
+        c.apply_env(|n| (n == "FREE_CREDIT_USD").then(|| "2".into()));
+        assert_eq!(c.signup.free_credit_usd, "2");
     }
 }

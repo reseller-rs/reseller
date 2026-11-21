@@ -35,9 +35,17 @@ impl Test {
         let c = Config {
             admin_token: "admin-test-secret-123456789".into(),
             key_pepper: "pepper-test-secret-12345678".into(),
-            cooldown_seconds: 0,
-            ip_limit_per_month: 0,
-            global_hourly_limit: 0,
+            signup: reseller::config::Signup {
+                cooldown_seconds: 0,
+                ip_limit_per_month: 0,
+                global_hourly_limit: 0,
+                pow_max_number: 0,
+                ..Default::default()
+            },
+            keys: reseller::config::KeyPolicy {
+                rotate_cooldown_seconds: 0,
+                ..Default::default()
+            },
             ..Config::default()
         };
         let c = db::settings(&pool, c).await.unwrap();
@@ -49,7 +57,7 @@ impl Test {
     async fn key(&self) -> Value {
         keys::create(
             &self.app,
-            keys::Requester::Public(None),
+            keys::Requester::Signup { altcha: None },
             "127.0.0.1",
             &json!({"name":"test"}),
         )
@@ -133,10 +141,10 @@ fn decimal_money_is_exact_and_rejects_invalid_values() {
 fn explicit_zero_provider_cost_overrides_price_table() {
     let c = Config::default();
     let u = Usage::parse(&json!({"prompt_tokens":1000,"cost":0}));
-    assert_eq!(u.cost(&c, "unknown").unwrap(), 0);
+    assert_eq!(u.cost(&c, "unknown", false).unwrap(), 0);
     let u = Usage::parse(&json!({"input_tokens":1000,"output_tokens":100}));
     assert_eq!(u.total, 1100);
-    assert_eq!(u.cost(&c, "unknown").unwrap(), 650);
+    assert_eq!(u.cost(&c, "unknown", false).unwrap(), 650);
 }
 #[test]
 fn target_preserves_base_and_query_but_rejects_traversal() {
@@ -162,8 +170,8 @@ fn sse_inspector_handles_split_utf8_usage_and_done() {
         i.feed(byte);
     }
     i.finish();
-    assert_eq!(i.usage.total, 16);
-    assert_eq!(i.usage.cost, Some(1000));
+    assert_eq!(i.usage().total, 16);
+    assert_eq!(i.usage().cost, Some(1000));
 }
 #[test]
 fn sse_inspector_recovers_after_oversized_line() {
@@ -171,7 +179,7 @@ fn sse_inspector_recovers_after_oversized_line() {
     i.feed(&vec![b'x'; 5 * 1024 * 1024]);
     i.feed(b"\ndata: {\"usage\":{\"total_tokens\":12}}\n");
     i.finish();
-    assert_eq!(i.usage.total, 12);
+    assert_eq!(i.usage().total, 12);
 }
 #[test]
 fn audio_inspection_handles_chunked_wav_header() {
@@ -194,7 +202,7 @@ fn audio_inspection_handles_chunked_wav_header() {
         i.feed(c);
     }
     i.finish();
-    assert_eq!(i.usage.audio_ms, 1000);
+    assert_eq!(i.usage().audio_ms, 1000);
 }
 #[tokio::test]
 async fn signup_hashes_secrets_and_dashboard_cannot_proxy() {
@@ -238,14 +246,14 @@ async fn signup_hashes_secrets_and_dashboard_cannot_proxy() {
 #[tokio::test]
 async fn concurrent_signup_cannot_exceed_monthly_allowance() {
     let t = Test::new().await;
-    t.app.config_mut().await.ip_limit_per_month = 2;
+    t.app.config_mut().await.signup.ip_limit_per_month = 2;
     let mut tasks = Vec::new();
     for _ in 0..12 {
         let app = t.app.clone();
         tasks.push(tokio::spawn(async move {
             keys::create(
                 &app,
-                keys::Requester::Public(None),
+                keys::Requester::Signup { altcha: None },
                 "203.0.113.7",
                 &json!({}),
             )
@@ -272,7 +280,7 @@ async fn child_keys_share_credit_without_trial_mining() {
     let i = t.identity(&k).await;
     let child = keys::create(
         &t.app,
-        keys::Requester::Public(Some(&i)),
+        keys::Requester::Customer(&i),
         "127.0.0.1",
         &json!({}),
     )
@@ -484,12 +492,12 @@ async fn plan_grants_expiring_credit_and_bypasses_ip_allowance() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
-    t.app.config_mut().await.ip_limit_per_month = 1;
+    t.app.config_mut().await.signup.ip_limit_per_month = 1;
     let i = t.identity(&k).await;
     assert!(
         keys::create(
             &t.app,
-            keys::Requester::Public(Some(&i)),
+            keys::Requester::Customer(&i),
             "127.0.0.1",
             &json!({})
         )
@@ -508,7 +516,7 @@ async fn plan_grants_expiring_credit_and_bypasses_ip_allowance() {
     assert!(
         keys::create(
             &t.app,
-            keys::Requester::Public(Some(&i)),
+            keys::Requester::Customer(&i),
             "127.0.0.1",
             &json!({})
         )
@@ -1088,10 +1096,39 @@ async fn payment_amount_mismatch_rolls_back_event_and_credit() {
     assert_eq!(n, 0);
 }
 #[test]
+fn starter_config_with_every_option_uncommented_parses() {
+    // Uncommenting any `# key = value` line or `# [table]` header must keep
+    // keys in the right table and use field names Config accepts.
+    let text: String = include_str!("../reseller.example.toml")
+        .lines()
+        .map(|line| match line.strip_prefix("# ") {
+            Some(rest)
+                if rest.starts_with('[')
+                    || rest
+                        .split_once(" = ")
+                        .is_some_and(|(key, _)| !key.is_empty() && !key.contains(' ')) =>
+            {
+                rest
+            }
+            _ => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let c: Config = toml::from_str(&text).unwrap();
+    Config {
+        admin_token: "a".repeat(24),
+        key_pepper: "p".repeat(24),
+        ..c
+    }
+    .validate()
+    .unwrap();
+}
+
+#[test]
 fn starter_config_documents_every_option_and_validates() {
     // `reseller init` copies this file verbatim, so it must parse, pass
     // validation, and mention every configurable field at least once.
-    let text = include_str!("../assets/reseller.example.toml");
+    let text = include_str!("../reseller.example.toml");
     let c: Config = toml::from_str(text).unwrap();
     // Secrets are generated on first start; validation requires them.
     assert!(c.validate().is_err(), "empty secrets must not validate");
@@ -1114,17 +1151,34 @@ fn starter_config_documents_every_option_and_validates() {
         "model_policy",
         "voice_policy",
         "markup_pct",
-        "free_credit_usd",
-        "free_credit_expiry_days",
+        "signup",
+        "keys",
+        "rate_limits",
+        "mcp",
         "prices",
         "require_key",
         "accept_any_token",
+        // Signup, key policy, rate limits, MCP
+        "enabled",
+        "free_credit_usd",
+        "free_credit_expiry_days",
         "ip_limit_per_month",
         "cooldown_seconds",
         "global_hourly_limit",
-        "max_keys_per_account",
+        "pow_max_number",
+        "pow_ttl_seconds",
         "ip_overrides",
+        "max_per_account",
+        "max_new_per_day",
+        "rotate_cooldown_seconds",
         "default_limits",
+        "management_per_minute",
+        "auth_failures_per_hour",
+        "max_concurrent_requests",
+        "checkouts_per_hour",
+        "redeem_failures_per_hour",
+        "challenges_per_minute",
+        "max_media_bytes",
         "trust_proxy",
         "cors_origin",
         "max_json_body_bytes",
@@ -1170,8 +1224,11 @@ fn starter_config_documents_every_option_and_validates() {
         // Price
         "input",
         "output",
+        "cached_input",
         "audio_second",
+        "characters",
         "image",
+        "request",
         // Limits / windows
         "rpm",
         "requests",

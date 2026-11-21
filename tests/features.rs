@@ -33,9 +33,17 @@ impl Test {
         let c = Config {
             admin_token: ADMIN.into(),
             key_pepper: "pepper-test-secret-12345678".into(),
-            cooldown_seconds: 0,
-            ip_limit_per_month: 0,
-            global_hourly_limit: 0,
+            signup: reseller::config::Signup {
+                cooldown_seconds: 0,
+                ip_limit_per_month: 0,
+                global_hourly_limit: 0,
+                pow_max_number: 0,
+                ..Default::default()
+            },
+            keys: reseller::config::KeyPolicy {
+                rotate_cooldown_seconds: 0,
+                ..Default::default()
+            },
             ..Config::default()
         };
         let c = db::settings(&pool, c).await.unwrap();
@@ -48,7 +56,7 @@ impl Test {
     async fn key(&self) -> Value {
         keys::create(
             &self.app,
-            keys::Requester::Public(None),
+            keys::Requester::Signup { altcha: None },
             "127.0.0.1",
             &json!({"name":"test"}),
         )
@@ -238,8 +246,8 @@ async fn image_price_applies_per_generated_image() {
             reseller::config::Price {
                 input: "0".into(),
                 output: "0".into(),
-                audio_second: "0".into(),
                 image: "0.02".into(),
+                ..Default::default()
             },
         );
     }

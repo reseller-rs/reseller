@@ -1,5 +1,9 @@
 //! WebSocket relay for realtime APIs (`/v1/realtime?model=…`).
-use super::{Kind, inspect::realtime_usage, timeout, upstream_headers};
+use super::{
+    Kind,
+    inspect::{RealtimeEvent, realtime_event},
+    timeout, upstream_headers,
+};
 use crate::{
     App,
     config::{Config, Policy, Upstream},
@@ -25,6 +29,9 @@ use tokio_tungstenite::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// How long to keep reading upstream after the client has left, so a
+/// response that is still being generated can report its usage.
+const SETTLE_GRACE: Duration = Duration::from_secs(5);
 
 type UpstreamSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -144,17 +151,36 @@ async fn settle_failure(mut meter: Meter, status: StatusCode, message: &'static 
     Error::new(status, "upstream_error", message)
 }
 
+/// Responses the upstream has started but not yet finished, and the usage
+/// of those that finished.
+fn observe_event(meter: &mut Meter, pending: &mut i64, text: &str) {
+    match realtime_event(text) {
+        Some(RealtimeEvent::Created) => *pending += 1,
+        Some(RealtimeEvent::Done(usage)) => {
+            *pending = (*pending - 1).max(0);
+            if let Some(usage) = usage {
+                meter.usage.add(&usage);
+            }
+        }
+        None => {}
+    }
+}
+
 /// Relays frames both ways until either side closes or the session limit
 /// elapses, metering bytes and realtime usage.
 async fn session(down: WebSocket, up: UpstreamSocket, mut meter: Meter, limit: Duration) {
     meter.status = StatusCode::SWITCHING_PROTOCOLS.as_u16();
+    // An established session counts as a successful request.
+    meter.success = true;
     let (mut down_tx, mut down_rx) = down.split();
     let (mut up_tx, mut up_rx) = up.split();
+    let mut pending = 0i64;
+    let mut client_left = false;
     let relay = async {
         loop {
             tokio::select! {
                 message = down_rx.next() => {
-                    let Some(Ok(message)) = message else { break };
+                    let Some(Ok(message)) = message else { client_left = true; break };
                     let message = match message {
                         Message::Text(text) => {
                             meter.bytes_in += text.len() as i64;
@@ -166,7 +192,7 @@ async fn session(down: WebSocket, up: UpstreamSocket, mut meter: Meter, limit: D
                         }
                         Message::Ping(data) => UpstreamMessage::Ping(data),
                         Message::Pong(data) => UpstreamMessage::Pong(data),
-                        Message::Close(_) => break,
+                        Message::Close(_) => { client_left = true; break }
                     };
                     if up_tx.send(message).await.is_err() {
                         break;
@@ -177,9 +203,7 @@ async fn session(down: WebSocket, up: UpstreamSocket, mut meter: Meter, limit: D
                     let message = match message {
                         UpstreamMessage::Text(text) => {
                             meter.bytes_out += text.len() as i64;
-                            if let Some(usage) = realtime_usage(text.as_str()) {
-                                meter.usage.add(&usage);
-                            }
+                            observe_event(&mut meter, &mut pending, text.as_str());
                             Message::Text(text.as_str().into())
                         }
                         UpstreamMessage::Binary(data) => {
@@ -192,14 +216,32 @@ async fn session(down: WebSocket, up: UpstreamSocket, mut meter: Meter, limit: D
                         UpstreamMessage::Frame(_) => continue,
                     };
                     if down_tx.send(message).await.is_err() {
+                        client_left = true;
                         break;
                     }
                 }
             }
         }
     };
-    if tokio::time::timeout(limit, relay).await.is_err() {
+    let timed_out = tokio::time::timeout(limit, relay).await.is_err();
+    if timed_out {
         meter.error = Some("session time limit reached".into());
+    } else if client_left && pending > 0 {
+        // The client left mid-response: the upstream still bills it, so give
+        // it a bounded moment to deliver `response.done` before closing.
+        let _ = tokio::time::timeout(SETTLE_GRACE, async {
+            while pending > 0 {
+                match up_rx.next().await {
+                    Some(Ok(UpstreamMessage::Text(text))) => {
+                        meter.bytes_out += text.len() as i64;
+                        observe_event(&mut meter, &mut pending, text.as_str());
+                    }
+                    Some(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+        })
+        .await;
     }
     let _ = down_tx.close().await;
     let _ = up_tx.close().await;

@@ -9,6 +9,7 @@ use crate::{
     error::{Error, Result},
     identity, money,
 };
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection};
 
@@ -228,7 +229,13 @@ pub async fn redeem(app: &App, account: &str, code: &str) -> Result<Value> {
     .bind(now())
     .fetch_optional(&mut *tx)
     .await?
-    .ok_or_else(|| Error::bad("Code is invalid, expired, or already redeemed"))?;
+    .ok_or_else(|| {
+        Error::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_code",
+            "Code is invalid, expired, or already redeemed",
+        )
+    })?;
     match row.get::<Option<String>, _>("plan_code") {
         Some(plan) => {
             grant(&mut tx, account, &plan).await?;

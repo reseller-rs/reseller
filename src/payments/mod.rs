@@ -12,7 +12,7 @@ pub mod stripe;
 use crate::{
     App, billing,
     config::Config,
-    db::{self, now},
+    db::{self, HOUR, now},
     error::{Error, Result},
     identity::Identity,
     money,
@@ -71,6 +71,7 @@ pub async fn checkout(app: &App, identity: &Identity, body: &Value) -> Result<Va
     let code = body["plan_code"]
         .as_str()
         .ok_or_else(|| Error::bad("plan_code is required"))?;
+    check_checkout_budget(app, &config, &identity.account_id).await?;
     let plan = sqlx::query("SELECT * FROM plans WHERE code=? AND active=1")
         .bind(code)
         .fetch_optional(&app.db)
@@ -80,6 +81,30 @@ pub async fn checkout(app: &App, identity: &Identity, body: &Value) -> Result<Va
         STRIPE => stripe::checkout(app, &config, identity, &plan).await,
         _ => payroof::checkout(app, &config, identity, &plan).await,
     }
+}
+
+/// Caps orders per account per hour so a signed-in client cannot spam the
+/// payment providers (stored orders survive restarts, unlike in-memory state).
+async fn check_checkout_budget(app: &App, config: &Config, account: &str) -> Result<()> {
+    let limit = config.rate_limits.checkouts_per_hour;
+    if limit == 0 {
+        return Ok(());
+    }
+    let (recent, oldest): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*),MIN(created_at) FROM payments WHERE account_id=? AND created_at>?",
+    )
+    .bind(account)
+    .bind(now() - HOUR)
+    .fetch_one(&app.db)
+    .await?;
+    if recent >= i64::from(limit) {
+        return Err(Error::too_many(
+            "checkout_rate_limited",
+            "Too many checkout attempts; try again later",
+        )
+        .retry_after(oldest.map_or(60, |t| (t + HOUR - now()).max(1).unsigned_abs())));
+    }
+    Ok(())
 }
 
 /// Inserts a pending order snapshotting `plan`.

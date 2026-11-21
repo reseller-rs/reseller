@@ -6,6 +6,8 @@
 //! - [`meter`]: request admission, usage accounting, and settlement.
 //! - [`api`]: customer (`/v1/keys`, `/v1/account`) and administrator APIs.
 //! - [`identity`] / [`keys`]: authentication and API-key lifecycle.
+//! - [`mcp`]: Model Context Protocol server (`/mcp`) and stdio bridge.
+//! - [`security`]: rate limiting and proof-of-work signup challenges.
 //! - [`billing`] / [`money`]: credit ledger, plans, redeem codes, micro-USD.
 //! - [`payments`]: plan checkout orders via Stripe (cards) and Payroof (crypto).
 //! - [`theme`]: white-label branding, the page template, and theme files.
@@ -18,10 +20,12 @@ pub mod db;
 pub mod error;
 pub mod identity;
 pub mod keys;
+pub mod mcp;
 pub mod meter;
 pub mod money;
 pub mod payments;
 pub mod proxy;
+pub mod security;
 pub mod stats;
 pub mod theme;
 pub mod web;
@@ -39,6 +43,8 @@ pub struct App {
     pub tasks: tokio_util::task::TaskTracker,
     /// Payroof catalog and exchange-rate caches.
     pub payroof: Arc<payments::payroof::Cache>,
+    /// In-memory abuse limiter (per IP and per account).
+    pub limiter: Arc<security::limiter::Limiter>,
     /// Optional directory of theme files served under `/theme/`.
     pub theme_dir: Option<Arc<PathBuf>>,
 }
@@ -54,6 +60,7 @@ impl App {
                 .build()?,
             tasks: tokio_util::task::TaskTracker::new(),
             payroof: Arc::default(),
+            limiter: Arc::default(),
             theme_dir: None,
         })
     }

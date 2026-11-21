@@ -28,10 +28,15 @@ pub fn usd(s: &str) -> Result<i64> {
     micro(decimal(s)?)
 }
 
+/// Whole-number rounding with halves away from zero (`Decimal::round` would
+/// round halves to even).
+pub(crate) fn round_half_up(d: Decimal) -> Decimal {
+    d.round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+}
+
 /// Converts a USD amount into micro-USD, rounding half away from zero.
 pub fn micro(d: Decimal) -> Result<i64> {
-    (d * Decimal::from(MICROS_PER_USD))
-        .round()
+    round_half_up(d * Decimal::from(MICROS_PER_USD))
         .to_i64()
         .ok_or_else(|| Error::bad("Amount overflow"))
 }
@@ -45,8 +50,7 @@ pub fn display(micros: i64) -> String {
 
 /// Applies a percentage markup string (`"30"` = +30%) to a micro-USD cost.
 pub fn markup(micros: i64, pct: &str) -> Result<i64> {
-    (Decimal::from(micros) * (Decimal::ONE + decimal(pct)? / Decimal::ONE_HUNDRED))
-        .round()
+    round_half_up(Decimal::from(micros) * (Decimal::ONE + decimal(pct)? / Decimal::ONE_HUNDRED))
         .to_i64()
         .ok_or_else(|| Error::bad("Billing overflow"))
 }
@@ -90,6 +94,10 @@ mod tests {
     fn markup_rounds_to_whole_micros() {
         assert_eq!(markup(1_000, "30").unwrap(), 1_300);
         assert_eq!(markup(1, "50").unwrap(), 2);
+        // Halves round away from zero, not to even.
+        assert_eq!(markup(3, "50").unwrap(), 5);
+        assert_eq!(markup(1, "150").unwrap(), 3);
+        assert_eq!(micro(Decimal::new(25, 7)).unwrap(), 3);
         assert_eq!(display(1_500_000), "1.5");
     }
 }

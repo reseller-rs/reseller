@@ -16,24 +16,27 @@ use crate::{
     config::{Config, Policy, Upstream},
     db,
     error::{Error, Result},
-    identity::{self, Scope},
+    identity::{self, Identity, Scope},
     meter::{Meter, RequestMeta},
     money,
 };
 use axum::{
     body::{Body, to_bytes},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header, request},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, header, request,
+    },
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Duration,
 };
+use tokio::sync::{mpsc, oneshot};
 
 /// Upstream statuses after which the next fallback model is tried.
 const RETRYABLE: [u16; 5] = [400, 402, 404, 408, 429];
@@ -202,11 +205,35 @@ enum Payload {
     Stream(Option<reqwest::Body>),
 }
 
-/// Byte accounting shared with the streaming upload.
+/// State shared between the streaming upload (polled by the HTTP client)
+/// and the exchange task that owns the meter.
 #[derive(Clone, Default)]
 struct UploadCounter {
     bytes: Arc<AtomicI64>,
     too_large: Arc<AtomicBool>,
+    observed: Arc<Mutex<Observed>>,
+}
+
+/// What the upload learned about the request while streaming.
+#[derive(Default)]
+struct Observed {
+    /// Effective model from the multipart body.
+    model: Option<String>,
+    /// Why the upload was aborted (the client gets this error, not a 502).
+    rejection: Option<Error>,
+}
+
+impl UploadCounter {
+    fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
+        self.observed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records the abort reason (first one wins).
+    fn reject(&self, error: Error) -> std::io::Error {
+        let message = error.to_string();
+        self.observed().rejection.get_or_insert(error);
+        std::io::Error::other(message)
+    }
 }
 
 /// Proxies one `/v1/*` request.
@@ -234,8 +261,18 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
 
     let (parts, body) = req.into_parts();
     let counter = UploadCounter::default();
-    let (model, mut payload) = prepare(&config, kind, &path, &parts, body, &counter).await?;
-    let mut meter = Meter::begin(
+    let prepared = prepare(
+        &config,
+        kind,
+        &path,
+        &parts,
+        body,
+        &counter,
+        identity.as_ref(),
+    )
+    .await?;
+    let (model, payload) = (prepared.model, prepared.payload);
+    let meter = Meter::begin_with(
         &app,
         identity.clone(),
         RequestMeta {
@@ -245,6 +282,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
             model: &model,
             ip: &ip,
         },
+        !prepared.model_pending,
     )
     .await?;
     let balance = match &identity {
@@ -267,80 +305,296 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
                 .cloned(),
         );
     }
-
-    let timeout = timeout(&config, upstream);
-    let mut fallback = None;
-    let mut index = 0;
-    let response = loop {
-        let model = &models[index];
-        let last = index + 1 == models.len();
-        meter.model.clone_from(model);
-        let mut request = app
-            .client
-            .request(parts.method.clone(), url.clone())
-            .headers(upstream_headers(&parts.headers, upstream))
-            .bearer_auth(&upstream.api_key)
-            .header(header::ACCEPT_ENCODING, "identity")
-            .timeout(timeout);
-        request = match &mut payload {
-            Payload::Json(value, bytes) => {
-                if index > 0 {
-                    value["model"] = model.as_str().into();
-                    *bytes = Bytes::from(serde_json::to_vec(value)?);
-                }
-                request.body(bytes.clone())
-            }
-            Payload::Stream(body) => match body.take() {
-                Some(body) => request.body(body),
-                None => request,
+    // Quantities known from the request: text-to-speech input characters,
+    // and the input-token estimate used if an LLM upstream reports no usage.
+    let (characters, estimate) = match &payload {
+        Payload::Json(value, bytes) => (
+            if path == "/v1/audio/speech" {
+                value["input"]
+                    .as_str()
+                    .map_or(0, |s| i64::try_from(s.chars().count()).unwrap_or(i64::MAX))
+            } else {
+                0
             },
-        };
-        match request.send().await {
-            Ok(response) => {
-                let status = response.status();
-                if !last && (status.is_server_error() || RETRYABLE.contains(&status.as_u16())) {
-                    index += 1;
-                    fallback = Some(models[index].clone());
-                    continue;
-                }
-                break response;
-            }
-            Err(_) if !last => {
-                index += 1;
-                fallback = Some(models[index].clone());
-            }
-            Err(e) => {
-                meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
-                let (status, code, detail) = if counter.too_large.load(Ordering::Relaxed) {
-                    (
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "request_too_large",
-                        "upload exceeds limit",
-                    )
-                } else if e.is_timeout() {
-                    (
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "upstream_error",
-                        "upstream timed out",
-                    )
-                } else {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_error",
-                        "upstream connection failed",
-                    )
-                };
-                meter.fail(status, detail);
-                meter.finish().await?;
-                return Err(Error::new(
-                    status,
-                    code,
-                    "Upstream request could not be completed",
-                ));
-            }
-        }
+            matches!(
+                path.as_str(),
+                "/v1/chat/completions" | "/v1/responses" | "/v1/completions"
+            )
+            .then(|| inspect::estimate_input_tokens(value, bytes.len())),
+        ),
+        Payload::Stream(_) => (0, None),
     };
 
+    // The upstream exchange runs on a tracked task, not on the request
+    // future: a client that disconnects (even before the response head)
+    // cannot cancel it, so usage the upstream already charged us for is
+    // always observed and settled.
+    let (head_tx, head_rx) = oneshot::channel();
+    app.tasks.spawn(
+        Exchange {
+            app: app.clone(),
+            config,
+            kind,
+            url,
+            method: parts.method,
+            headers: parts.headers,
+            payload,
+            counter,
+            meter,
+            identity,
+            balance,
+            models,
+            characters,
+            estimate,
+        }
+        .run(head_tx),
+    );
+    head_rx
+        .await
+        .map_err(|_| Error::internal("upstream exchange ended without a response"))?
+}
+
+/// One proxied upstream exchange, owned by its task.
+struct Exchange {
+    app: App,
+    config: Arc<Config>,
+    kind: Kind,
+    url: url::Url,
+    method: Method,
+    headers: HeaderMap,
+    payload: Payload,
+    counter: UploadCounter,
+    meter: Meter,
+    identity: Option<Identity>,
+    balance: Option<i64>,
+    /// The requested model followed by its fallbacks.
+    models: Vec<String>,
+    characters: i64,
+    estimate: Option<i64>,
+}
+
+/// Chunks buffered between the upstream reader and the client.
+const RELAY_BUFFER: usize = 8;
+
+impl Exchange {
+    /// Sends the request (trying fallback models), hands the response head
+    /// to the waiting handler, then relays and inspects the body until the
+    /// upstream finishes, whether or not the client is still listening.
+    async fn run(self, head: oneshot::Sender<Result<Response<Body>>>) {
+        let Self {
+            app,
+            config,
+            kind,
+            url,
+            method,
+            headers: client_headers,
+            mut payload,
+            counter,
+            mut meter,
+            identity,
+            balance,
+            models,
+            characters,
+            estimate,
+        } = self;
+        let upstream = kind.upstream(&config);
+        let timeout = timeout(&config, upstream);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut fallback = None;
+        let mut index = 0;
+        let response = loop {
+            let model = &models[index];
+            let last = index + 1 == models.len();
+            meter.model.clone_from(model);
+            let mut request = app
+                .client
+                .request(method.clone(), url.clone())
+                .headers(upstream_headers(&client_headers, upstream))
+                .bearer_auth(&upstream.api_key)
+                .header(header::ACCEPT_ENCODING, "identity")
+                .timeout(timeout);
+            request = match &mut payload {
+                Payload::Json(value, bytes) => {
+                    if index > 0 {
+                        value["model"] = model.as_str().into();
+                        match serde_json::to_vec(value) {
+                            Ok(v) => *bytes = Bytes::from(v),
+                            Err(e) => {
+                                meter.fail(StatusCode::INTERNAL_SERVER_ERROR, "invalid request");
+                                settle(meter).await;
+                                let _ = head.send(Err(Error::internal(e)));
+                                return;
+                            }
+                        }
+                    }
+                    request.body(bytes.clone())
+                }
+                Payload::Stream(body) => match body.take() {
+                    Some(body) => request.body(body),
+                    None => request,
+                },
+            };
+            let sent = request.send().await;
+            // The upload may have learned the model or aborted itself.
+            let (observed_model, rejection) = {
+                let mut observed = counter.observed();
+                (observed.model.clone(), observed.rejection.take())
+            };
+            if let Some(model) = observed_model {
+                meter.model = model;
+            }
+            if let Some(error) = rejection {
+                meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+                meter.fail(error.status, &error.to_string());
+                settle(meter).await;
+                let _ = head.send(Err(error));
+                return;
+            }
+            match sent {
+                Ok(response) => {
+                    let status = response.status();
+                    if !last && (status.is_server_error() || RETRYABLE.contains(&status.as_u16())) {
+                        index += 1;
+                        fallback = Some(models[index].clone());
+                        continue;
+                    }
+                    break response;
+                }
+                Err(_) if !last => {
+                    index += 1;
+                    fallback = Some(models[index].clone());
+                }
+                Err(e) => {
+                    meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+                    let (status, code, detail) = if counter.too_large.load(Ordering::Relaxed) {
+                        (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request_too_large",
+                            "upload exceeds limit",
+                        )
+                    } else if e.is_timeout() {
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "upstream_error",
+                            "upstream timed out",
+                        )
+                    } else {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            "upstream_error",
+                            "upstream connection failed",
+                        )
+                    };
+                    meter.fail(status, detail);
+                    settle(meter).await;
+                    let _ = head.send(Err(Error::new(
+                        status,
+                        code,
+                        "Upstream request could not be completed",
+                    )));
+                    return;
+                }
+            }
+        };
+
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        meter.status = status.as_u16();
+        meter.success = status.is_success();
+        let mut inspector = Inspector::new(&content_type);
+        if meter.success {
+            inspector = inspector.with_characters(characters);
+            if let Some(input) = estimate {
+                inspector = inspector.with_estimate(input);
+            }
+        }
+
+        let (out_tx, mut out_rx) = mpsc::channel::<std::io::Result<Bytes>>(RELAY_BUFFER);
+        let mut gone = match response_head(&response, &meter, identity.as_ref(), balance, fallback)
+        {
+            Ok(headers) => {
+                let stream = async_stream::stream! {
+                    while let Some(item) = out_rx.recv().await {
+                        yield item;
+                    }
+                };
+                let mut out = Response::new(Body::from_stream(stream));
+                *out.status_mut() = status;
+                *out.headers_mut() = headers;
+                head.send(Ok(out)).is_err()
+            }
+            Err(e) => {
+                meter.fail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid response headers",
+                );
+                let _ = head.send(Err(e));
+                true
+            }
+        };
+
+        let mut source = response.bytes_stream();
+        loop {
+            let chunk = match tokio::time::timeout_at(deadline, source.next()).await {
+                Ok(Some(Ok(bytes))) => bytes,
+                Ok(None) => break,
+                Ok(Some(Err(_))) | Err(_) => {
+                    if !gone {
+                        meter.fail(StatusCode::BAD_GATEWAY, "upstream stream interrupted");
+                        let _ = out_tx
+                            .send(Err(std::io::Error::other("upstream stream interrupted")))
+                            .await;
+                    }
+                    break;
+                }
+            };
+            meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+            meter.bytes_out = meter.bytes_out.saturating_add(chunk.len() as i64);
+            inspector.feed(&chunk);
+            meter.usage = inspector.usage();
+            // After the client leaves, keep draining (inspecting, not
+            // buffering) so end-of-stream usage is still observed.
+            if !gone && out_tx.send(Ok(chunk)).await.is_err() {
+                gone = true;
+            }
+            if gone && meter.error.is_none() {
+                meter.status = 499;
+                meter.error = Some("client disconnected".into());
+            }
+        }
+        if gone && meter.error.is_none() {
+            meter.status = 499;
+            meter.error = Some("client disconnected".into());
+        }
+        meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+        inspector.finish();
+        meter.usage = inspector.usage();
+        // Settle before closing the body so a client that read to the end
+        // can rely on the books being up to date.
+        settle(meter).await;
+        drop(out_tx);
+    }
+}
+
+async fn settle(meter: Meter) {
+    if let Err(e) = meter.finish().await {
+        tracing::error!(error = %e, "request settlement failed");
+    }
+}
+
+/// Response headers returned to the client.
+fn response_head(
+    response: &reqwest::Response,
+    meter: &Meter,
+    identity: Option<&Identity>,
+    balance: Option<i64>,
+    fallback: Option<String>,
+) -> Result<HeaderMap> {
     let mut headers = forward_headers(response.headers(), false);
     let mut set = |name: &'static str, value: &str| -> Result<()> {
         headers.insert(
@@ -350,7 +604,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
         Ok(())
     };
     set("x-request-id", &meter.id)?;
-    if let Some(i) = &identity {
+    if let Some(i) = identity {
         set("x-key-prefix", &i.prefix)?;
     }
     if let Some(balance) = balance {
@@ -359,23 +613,20 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
     if let Some(model) = &fallback {
         set("x-model-fallback", model)?;
     }
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    meter.status = status.as_u16();
-    let stream = relay_body(response, meter, counter, content_type);
-    let mut out = Response::new(Body::from_stream(stream));
-    *out.status_mut() = status;
-    *out.headers_mut() = headers;
-    Ok(out)
+    Ok(headers)
 }
 
-/// Reads and rewrites the request body. Returns the effective model (empty
-/// when unknown) and the payload to send.
+/// A request body ready to send.
+struct Prepared {
+    /// Effective model (empty when unknown).
+    model: String,
+    payload: Payload,
+    /// The model is only learned while the upload streams; the allowlist is
+    /// enforced there instead of at admission.
+    model_pending: bool,
+}
+
+/// Reads and rewrites the request body.
 async fn prepare(
     config: &Config,
     kind: Kind,
@@ -383,7 +634,8 @@ async fn prepare(
     parts: &request::Parts,
     body: Body,
     counter: &UploadCounter,
-) -> Result<(String, Payload)> {
+    identity: Option<&Identity>,
+) -> Result<Prepared> {
     let upstream = kind.upstream(config);
     let content_type = parts
         .headers
@@ -422,7 +674,11 @@ async fn prepare(
             value["stream_options"]["include_usage"] = true.into();
         }
         let bytes = Bytes::from(serde_json::to_vec(&value)?);
-        return Ok((model, Payload::Json(value, bytes)));
+        return Ok(Prepared {
+            model,
+            payload: Payload::Json(value, bytes),
+            model_pending: false,
+        });
     }
 
     let max = config.max_stream_body_bytes;
@@ -435,24 +691,28 @@ async fn prepare(
     {
         return Err(Error::too_large("Upload exceeds limit"));
     }
-    let mut rewriter = multipart::boundary(content_type)
-        .filter(|_| config.model_policy != Policy::Passthrough && !upstream.model.is_empty())
-        .map(|boundary| {
-            Multipart::new(
-                &boundary,
-                &upstream.model,
-                config.model_policy == Policy::Force,
-                true,
-            )
-        });
+    // Multipart bodies are always parsed so the client's model is seen,
+    // whatever the policy; only the rewrite itself depends on it.
+    let configured = upstream.model.as_str();
+    let mut parser = multipart::boundary(content_type).map(|boundary| {
+        Multipart::new(
+            &boundary,
+            configured,
+            config.model_policy == Policy::Force && !configured.is_empty(),
+            config.model_policy != Policy::Passthrough && !configured.is_empty(),
+        )
+    });
     // A forced multipart model is known up front, so admission, metering,
     // and allowlists see it.
-    let model = if rewriter.is_some() && config.model_policy == Policy::Force {
-        upstream.model.clone()
+    let force = parser.is_some() && config.model_policy == Policy::Force && !configured.is_empty();
+    let model = if force {
+        configured.to_owned()
     } else {
         String::new()
     };
+    let model_pending = parser.is_some() && !force;
     let counter = counter.clone();
+    let identity = identity.cloned();
     let mut source = body.into_data_stream();
     let upload = async_stream::stream! {
         while let Some(chunk) = source.next().await {
@@ -463,9 +723,19 @@ async fn prepare(
                 yield Err(std::io::Error::other("upload exceeds limit"));
                 return;
             }
-            match &mut rewriter {
-                Some(r) => {
-                    let out = r.push(&chunk).map_err(std::io::Error::other)?;
+            match &mut parser {
+                Some(p) => {
+                    let out = match p.push(&chunk) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            yield Err(counter.reject(Error::bad(e)));
+                            return;
+                        }
+                    };
+                    if let Err(e) = observe_models(p, &counter, identity.as_ref()) {
+                        yield Err(e);
+                        return;
+                    }
                     if !out.is_empty() {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
                     }
@@ -473,52 +743,44 @@ async fn prepare(
                 None => yield Ok(chunk),
             }
         }
-        if let Some(r) = &mut rewriter {
-            let out = r.finish();
+        if let Some(p) = &mut parser {
+            let out = p.finish();
+            if counter.observed().model.is_none()
+                && identity.as_ref().is_some_and(|i| !i.limits.allowed_models.is_empty())
+            {
+                yield Err(counter.reject(Error::forbidden(
+                    "model_not_allowed",
+                    "This key is restricted to specific models; the request must name one",
+                )));
+                return;
+            }
             if !out.is_empty() {
                 yield Ok(Bytes::from(out));
             }
         }
     };
-    Ok((
+    Ok(Prepared {
         model,
-        Payload::Stream(Some(reqwest::Body::wrap_stream(upload))),
-    ))
+        payload: Payload::Stream(Some(reqwest::Body::wrap_stream(upload))),
+        model_pending,
+    })
 }
 
-/// Streams the upstream body to the client while inspecting usage; the meter
-/// settles at end of stream (or on drop if the client disconnects).
-fn relay_body(
-    response: reqwest::Response,
-    mut meter: Meter,
-    counter: UploadCounter,
-    content_type: String,
-) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> {
-    async_stream::stream! {
-        let mut source = response.bytes_stream();
-        let mut inspector = Inspector::new(&content_type);
-        while let Some(chunk) = source.next().await {
-            meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
-            match chunk {
-                Ok(bytes) => {
-                    meter.bytes_out = meter.bytes_out.saturating_add(bytes.len() as i64);
-                    inspector.feed(&bytes);
-                    meter.usage.clone_from(&inspector.usage);
-                    yield Ok(bytes);
-                }
-                Err(_) => {
-                    meter.fail(StatusCode::BAD_GATEWAY, "upstream stream interrupted");
-                    yield Err(std::io::Error::other("upstream stream interrupted"));
-                    break;
-                }
-            }
-        }
-        inspector.finish();
-        if !inspector.usage.is_empty() {
-            meter.usage = inspector.usage;
-        }
-        if let Err(e) = meter.finish().await {
-            tracing::error!(error = %e, "request settlement failed");
+/// Applies newly completed multipart model parts: records the effective
+/// model for metering and enforces the key's allowlist, aborting the upload
+/// with a `model_not_allowed` rejection when it does not pass.
+fn observe_models(
+    parser: &mut Multipart,
+    counter: &UploadCounter,
+    identity: Option<&Identity>,
+) -> std::result::Result<(), std::io::Error> {
+    for model in parser.take_models() {
+        counter.observed().model = Some(model.clone());
+        if let Some(identity) = identity
+            && let Err(e) = crate::meter::check_model(identity, &model)
+        {
+            return Err(counter.reject(e));
         }
     }
+    Ok(())
 }
