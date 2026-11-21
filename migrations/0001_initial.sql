@@ -48,7 +48,11 @@ CREATE TABLE requests (
  model TEXT NOT NULL, ip TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0,
  duration_ms INTEGER NOT NULL DEFAULT 0, bytes_in INTEGER NOT NULL DEFAULT 0, bytes_out INTEGER NOT NULL DEFAULT 0,
  tokens INTEGER NOT NULL DEFAULT 0 CHECK(tokens>=0), upstream_micro INTEGER NOT NULL DEFAULT 0 CHECK(upstream_micro>=0),
- billed_micro INTEGER NOT NULL DEFAULT 0 CHECK(billed_micro>=0), error TEXT, finished INTEGER NOT NULL DEFAULT 0
+ billed_micro INTEGER NOT NULL DEFAULT 0 CHECK(billed_micro>=0), error TEXT, finished INTEGER NOT NULL DEFAULT 0,
+ estimated INTEGER NOT NULL DEFAULT 0 CHECK(estimated IN (0,1)),
+ input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens>=0), output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(output_tokens>=0),
+ cached_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cached_tokens>=0), characters INTEGER NOT NULL DEFAULT 0 CHECK(characters>=0),
+ audio_ms INTEGER NOT NULL DEFAULT 0 CHECK(audio_ms>=0), images INTEGER NOT NULL DEFAULT 0 CHECK(images>=0)
 ) STRICT;
 CREATE INDEX requests_key_time ON requests(key_id,created_at);
 CREATE INDEX requests_account_time ON requests(account_id,created_at);
@@ -89,3 +93,5 @@ CREATE TABLE payment_transfers (
 ) STRICT;
 CREATE INDEX payment_transfers_payment ON payment_transfers(payment_id,seen_at);
 CREATE TABLE payment_events (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;
+CREATE TABLE pow_spent (challenge TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
+CREATE INDEX pow_spent_expires ON pow_spent(expires_at);

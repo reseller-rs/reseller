@@ -479,20 +479,6 @@ Webhooks are verified (HMAC-SHA256 with the decoded `whsec_` key, ±300 s) befor
 - **Shutdown:** SIGTERM/Ctrl-C drains connections and billing tasks; allow up to the upstream timeout.
 - **Crashes:** an abrupt process or machine failure can lose usage that an upstream has not yet reported; interrupted requests remain identifiable in the database.
 
-## Upgrading from 0.3
-
-Back up first, then start 0.4.0 on the existing database. Migration `0002_v0_4.sql` runs automatically and rewrites the stored settings: `free_credit_usd`, `free_credit_expiry_days`, `ip_limit_per_month`, `cooldown_seconds`, `global_hourly_limit`, and `ip_overrides` move into `[signup]`; `max_keys_per_account` becomes `keys.max_per_account`; and `default_limits` becomes `keys.default_limits`. New settings (`signup.pow_*`, `keys.max_new_per_day`, `keys.rotate_cooldown_seconds`, `[rate_limits]`, `[mcp]`) take their defaults. It also adds the `pow_spent` table and the `estimated`, `input_tokens`, `output_tokens`, `cached_tokens`, `characters`, `audio_ms`, and `images` columns on request logs. Update any seed TOML you keep (`reseller config export` writes the new layout).
-
-Breaking changes:
-
-- `POST /v1/keys` **requires authentication** and creates a child key on the caller's account; anonymous requests get `401`. Anonymous signup moved to `GET /v1/signup/challenge` + `POST /v1/signup` with proof of work (`pow_required`, `pow_invalid`, `pow_replayed`). Clients and scripts that minted keys anonymously must solve the challenge or use the web UI / `reseller mcp`.
-- Config keys moved as described above; the old top-level names are rejected in TOML files.
-- An invalid, expired, or already-used redeem code now returns `400 invalid_code` (previously a generic `invalid_request`), and repeated failures are rate limited.
-- Using a dashboard token on a proxy route returns `401 dashboard_token_not_allowed` (previously `invalid_api_key`); it no longer counts toward the auth-failure lockout.
-- `[prices.*]` gained `cached_input` (optional), `characters`, and `request`; existing entries keep working with those at their defaults. Requests whose upstream reports no usage on chat/responses/completions routes are now estimated and flagged instead of billed as zero.
-- Rotation by customers is limited (`rotate_cooldown`, `key_creation_daily_limit`) and counts toward `signup.global_hourly_limit`.
-- New per-IP `429` limits apply to management endpoints and failed credentials; if you run behind a reverse proxy, review `trust_proxy` first.
-
 ## Development
 
 ```sh
