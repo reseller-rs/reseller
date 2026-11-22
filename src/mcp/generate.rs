@@ -83,6 +83,9 @@ fn upstream_error(status: StatusCode, body: &[u8], request_id: Option<&str>) -> 
     ToolError::new("upstream_error", message)
 }
 
+/// The result `_meta` key of a generation's billing.
+const BILLING_META: &str = "reseller/billing";
+
 /// Billed cost, tokens and remaining balance for a finished request.
 async fn billing(ctx: &Ctx, request_id: Option<&str>) -> Result<Value, ToolError> {
     let account = ctx
@@ -112,20 +115,10 @@ async fn billing(ctx: &Ctx, request_id: Option<&str>) -> Result<Value, ToolError
     Ok(out)
 }
 
-fn billing_line(billing: &Value) -> String {
-    let mut line = String::new();
-    if let Some(cost) = billing["billed_usd"].as_str() {
-        line.push_str(&format!("Billed ${cost}"));
-        if let Some(tokens) = billing["tokens"].as_i64().filter(|t| *t > 0) {
-            line.push_str(&format!(" ({tokens} tokens)"));
-        }
-        line.push_str(". ");
-    }
-    line.push_str(&format!(
-        "Remaining balance: ${}.",
-        billing["balance_usd"].as_str().unwrap_or("unknown")
-    ));
-    line
+/// Result `_meta` carrying the billing of a request. Billing is for the client
+/// (and the person paying), not for the model, so it stays out of `content`.
+fn billing_meta(billing: Value) -> Option<Value> {
+    Some(json!({ BILLING_META: billing }))
 }
 
 fn post_json(ctx: &Ctx, path: &str, body: &Value) -> Result<Request<Body>, ToolError> {
@@ -215,17 +208,14 @@ pub(super) async fn text(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolErr
     let text = message_text(&choice["message"]["content"]);
     let billing = billing(ctx, reply.request_id.as_deref()).await?;
     Ok(Output {
-        content: vec![
-            json!({"type": "text", "text": text}),
-            json!({"type": "text", "text": billing_line(&billing)}),
-        ],
+        content: vec![json!({"type": "text", "text": text})],
         structured: Some(json!({
             "text": text,
             "model": value["model"],
             "finish_reason": choice["finish_reason"],
             "usage": value["usage"],
-            "billing": billing,
         })),
+        meta: billing_meta(billing),
     })
 }
 
@@ -278,16 +268,13 @@ pub(super) async fn speech(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolE
     };
     let billing = billing(ctx, reply.request_id.as_deref()).await?;
     Ok(Output {
-        content: vec![
-            json!({"type": "audio", "data": STANDARD.encode(&audio), "mimeType": mime}),
-            json!({"type": "text", "text": billing_line(&billing)}),
-        ],
+        content: vec![json!({"type": "audio", "data": STANDARD.encode(&audio), "mimeType": mime})],
         structured: Some(json!({
             "format": format,
             "mime_type": mime,
             "bytes": audio.len(),
-            "billing": billing,
         })),
+        meta: billing_meta(billing),
     })
 }
 
@@ -458,16 +445,13 @@ pub(super) async fn transcribe(ctx: &Ctx, arguments: &Value) -> Result<Output, T
     };
     let billing = billing(ctx, reply.request_id.as_deref()).await?;
     Ok(Output {
-        content: vec![
-            json!({"type": "text", "text": text}),
-            json!({"type": "text", "text": billing_line(&billing)}),
-        ],
+        content: vec![json!({"type": "text", "text": text})],
         structured: Some(json!({
             "text": text,
             "language": extra.as_ref().map(|v| v["language"].clone()),
             "duration": extra.as_ref().map(|v| v["duration"].clone()),
-            "billing": billing,
         })),
+        meta: billing_meta(billing),
     })
 }
 
@@ -589,10 +573,10 @@ pub(super) async fn image(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolEr
         ));
     }
     let billing = billing(ctx, reply.request_id.as_deref()).await?;
-    content.push(json!({"type": "text", "text": billing_line(&billing)}));
     Ok(Output {
         content,
-        structured: Some(json!({"images": described, "billing": billing})),
+        structured: Some(json!({"images": described})),
+        meta: billing_meta(billing),
     })
 }
 

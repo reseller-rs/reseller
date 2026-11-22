@@ -1013,12 +1013,17 @@ async fn generate_text_is_billed_like_the_http_api() {
     let data = &result["structuredContent"];
     assert_eq!(data["text"], "Hello there");
     assert_eq!(data["finish_reason"], "stop");
-    assert_eq!(result["content"][0]["text"], "Hello there");
+    // The model reads the result only: billing rides in `_meta`, for the client.
+    assert_eq!(
+        result["content"],
+        json!([{"type": "text", "text": "Hello there"}])
+    );
+    assert!(data.get("billing").is_none());
+    let billing = &result["_meta"]["reseller/billing"];
     // (1000 * 2 + 500 * 4) / 1e6 USD.
-    assert_eq!(data["billing"]["billed_usd"], "0.004");
-    assert_eq!(data["billing"]["tokens"], 1500);
-    assert_eq!(data["billing"]["balance_usd"], "0.246");
-    assert!(text_of(&result).contains("Remaining balance: $0.246"));
+    assert_eq!(billing["billed_usd"], "0.004");
+    assert_eq!(billing["tokens"], 1500);
+    assert_eq!(billing["balance_usd"], "0.246");
 
     // The upstream saw our credential and the translated request, never the client's token.
     {
@@ -1070,10 +1075,7 @@ async fn generate_text_is_billed_like_the_http_api() {
             "{column}"
         );
     }
-    assert_eq!(
-        data["billing"]["request_id"],
-        rows[0].get::<String, _>("id")
-    );
+    assert_eq!(billing["request_id"], rows[0].get::<String, _>("id"));
     assert_eq!(t.balance().await, "0.242");
 }
 
@@ -1175,7 +1177,8 @@ async fn generate_speech_returns_audio_and_is_billed_by_characters() {
         audio
     );
     // 9 characters * 15 / 1e6 USD.
-    assert_eq!(r["structuredContent"]["billing"]["billed_usd"], "0.000135");
+    assert_eq!(r["_meta"]["reseller/billing"]["billed_usd"], "0.000135");
+    assert_eq!(r["content"].as_array().unwrap().len(), 1);
     assert_eq!(r["structuredContent"]["bytes"], audio.len());
     let body: Value = serde_json::from_slice(&seen.lock().unwrap()[0].1).unwrap();
     assert_eq!(body["input"], "héllo 世界!");
@@ -1326,7 +1329,8 @@ async fn transcribe_audio_uploads_multipart_and_bills_duration() {
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(r["content"][0]["text"], "hello world");
     // 30 s * 0.002 USD.
-    assert_eq!(r["structuredContent"]["billing"]["billed_usd"], "0.06");
+    assert_eq!(r["_meta"]["reseller/billing"]["billed_usd"], "0.06");
+    assert_eq!(r["content"].as_array().unwrap().len(), 1);
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].0, "Bearer upstream-secret");
@@ -1400,14 +1404,14 @@ async fn generate_image_returns_inline_images_and_never_fetches_urls() {
         PNG
     );
     assert!(content[1]["text"].as_str().unwrap().contains("/secret.png"));
-    // file: URLs are dropped. The summary line is last.
-    assert_eq!(content.len(), 3);
+    // file: URLs are dropped, and billing is not content.
+    assert_eq!(content.len(), 2);
     assert_eq!(
         r["structuredContent"]["images"][0]["revised_prompt"],
         "a red cat"
     );
     // 3 images at 0.04 USD.
-    assert!(r["structuredContent"]["billing"]["billed_usd"].is_string());
+    assert!(r["_meta"]["reseller/billing"]["billed_usd"].is_string());
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         *hits.lock().unwrap(),

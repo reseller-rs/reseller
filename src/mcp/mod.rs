@@ -127,10 +127,12 @@ impl From<sqlx::Error> for ToolError {
     }
 }
 
-/// Successful tool output: content blocks plus optional structured data.
+/// Successful tool output: content blocks (what the model reads), optional
+/// structured data, and optional result `_meta` (for the client, not the model).
 pub(crate) struct Output {
     pub content: Vec<Value>,
     pub structured: Option<Value>,
+    pub meta: Option<Value>,
 }
 
 impl Output {
@@ -139,6 +141,7 @@ impl Output {
         Self {
             content: vec![json!({"type": "text", "text": value.to_string()})],
             structured: Some(value),
+            meta: None,
         }
     }
 
@@ -146,6 +149,9 @@ impl Output {
         let mut out = json!({"content": self.content, "isError": false});
         if let Some(s) = self.structured {
             out["structuredContent"] = s;
+        }
+        if let Some(m) = self.meta {
+            out["_meta"] = m;
         }
         out
     }
