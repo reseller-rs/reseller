@@ -185,21 +185,6 @@ impl RpcError {
         .bad_request()
     }
 
-    /// A rejected `initialize` (legacy era) names every supported version.
-    pub fn initialize_rejected(requested: &str) -> Self {
-        Self {
-            data: Some(json!({"supported": SUPPORTED_VERSIONS, "requested": requested})),
-            ..Self::new(
-                INVALID_PARAMS,
-                format!(
-                    "Unsupported protocol version. This server supports {}",
-                    SUPPORTED_VERSIONS.join(", ")
-                ),
-            )
-        }
-        .bad_request()
-    }
-
     /// A modern request that does not carry the required `_meta` fields.
     pub fn missing_meta(message: impl Into<String>) -> Self {
         Self::new(INVALID_PARAMS, message).bad_request()
@@ -515,11 +500,10 @@ async fn legacy_dispatch(
 ) -> std::result::Result<Value, RpcError> {
     match method {
         "initialize" => {
-            let requested = params["protocolVersion"]
-                .as_str()
-                .ok_or_else(|| RpcError::new(INVALID_PARAMS, "protocolVersion is required"))?;
-            if requested != LEGACY_VERSION {
-                return Err(RpcError::initialize_rejected(requested));
+            // Any requested revision gets the one handshake revision served here: the client then
+            // goes on with it or disconnects, as the 2025-11-25 lifecycle says.
+            if !params["protocolVersion"].is_string() {
+                return Err(RpcError::new(INVALID_PARAMS, "protocolVersion is required"));
             }
             Ok(json!({
                 "protocolVersion": LEGACY_VERSION,

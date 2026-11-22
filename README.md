@@ -551,7 +551,7 @@ Failures use `{ "error": { "code": "...", "message": "..." } }`.
 
 Agents can use the service through the Model Context Protocol. There are two ways to connect.
 
-- **Remote endpoint:** a stateless Streamable HTTP endpoint at `POST /mcp`. It supports protocol `2026-07-28` (current) and the legacy `2025-11-25` handshake. Older revisions are rejected.
+- **Remote endpoint:** a stateless Streamable HTTP endpoint at `POST /mcp`. It supports protocol `2026-07-28` (current) and the legacy `2025-11-25` handshake. An `initialize` that asks for an older revision is answered with `2025-11-25`; requests that name an older revision in `MCP-Protocol-Version` are refused.
 - **Local bridge:** `reseller mcp` runs next to the agent. It keeps credentials and the signup proof of work on the agent's machine.
 
 Generation tools go through the same admission, limits, metering, and model policy as the HTTP API. Set `[mcp].enabled = false` to turn the endpoint off. It then answers `404 mcp_disabled`.

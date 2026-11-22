@@ -497,11 +497,10 @@ impl Bridge {
     async fn legacy_dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
         match method {
             "initialize" => {
-                let requested = params["protocolVersion"]
-                    .as_str()
-                    .ok_or_else(|| RpcError::new(-32602, "protocolVersion is required"))?;
-                if requested != LEGACY_VERSION {
-                    return Err(RpcError::initialize_rejected(requested));
+                // Any requested revision gets the one handshake revision served here: the client
+                // then goes on with it or disconnects, as the 2025-11-25 lifecycle says.
+                if !params["protocolVersion"].is_string() {
+                    return Err(RpcError::new(-32602, "protocolVersion is required"));
                 }
                 self.legacy.store(true, Ordering::Relaxed);
                 Ok(json!({

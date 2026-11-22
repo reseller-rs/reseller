@@ -96,7 +96,7 @@ Every request is self-describing. There is no handshake and no state between req
 
 A request without modern `_meta` is served with 2025-11-25 semantics.
 
-1. Send `initialize` without the `MCP-Protocol-Version` header. It must request `2025-11-25`. Any other version is refused with `400`, `-32602`, and `error.data.supported`.
+1. Send `initialize` without the `MCP-Protocol-Version` header. The result always names `2025-11-25`: a client that requested another revision continues with it or disconnects, as the 2025-11-25 lifecycle says. An `initialize` without `protocolVersion` is refused with `400` and `-32602`.
 2. Send `MCP-Protocol-Version: 2025-11-25` on every later request. A request without the header, or with another unsupported version, is refused with `-32020` or `-32022`.
 
 Nothing is stored on the server. No session is created.
@@ -184,9 +184,8 @@ It forwards `tools/list` and `tools/call` to the remote `/mcp` endpoint, using t
   - Errors use `-32602` (missing `_meta`, unknown tool, or cursor), `-32022` (unsupported version, with the supported list), or `-32601` (unknown method, including `ping`).
   - `notifications/cancelled` stops a request that is still in flight.
 - **Legacy (2025-11-25):**
-  - An `initialize` that requests `2025-11-25` switches the process to the legacy era.
+  - An `initialize` switches the process to the legacy era. Its result names `2025-11-25`, whatever revision was requested.
   - `ping`, `tools/list`, and `tools/call` then work without `_meta` and return 2025-11-25-shaped results.
-  - Other `initialize` versions are rejected with `-32602` and `error.data.supported`.
   - A request without `_meta` before any `initialize` gets `-32602`.
 
 ### Bridge flags
@@ -306,7 +305,7 @@ Failures appear at three levels.
 | `-32700` | Parse error | 400 | The body is not valid JSON |
 | `-32600` | Invalid request | 400 | Malformed envelope, or a batch |
 | `-32601` | Method not found | 404 (modern era) | Unknown or unserved method, including `ping` in the modern era |
-| `-32602` | Invalid params | 400 | Bad params, unknown tool, cursor on `tools/list`, missing or malformed `_meta`, or a refused legacy `initialize` version |
+| `-32602` | Invalid params | 400 | Bad params, unknown tool, cursor on `tools/list`, missing or malformed `_meta`, or a legacy `initialize` without `protocolVersion` |
 | `-32020` | HeaderMismatch | 400 | `MCP-Protocol-Version`, `Mcp-Method`, or `Mcp-Name` is missing, or disagrees with the body |
 | `-32021` | Not returned | n/a | Client capabilities are never required by this server |
 | `-32022` | Unsupported protocol version | 400 | Requested version is not supported. `error.data.supported` lists the supported versions. |

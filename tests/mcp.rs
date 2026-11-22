@@ -711,8 +711,9 @@ async fn legacy_initialize_flow_still_works() {
 }
 
 #[tokio::test]
-async fn older_handshake_versions_are_rejected() {
+async fn older_handshake_versions_are_answered_with_the_legacy_version() {
     let t = Test::new().await;
+    // The 2025-11-25 lifecycle: a server answers a revision it does not speak with one it does.
     for version in ["2025-06-18", "2025-03-26", "1999-01-01", MODERN] {
         let r = t
             .legacy(
@@ -720,21 +721,8 @@ async fn older_handshake_versions_are_rejected() {
                 json!({"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"t","version":"1"}}),
             )
             .await;
-        assert_eq!(
-            (r.status, r.body["error"]["code"].as_i64()),
-            (400, Some(-32602)),
-            "{version}"
-        );
-        assert_eq!(
-            r.body["error"]["data"]["supported"],
-            json!([MODERN, LEGACY])
-        );
-        assert_eq!(r.body["error"]["data"]["requested"], version);
-        let message = r.body["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains(MODERN) && message.contains(LEGACY),
-            "{message}"
-        );
+        assert_eq!(r.status, 200, "{version}");
+        assert_eq!(r.body["result"]["protocolVersion"], LEGACY, "{version}");
     }
     let r = t.legacy("initialize", json!({})).await;
     assert_eq!(r.body["error"]["code"], -32602);
@@ -1817,17 +1805,10 @@ async fn bridge_legacy_initialize_still_works() {
             .await
             .is_none()
     );
-    // Older handshake versions are rejected and do not open the legacy era.
-    for version in ["2025-06-18", "2025-03-26"] {
-        let r = b
-            .send_raw("initialize", json!({"protocolVersion":version}))
-            .await;
-        assert_eq!(r["error"]["code"], -32602, "{version}");
-        assert_eq!(r["error"]["data"]["supported"], json!([MODERN, LEGACY]));
-    }
     assert_eq!(b.send_raw("ping", json!({})).await["error"]["code"], -32602);
+    // An older handshake revision is answered with the one the bridge speaks.
     let init = b
-        .send_raw("initialize", json!({"protocolVersion":LEGACY}))
+        .send_raw("initialize", json!({"protocolVersion":"2025-06-18"}))
         .await;
     let result = &init["result"];
     assert_eq!(result["protocolVersion"], LEGACY);
