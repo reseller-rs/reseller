@@ -369,7 +369,7 @@ async fn discover_advertises_versions_capabilities_and_identity() {
     assert!(result["ttlMs"].as_u64().unwrap() > 0);
     assert_server_info(result);
     let instructions = result["instructions"].as_str().unwrap();
-    for needle in ["Bearer", "create_account", "generate_text", "$0.25"] {
+    for needle in ["Bearer", "create_account", "generate_text", "$0.10"] {
         assert!(instructions.contains(needle), "{needle}: {instructions}");
     }
     // Discovery and the tool list are identical for every caller.
@@ -985,7 +985,7 @@ async fn tools_need_the_right_credential() {
     for token in [t.dashboard(), t.api_key()] {
         let r = t.tool(Some(token), "account_overview", json!({})).await;
         assert_eq!(r["isError"], false);
-        assert_eq!(r["structuredContent"]["account"]["balance_usd"], "0.25");
+        assert_eq!(r["structuredContent"]["account"]["balance_usd"], "0.1");
     }
     let plans = t.tool(None, "list_plans", json!({})).await;
     assert_eq!(plans["isError"], false);
@@ -1023,7 +1023,7 @@ async fn generate_text_is_billed_like_the_http_api() {
     // (1000 * 2 + 500 * 4) / 1e6 USD.
     assert_eq!(billing["billed_usd"], "0.004");
     assert_eq!(billing["tokens"], 1500);
-    assert_eq!(billing["balance_usd"], "0.246");
+    assert_eq!(billing["balance_usd"], "0.096");
 
     // The upstream saw our credential and the translated request, never the client's token.
     {
@@ -1076,7 +1076,7 @@ async fn generate_text_is_billed_like_the_http_api() {
         );
     }
     assert_eq!(billing["request_id"], rows[0].get::<String, _>("id"));
-    assert_eq!(t.balance().await, "0.242");
+    assert_eq!(t.balance().await, "0.092");
 }
 
 #[tokio::test]
@@ -1126,7 +1126,7 @@ async fn generate_text_validates_arguments_and_reports_failures() {
 }
 
 #[tokio::test]
-async fn insufficient_balance_is_a_tool_error_with_the_code() {
+async fn insufficient_quota_is_a_tool_error_with_the_code() {
     let mut t = Test::new().await;
     let seen = Arc::default();
     t.mock(llm, recording(Arc::clone(&seen), chat_reply)).await;
@@ -1138,8 +1138,8 @@ async fn insufficient_balance_is_a_tool_error_with_the_code() {
     let r = t
         .tool(Some(t.api_key()), "generate_text", json!({"prompt":"x"}))
         .await;
-    assert_eq!(error_code(&r), "insufficient_balance");
-    assert!(text_of(&r).contains("insufficient_balance"));
+    assert_eq!(error_code(&r), "insufficient_quota");
+    assert!(text_of(&r).contains("insufficient_quota"));
     assert!(seen.lock().unwrap().is_empty());
 }
 
@@ -1437,15 +1437,19 @@ async fn generate_image_returns_inline_images_and_never_fetches_urls() {
 }
 
 #[tokio::test]
-async fn list_models_goes_through_the_proxy() {
-    let mut t = Test::new().await;
-    t.mock(
-        llm,
-        Router::new().fallback(any(|| async {
-            Json(json!({"object":"list","data":[{"id":"m"},{"id":"other"}]}))
-        })),
-    )
-    .await;
+async fn list_models_lists_the_catalog() {
+    let t = Test::new().await;
+    t.app.config_mut().await.models = vec![
+        reseller::config::Model {
+            id: "m".into(),
+            ..Default::default()
+        },
+        reseller::config::Model {
+            id: "other".into(),
+            upstream: "vendor/other".into(),
+            ..Default::default()
+        },
+    ];
     let r = t.tool(Some(t.api_key()), "list_models", json!({})).await;
     assert_eq!(r["structuredContent"]["models"], json!(["m", "other"]));
 }
@@ -1679,7 +1683,7 @@ async fn account_creation_through_tools() {
     let overview = t.tool(Some(&key), "account_overview", json!({})).await;
     assert_eq!(
         overview["structuredContent"]["account"]["balance_usd"],
-        "0.25"
+        "0.1"
     );
     let text = t
         .tool(Some(&key), "generate_text", json!({"prompt":"hi"}))
@@ -1945,7 +1949,7 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
     let who = b.tool("whoami", json!({})).await;
     let who = &who["structuredContent"];
     assert_eq!(who["signed_in"], true);
-    assert_eq!(who["balance_usd"], "0.25");
+    assert_eq!(who["balance_usd"], "0.1");
     assert_eq!(who["key_prefix"], api_key[..15]);
     assert!(!who.to_string().contains(&api_key));
 

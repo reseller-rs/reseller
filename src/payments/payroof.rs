@@ -13,7 +13,7 @@
 //! The order is paid once the confirmed value covers the price, within the
 //! configured underpayment tolerance. Payments in several assets, or several
 //! transfers, add up.
-use super::{complete, create_order, first_delivery, provider_error, unavailable};
+use super::{complete, create_order, deposits, first_delivery, provider_error, unavailable};
 use crate::{
     App,
     config::{Config, Payroof, RateSource},
@@ -165,7 +165,7 @@ pub fn verify(secret: &str, timestamp: &str, signature: &str, body: &[u8], now: 
 ///
 /// A 429 or 503 response maps to a 503 error. Any other failure maps to a 502
 /// error.
-async fn call(
+pub(super) async fn call(
     app: &App,
     config: &Payroof,
     method: Method,
@@ -200,7 +200,7 @@ async fn call(
 }
 
 /// Path of the project resource, such as `/v1/projects/<name>`.
-fn project_path(config: &Payroof) -> String {
+pub(super) fn project_path(config: &Payroof) -> String {
     format!("/v1/projects/{}", config.project)
 }
 
@@ -397,13 +397,7 @@ pub(super) async fn checkout(
             ))
         })
         .collect();
-    let allowed_chain = |chain: &str| {
-        settings.chains.is_empty()
-            || settings
-                .chains
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(chain))
-    };
+    let allowed_chain = |chain: &str| settings.allows_chain(chain);
     let natives: Vec<String> = if settings.native_coins {
         chains
             .iter()
@@ -526,17 +520,17 @@ pub fn transfer_json(r: &SqliteRow) -> Value {
 
 /// A Payroof webhook delivery.
 #[derive(Debug, Deserialize)]
-struct Event {
-    id: String,
-    event: String,
-    transfer: String,
-    project: String,
-    reference: String,
-    chain: String,
-    asset: String,
-    address: String,
-    transaction: String,
-    amount: String,
+pub(super) struct Event {
+    pub(super) id: String,
+    pub(super) event: String,
+    pub(super) transfer: String,
+    pub(super) project: String,
+    pub(super) reference: String,
+    pub(super) chain: String,
+    pub(super) asset: String,
+    pub(super) address: String,
+    pub(super) transaction: String,
+    pub(super) amount: String,
 }
 
 /// Reads a header as text, or returns an empty string when it is absent or
@@ -569,20 +563,39 @@ pub async fn webhook(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<Valu
     if event.project != settings.project || !matches!(event.event.as_str(), "seen" | "confirmed") {
         return Ok(json!({"received": true, "ignored": true}));
     }
+    // The catalog is fetched before the write lock is taken. When it is
+    // unavailable, the error status makes Payroof deliver the event again.
+    let deposit = deposits::account_of(&event.reference);
+    let chains = match deposit {
+        Some(_) if event.event == "confirmed" => Some(catalog(app, settings).await?),
+        _ => None,
+    };
     let mut tx = db::write(&app.db).await?;
     if !first_delivery(&mut tx, &format!("payroof:{}", event.id)).await? {
         return Ok(json!({"received": true, "duplicate": true}));
     }
-    let Some(order) = sqlx::query("SELECT * FROM payments WHERE id=? AND provider='payroof'")
+    if let Some(order) = sqlx::query("SELECT * FROM payments WHERE id=? AND provider='payroof'")
         .bind(&event.reference)
         .fetch_optional(&mut *tx)
         .await?
-    else {
+    {
+        record_transfer(&mut tx, &order, &event, settings).await?;
+    } else if let Some(account) = deposit
+        && deposits::account_exists(&mut tx, account).await?
+    {
+        deposits::record(
+            &mut tx,
+            account,
+            &event,
+            settings,
+            chains.as_ref().map(|c| c.as_slice()),
+        )
+        .await?;
+    } else {
         // References may belong to other applications sharing the project.
         tx.commit().await?;
         return Ok(json!({"received": true, "ignored": true}));
-    };
-    record_transfer(&mut tx, &order, &event, settings).await?;
+    }
     tx.commit().await?;
     Ok(json!({"received": true}))
 }

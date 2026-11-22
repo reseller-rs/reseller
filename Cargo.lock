@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "reseller"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1668,6 +1668,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac",
+ "percent-encoding",
  "reqwest",
  "rust_decimal",
  "serde",

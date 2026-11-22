@@ -449,7 +449,7 @@ async fn expired_credit_is_not_spendable() {
         .await
         .unwrap();
     let result = Meter::begin(&t.app, Some(t.identity(&k).await), meta()).await;
-    assert!(matches!(result,Err(e) if e.status.as_u16()==402));
+    assert!(matches!(result,Err(e) if e.status.as_u16()==429));
 }
 #[tokio::test]
 async fn redemption_is_atomic_under_retries() {
@@ -484,7 +484,7 @@ async fn redemption_is_atomic_under_retries() {
         billing::account(&t.app, k["account_id"].as_str().unwrap())
             .await
             .unwrap()["account"]["balance_usd"],
-        "10.25"
+        "10.1"
     );
 }
 #[tokio::test]
@@ -524,7 +524,7 @@ async fn plan_grants_expiring_credit_and_bypasses_ip_allowance() {
         .is_ok()
     );
     let v = billing::account(&t.app, aid).await.unwrap();
-    assert_eq!(v["account"]["balance_usd"], "20.25");
+    assert_eq!(v["account"]["balance_usd"], "20.1");
     assert!(v["account"]["subscription"]["expires_at"].as_i64().unwrap() > db::now());
 }
 #[tokio::test]
@@ -549,7 +549,7 @@ async fn rpm_is_persistent_and_model_allowlist_applies() {
     i.limits.rpm = Some(1);
     i.limits.allowed_models = vec!["other".into()];
     assert!(
-        matches!(Meter::begin(&t.app,Some(i.clone()),meta()).await,Err(e) if e.code=="model_not_allowed")
+        matches!(Meter::begin(&t.app,Some(i.clone()),meta()).await,Err(e) if e.code=="model_not_found")
     );
     i.limits.allowed_models = vec!["test-model".into()];
     Meter::begin(&t.app, Some(i.clone()), meta())
@@ -579,7 +579,7 @@ async fn metering_commits_debit_log_and_aggregates_once() {
     let a = billing::account(&t.app, k["account_id"].as_str().unwrap())
         .await
         .unwrap();
-    assert_eq!(a["account"]["balance_usd"], "0.237");
+    assert_eq!(a["account"]["balance_usd"], "0.087");
     let r = sqlx::query("SELECT finished,billed_micro FROM requests")
         .fetch_one(&t.app.db)
         .await
@@ -1061,7 +1061,7 @@ async fn payment_webhook_uses_snapshot_and_grants_only_once() {
             .unwrap();
     }
     let v = billing::account(&t.app, aid).await.unwrap();
-    assert_eq!(v["account"]["balance_usd"], "25.25");
+    assert_eq!(v["account"]["balance_usd"], "25.1");
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions")
         .fetch_one(&t.app.db)
         .await

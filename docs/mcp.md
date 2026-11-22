@@ -278,7 +278,7 @@ Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempoten
 1. The agent calls `whoami`, or any tool. Before signup, the response shows `signed_in: false` and the error code `not_signed_in`.
 2. The agent calls `signup`, optionally with `name` and `contact`. The bridge fetches `GET /v1/signup/challenge`, finds the proof-of-work number locally, posts to `POST /v1/signup`, and writes the credential file. The result shows only the account ID and key prefix.
 3. The agent calls `whoami` to see the trial balance, then uses `generate_text` and the other tools.
-4. When credit runs out (`insufficient_balance`), the agent calls `list_plans` and `start_checkout`. Alternatively, the user redeems a code with `redeem_code`.
+4. When credit runs out (`insufficient_quota`), the agent calls `list_plans` and `start_checkout`. Alternatively, the user redeems a code with `redeem_code`.
 5. To use an existing account, either set `RESELLER_TOKEN` before starting the bridge, or call `login`. Supply the credentials outside the transcript where possible.
 
 ### With the remote endpoint and no credential
@@ -296,7 +296,7 @@ Self-service signup can be disabled. Then the response is `403 signup_disabled`,
 
 Failures appear at three levels.
 
-1. **HTTP errors before the protocol layer.** Credential, origin, version, size, and rate-limit problems use the standard API shape, `{"error":{"code","message"}}`, with the usual status.
+1. **HTTP errors before the protocol layer.** Credential, origin, version, size, and rate-limit problems use the standard API shape, `{"error":{"message","type","param","code"}}`, with the usual status.
 2. **JSON-RPC errors.** These report protocol misuse. Unknown tools and malformed requests are protocol errors.
 3. **Tool errors.** These report failures while running a valid call. They are normal results with `resultType: "complete"` and `isError: true`.
 
@@ -336,8 +336,8 @@ A tool error has `isError: true`. The text reads `<message> (error code: <code>)
 | `authentication_required` | No credential. Sign up or log in. |
 | `dashboard_token_not_allowed` | The tool needs an API key. Use `create_key`, or use the API key. |
 | `invalid_api_key`, `key_revoked`, `key_blocked`, `key_expired`, `account_suspended` | Credential problems. Rotate or replace the key, or contact the operator. |
-| `insufficient_balance` (402) | Out of credit. Use `list_plans` and `start_checkout`, or `redeem_code`. |
-| `model_not_allowed` | The key's allowlist excludes the model. Omit `model`, or use `list_models`. |
+| `insufficient_quota` (429) | Out of credit. Use `list_plans` and `start_checkout`, or `redeem_code`. |
+| `model_not_found` (404) | The model is unknown or the key's allowlist excludes it. Omit `model`, or use `list_models`. |
 | `rate_limit_exceeded`, `request_limit_exceeded`, `token_limit_exceeded`, `spend_limit_exceeded`, `concurrency_limit_exceeded` | Wait `retry_after_seconds` when it is given. |
 | `creation_cooldown`, `ip_key_limit`, and other key or signup guards | Wait, then retry. See the README rate-limit table. |
 | `pow_required`, `pow_invalid`, `pow_replayed` | The signup proof of work is missing, wrong or expired, or already used. Fetch a new challenge. |

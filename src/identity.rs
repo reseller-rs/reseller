@@ -87,10 +87,7 @@ pub async fn authenticate(
     let proxy = scope == Scope::Proxy;
     let Some(token) = token(headers) else {
         return if proxy && config.require_key {
-            Err(Error::unauthorized(
-                "missing_api_key",
-                "An API key is required",
-            ))
+            Err(missing_credential())
         } else {
             Ok(None)
         };
@@ -158,12 +155,11 @@ pub async fn authenticate(
 pub async fn required(app: &App, headers: &HeaderMap) -> Result<Identity> {
     authenticate(app, headers, Scope::Manage)
         .await?
-        .ok_or_else(|| {
-            Error::unauthorized(
-                "missing_api_key",
-                "Sign in with an API key or dashboard token",
-            )
-        })
+        .ok_or_else(missing_credential)
+}
+
+fn missing_credential() -> Error {
+    Error::unauthorized("missing_api_key", "Missing bearer authentication in header")
 }
 
 /// Verifies the administrator token in constant time.

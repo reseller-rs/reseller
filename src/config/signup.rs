@@ -35,7 +35,7 @@ impl Default for Signup {
     fn default() -> Self {
         Self {
             enabled: true,
-            free_credit_usd: "0.25".into(),
+            free_credit_usd: "0.10".into(),
             free_credit_expiry_days: 30,
             ip_limit_per_month: 2,
             cooldown_seconds: 30,

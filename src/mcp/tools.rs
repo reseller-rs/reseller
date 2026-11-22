@@ -460,7 +460,7 @@ pub(super) fn instructions(config: &Config) -> String {
          \n\
          Pricing: usage is billed in USD against prepaid credit. Every generation result reports its \
          billed cost, tokens and the remaining balance. {signup} Use list_plans and start_checkout to add credit; \
-         insufficient_balance errors mean the balance is exhausted. Rate limits return an error with a retry delay.",
+         insufficient_quota errors mean the balance is exhausted. Rate limits return an error with a retry delay.",
         name = config.branding.name,
     )
 }

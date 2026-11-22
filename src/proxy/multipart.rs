@@ -1,5 +1,9 @@
 //! Streaming `multipart/form-data` rewriter that applies the model policy to
 //! uploads (for example speech-to-text) without buffering file payloads.
+use crate::error::{Error, Result};
+
+/// Maps the model name a client sent to the one forwarded.
+type Resolver = Box<dyn Fn(&str) -> Result<String> + Send + Sync>;
 
 /// Longest accepted `model` form value, in bytes (matches the allowlist entry
 /// limit).
@@ -25,6 +29,10 @@ pub struct Multipart {
     capture: Option<Vec<u8>>,
     /// Effective model values completed since the last `take_models`.
     observed: Vec<String>,
+    /// Maps the client's model, which is then held back until its part ends.
+    resolver: Option<Resolver>,
+    /// Models the resolver produced since the last `take_resolved`.
+    resolved: Vec<String>,
     state: Part,
     buf: Vec<u8>,
 }
@@ -50,17 +58,34 @@ impl Multipart {
             discard: false,
             capture: None,
             observed: Vec::new(),
+            resolver: None,
+            resolved: Vec::new(),
             state: Part::Preamble,
             buf: Vec::new(),
         }
+    }
+    /// Rewrites the model the client sent with `resolver`. Its error aborts
+    /// the body. The value is held until its part is complete, then replaced.
+    #[must_use]
+    pub fn with_resolver(
+        mut self,
+        resolver: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.resolver = Some(Box::new(resolver));
+        self
     }
     /// Effective model values whose parts completed since the last call, in
     /// body order. An injected model is reported when the body closes.
     pub fn take_models(&mut self) -> Vec<String> {
         std::mem::take(&mut self.observed)
     }
+    /// Models the resolver produced for completed parts since the last call.
+    /// They are not in [`Multipart::take_models`].
+    pub fn take_resolved(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.resolved)
+    }
     /// Feeds one input chunk. Returns the bytes that should be forwarded.
-    pub fn push(&mut self, chunk: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(chunk.len() + self.model.len() + 64);
         while self.step(&mut out)? {}
@@ -74,7 +99,7 @@ impl Multipart {
         }
         std::mem::take(&mut self.buf)
     }
-    fn step(&mut self, out: &mut Vec<u8>) -> std::result::Result<bool, String> {
+    fn step(&mut self, out: &mut Vec<u8>) -> Result<bool> {
         match self.state {
             Part::Preamble => {
                 let Some(i) = find(&self.buf, &self.marker) else {
@@ -134,7 +159,7 @@ impl Multipart {
             Part::Headers => {
                 let Some(i) = find(&self.buf, b"\r\n\r\n") else {
                     if self.buf.len() > PART_HEADER_LIMIT {
-                        return Err("multipart part headers exceed limit".into());
+                        return Err(Error::bad("multipart part headers exceed limit"));
                     }
                     return Ok(false);
                 };
@@ -151,6 +176,7 @@ impl Multipart {
                         self.discard = true;
                     } else {
                         self.capture = Some(Vec::new());
+                        self.discard = self.resolver.is_some();
                     }
                 }
                 self.state = Part::Body;
@@ -176,8 +202,20 @@ impl Multipart {
                 self.capture_value(i)?;
                 if let Some(value) = self.capture.take() {
                     let value = String::from_utf8(value)
-                        .map_err(|_| "model must be valid UTF-8".to_owned())?;
-                    self.observed.push(value);
+                        .map_err(|_| Error::bad("model must be valid UTF-8"))?;
+                    match self.resolver.as_ref().filter(|_| !value.is_empty()) {
+                        Some(resolve) => {
+                            let upstream = resolve(&value)?;
+                            out.extend_from_slice(upstream.as_bytes());
+                            self.resolved.push(upstream);
+                        }
+                        None => {
+                            if self.discard {
+                                out.extend_from_slice(value.as_bytes());
+                            }
+                            self.observed.push(value);
+                        }
+                    }
                 } else if self.discard {
                     self.observed
                         .push(String::from_utf8_lossy(&self.model).into_owned());
@@ -196,11 +234,11 @@ impl Multipart {
 }
 impl Multipart {
     /// Appends `self.buf[..end]` to the model value being captured.
-    fn capture_value(&mut self, end: usize) -> std::result::Result<(), String> {
+    fn capture_value(&mut self, end: usize) -> Result<()> {
         if let Some(value) = &mut self.capture {
             value.extend_from_slice(&self.buf[..end]);
             if value.len() > MODEL_LIMIT {
-                return Err(format!("model exceeds {MODEL_LIMIT} bytes"));
+                return Err(Error::bad(format!("model exceeds {MODEL_LIMIT} bytes")));
             }
         }
         Ok(())

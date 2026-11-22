@@ -61,6 +61,12 @@ pub struct Payroof {
     pub quote_ttl_minutes: u32,
     /// Accepted underpayment, in percent of the order price.
     pub underpayment_tolerance_pct: String,
+    /// Give every account a standing deposit address. Stablecoin transfers
+    /// to it are credited automatically.
+    pub deposits: bool,
+    /// Typical minutes from a deposit until it is credited. Shown to
+    /// customers only.
+    pub deposit_eta_minutes: u32,
 }
 
 impl Default for Payroof {
@@ -92,6 +98,8 @@ impl Default for Payroof {
             native_rates_usd: BTreeMap::new(),
             quote_ttl_minutes: 60,
             underpayment_tolerance_pct: "0.5".into(),
+            deposits: true,
+            deposit_eta_minutes: 5,
         }
     }
 }
@@ -100,6 +108,16 @@ impl Payroof {
     /// Whether crypto checkout is offered (project, token, and webhook secret are set).
     pub fn enabled(&self) -> bool {
         !self.project.is_empty() && !self.token.is_empty() && !self.webhook_secret.is_empty()
+    }
+
+    /// Whether accounts get standing deposit addresses.
+    pub fn deposits_enabled(&self) -> bool {
+        self.enabled() && self.deposits
+    }
+
+    /// Whether payments are accepted on the CAIP-2 chain id `chain`.
+    pub fn allows_chain(&self, chain: &str) -> bool {
+        self.chains.is_empty() || self.chains.iter().any(|c| c.eq_ignore_ascii_case(chain))
     }
 
     /// API origin without a trailing slash.
@@ -140,6 +158,10 @@ impl Payroof {
         anyhow::ensure!(
             (1..=1440).contains(&self.quote_ttl_minutes),
             "payroof.quote_ttl_minutes must be 1-1440"
+        );
+        anyhow::ensure!(
+            (1..=1440).contains(&self.deposit_eta_minutes),
+            "payroof.deposit_eta_minutes must be 1-1440"
         );
         let tolerance = crate::money::decimal(&self.underpayment_tolerance_pct)
             .context("payroof.underpayment_tolerance_pct")?;

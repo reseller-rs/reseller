@@ -2,7 +2,7 @@
 use super::{
     Kind,
     inspect::{RealtimeEvent, realtime_event},
-    timeout, upstream_headers,
+    models, timeout, upstream_headers,
 };
 use crate::{
     App,
@@ -36,20 +36,26 @@ const SETTLE_GRACE: Duration = Duration::from_secs(5);
 type UpstreamSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Applies the model policy to the `model` query parameter and returns the
-/// effective model.
-fn apply_model_policy(url: &mut url::Url, configured: &str, policy: Policy) -> String {
+/// effective model, and whether the policy wrote it.
+fn apply_model_policy(url: &mut url::Url, configured: &str, policy: Policy) -> (String, bool) {
     let requested = url
         .query_pairs()
         .find(|(k, _)| k == "model")
         .map(|(_, v)| v.into_owned())
         .filter(|m| !m.is_empty());
-    let model = match (policy, requested) {
+    let (model, filled) = match (policy, requested) {
         (Policy::Force, _) | (Policy::Default, None) if !configured.is_empty() => {
-            configured.to_owned()
+            (configured.to_owned(), true)
         }
-        (_, Some(requested)) => requested,
-        (_, None) => return String::new(),
+        (_, Some(requested)) => (requested, false),
+        (_, None) => return (String::new(), false),
     };
+    set_model(url, &model);
+    (model, filled)
+}
+
+/// Sets the `model` query parameter.
+fn set_model(url: &mut url::Url, model: &str) {
     let others: Vec<(String, String)> = url
         .query_pairs()
         .filter(|(k, _)| k != "model")
@@ -58,8 +64,7 @@ fn apply_model_policy(url: &mut url::Url, configured: &str, policy: Policy) -> S
     url.query_pairs_mut()
         .clear()
         .extend_pairs(others)
-        .append_pair("model", &model);
-    model
+        .append_pair("model", model);
 }
 
 pub(super) async fn relay(
@@ -72,9 +77,18 @@ pub(super) async fn relay(
     mut url: url::Url,
 ) -> Result<Response<Body>> {
     let (mut parts, _) = req.into_parts();
-    let model = apply_model_policy(&mut url, &upstream.model, config.model_policy);
+    let (mut model, filled) = apply_model_policy(&mut url, &upstream.model, config.model_policy);
+    // A model the client chose is a public name. The one the policy wrote is
+    // already the upstream's.
+    let resolved = !filled && !model.is_empty() && !config.models.is_empty();
+    if resolved {
+        model = models::resolve(config, identity.as_ref(), &model)?
+            .upstream_name()
+            .to_owned();
+        set_model(&mut url, &model);
+    }
     let path = parts.uri.path().to_owned();
-    let meter = Meter::begin(
+    let meter = Meter::begin_with(
         &app,
         identity,
         RequestMeta {
@@ -84,6 +98,7 @@ pub(super) async fn relay(
             model: &model,
             ip: &ip,
         },
+        !resolved,
     )
     .await?;
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
@@ -261,7 +276,10 @@ mod tests {
     #[test]
     fn force_overrides_requested_model() {
         let mut u = url("?model=expensive&x=1");
-        assert_eq!(apply_model_policy(&mut u, "cheap", Policy::Force), "cheap");
+        assert_eq!(
+            apply_model_policy(&mut u, "cheap", Policy::Force),
+            ("cheap".to_owned(), true)
+        );
         assert_eq!(u.query(), Some("x=1&model=cheap"));
     }
 
@@ -270,12 +288,12 @@ mod tests {
         let mut u = url("");
         assert_eq!(
             apply_model_policy(&mut u, "cheap", Policy::Default),
-            "cheap"
+            ("cheap".to_owned(), true)
         );
         let mut u = url("?model=chosen");
         assert_eq!(
             apply_model_policy(&mut u, "cheap", Policy::Default),
-            "chosen"
+            ("chosen".to_owned(), false)
         );
     }
 
@@ -284,10 +302,13 @@ mod tests {
         let mut u = url("?model=chosen");
         assert_eq!(
             apply_model_policy(&mut u, "cheap", Policy::Passthrough),
-            "chosen"
+            ("chosen".to_owned(), false)
         );
         let mut u = url("");
-        assert_eq!(apply_model_policy(&mut u, "cheap", Policy::Passthrough), "");
+        assert_eq!(
+            apply_model_policy(&mut u, "cheap", Policy::Passthrough),
+            (String::new(), false)
+        );
         assert_eq!(u.query(), None);
     }
 }

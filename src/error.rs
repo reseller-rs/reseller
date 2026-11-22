@@ -1,4 +1,5 @@
-//! API error type rendered as `{"error":{"code","message"}}` JSON.
+//! API error type rendered as an OpenAI-style
+//! `{"error":{"message","type","param","code"}}` JSON body.
 use axum::{
     Json,
     http::{HeaderValue, StatusCode, header},
@@ -9,6 +10,7 @@ use serde_json::json;
 /// An error that is safe to show to API clients.
 ///
 /// `code` is a stable machine-readable identifier; `message` is human-readable.
+/// `param` names the request parameter at fault, when there is one.
 /// Internal failures are logged and replaced by a generic message so that
 /// database or upstream details never leak to callers.
 #[derive(Debug)]
@@ -16,8 +18,11 @@ pub struct Error {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    pub param: Option<&'static str>,
     /// Seconds a client should wait before retrying (429 responses).
     pub retry_after: Option<u64>,
+    /// Methods the path accepts (`Allow` header of 405 responses).
+    pub allow: Option<&'static str>,
 }
 
 /// Result alias whose error type defaults to [`Error`].
@@ -30,7 +35,9 @@ impl Error {
             status,
             code,
             message: message.into(),
+            param: None,
             retry_after: None,
+            allow: None,
         }
     }
 
@@ -38,6 +45,20 @@ impl Error {
     #[must_use]
     pub fn with_code(mut self, code: &'static str) -> Self {
         self.code = code;
+        self
+    }
+
+    /// Names the request parameter at fault.
+    #[must_use]
+    pub fn with_param(mut self, param: &'static str) -> Self {
+        self.param = Some(param);
+        self
+    }
+
+    /// Sets the `Allow` header of a 405 response.
+    #[must_use]
+    pub fn with_allow(mut self, allow: &'static str) -> Self {
+        self.allow = Some(allow);
         self
     }
 
@@ -67,6 +88,32 @@ impl Error {
 
     pub fn too_many(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, code, message)
+    }
+
+    /// 405 `method_not_allowed` for a path that accepts only `allow`.
+    pub fn method_not_allowed(allow: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            message,
+        )
+        .with_allow(allow)
+    }
+
+    /// 404 `model_not_found` for a model that is unknown, disabled, or not
+    /// allowed for the caller. The three cases look the same.
+    pub fn model_not_found(model: &str) -> Self {
+        let message = if model.is_empty() {
+            "This key is restricted to specific models. The request must name one".to_owned()
+        } else {
+            format!("The model '{model}' does not exist or you do not have access to it.")
+        };
+        Self::not_found("model_not_found", message).with_param("model")
+    }
+
+    /// 429 `insufficient_quota`: the account has no spendable balance.
+    pub fn insufficient_quota(message: impl Into<String>) -> Self {
+        Self::too_many("insufficient_quota", message)
     }
 
     pub fn too_large(message: impl Into<String>) -> Self {
@@ -105,13 +152,37 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+impl Error {
+    /// The OpenAI-style `type` of this error, derived from status and code.
+    pub fn kind(&self) -> &'static str {
+        match self.status.as_u16() {
+            429 if self.code == "insufficient_quota" => "insufficient_quota",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            500..=599 => "server_error",
+            _ => "invalid_request_error",
+        }
+    }
+
+    /// The JSON response body.
+    pub fn body(&self) -> serde_json::Value {
+        json!({"error": {
+            "message": self.message,
+            "type": self.kind(),
+            "param": self.param,
+            "code": self.code,
+        }})
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let mut response = (
-            self.status,
-            Json(json!({"error": {"code": self.code, "message": self.message}})),
-        )
-            .into_response();
+        let mut response = (self.status, Json(self.body())).into_response();
+        if let Some(allow) = self.allow {
+            response
+                .headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static(allow));
+        }
         if self.status == StatusCode::TOO_MANY_REQUESTS {
             response.headers_mut().insert(
                 header::RETRY_AFTER,

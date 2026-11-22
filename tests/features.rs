@@ -177,7 +177,7 @@ async fn image_generation_routes_to_image_upstream_and_bills_trailing_usage() {
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
     let before = t.balance(aid).await;
-    assert_eq!(before, "0.25");
+    assert_eq!(before, "0.1");
     let reference = "data:image/png;base64,iVBORw0KGgo=";
     let (s, v) = t
         .call(
@@ -204,7 +204,7 @@ async fn image_generation_routes_to_image_upstream_and_bills_trailing_usage() {
         assert_eq!(title, "Reseller", "configured upstream header sent");
     }
     // Provider cost $0.01 at 0% markup.
-    assert_eq!(t.balance(aid).await, "0.24");
+    assert_eq!(t.balance(aid).await, "0.09");
     let row = sqlx::query("SELECT kind,model,billed_micro,tokens FROM requests")
         .fetch_one(&t.app.db)
         .await
@@ -510,7 +510,7 @@ async fn payroof_checkout_quotes_assets_and_completes_on_confirmed_transfers() {
         .await;
     assert_eq!(detail["status"], "pending");
     assert_eq!(detail["transfers"][0]["status"], "seen");
-    assert_eq!(t.balance(aid).await, "0.25");
+    assert_eq!(t.balance(aid).await, "0.1");
 
     // A confirmed partial payment counts but does not complete the order.
     let (s, _) = deliver(
@@ -563,7 +563,7 @@ async fn payroof_checkout_quotes_assets_and_completes_on_confirmed_transfers() {
         .await;
     assert_eq!(detail["status"], "paid", "{detail}");
     assert_eq!(detail["paid_by"], "payroof");
-    assert_eq!(t.balance(aid).await, "20.25");
+    assert_eq!(t.balance(aid).await, "20.1");
 
     // More transfers after payment never grant twice.
     deliver(
@@ -571,7 +571,7 @@ async fn payroof_checkout_quotes_assets_and_completes_on_confirmed_transfers() {
         &event("evt_4", "confirmed", "trf_c", &order_id, usdc, "20000000"),
     )
     .await;
-    assert_eq!(t.balance(aid).await, "20.25");
+    assert_eq!(t.balance(aid).await, "20.1");
     let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions")
         .fetch_one(&t.app.db)
         .await
@@ -703,7 +703,7 @@ async fn late_native_transfers_need_review_and_admin_can_complete() {
     assert_eq!(detail["status"], "expired");
     assert_eq!(detail["transfers"][0]["note"], "late");
     assert_eq!(detail["received_usd"], "0");
-    assert_eq!(t.balance(aid).await, "0.25");
+    assert_eq!(t.balance(aid).await, "0.1");
 
     // A transfer to the wrong address or in an unquoted asset never counts.
     let wrong = event(
@@ -735,7 +735,7 @@ async fn late_native_transfers_need_review_and_admin_can_complete() {
         (done["status"].clone(), done["paid_by"].clone()),
         (json!("paid"), json!("admin"))
     );
-    assert_eq!(t.balance(aid).await, "20.25");
+    assert_eq!(t.balance(aid).await, "20.1");
     let (s, _) = t
         .admin("POST", &format!("payments/{order_id}/complete"), json!({}))
         .await;
@@ -939,11 +939,396 @@ async fn account_list_balance_subtracts_debt_and_search_is_literal() {
         .unwrap();
     tx.commit().await.unwrap();
     let (_, v) = t.admin("GET", "accounts", json!({})).await;
-    assert_eq!(v["accounts"][0]["balance_usd"], "-0.75");
-    assert_eq!(t.balance(aid).await, "-0.75");
+    assert_eq!(v["accounts"][0]["balance_usd"], "-0.9");
+    assert_eq!(t.balance(aid).await, "-0.9");
     // `%` and `_` are matched literally rather than as wildcards.
     let (_, v) = t.admin("GET", "accounts?q=%25", json!({})).await;
     assert_eq!(v["total"], 0);
     let (_, v) = t.admin("GET", "keys?q=_", json!({})).await;
     assert_eq!(v["total"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// Model catalog, OpenAI errors, quota, deposits, and trial credit
+// ---------------------------------------------------------------------------
+
+const ERROR_KEYS: [&str; 4] = ["code", "message", "param", "type"];
+
+fn error_keys(v: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = v["error"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Serves an LLM upstream that records every request body it receives.
+async fn recording_llm(t: &Test) -> Arc<Mutex<Vec<Value>>> {
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let log = seen.clone();
+    let base = serve(Router::new().fallback(any(move |req: Request<Body>| {
+        let log = log.clone();
+        async move {
+            let body = to_bytes(req.into_body(), 1 << 20).await.unwrap();
+            log.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+            Json(json!({"id": "mock", "usage": {"total_tokens": 3, "cost": 0.0001}}))
+        }
+    })))
+    .await;
+    let mut c = t.app.config_mut().await;
+    c.llm.base_url = format!("{base}/v1");
+    c.llm.api_key = "upstream-secret".into();
+    c.llm.model = "configured".into();
+    seen
+}
+
+fn catalog() -> Vec<reseller::config::Model> {
+    vec![
+        reseller::config::Model {
+            id: "assistant".into(),
+            upstream: "vendor/secret-upstream-name".into(),
+            aliases: vec!["gpt-4o".into()],
+            name: "Assistant".into(),
+            context_length: Some(128_000),
+            ..Default::default()
+        },
+        reseller::config::Model {
+            id: "other".into(),
+            upstream: "vendor/other".into(),
+            ..Default::default()
+        },
+        reseller::config::Model {
+            id: "retired".into(),
+            enabled: false,
+            ..Default::default()
+        },
+    ]
+}
+
+async fn empty_balance(t: &Test) {
+    sqlx::query("UPDATE credits SET remaining_micro=0")
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn models_list_follows_the_catalog_and_hides_upstream_names() {
+    let t = Test::new().await;
+    t.app.config_mut().await.models = catalog();
+    let k = t.key().await;
+    let key = k["key"].as_str().unwrap();
+    let (s, v) = t.call("GET", "/v1/models", Some(key), json!({})).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["object"], "list");
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["assistant", "other"],
+        "disabled and aliases are hidden"
+    );
+    let first = &v["data"][0];
+    assert_eq!(first["object"], "model");
+    assert_eq!(first["name"], "Assistant");
+    assert_eq!(first["context_length"], 128_000);
+    assert!(first.get("pricing").is_none());
+    assert!(!v.to_string().contains("secret-upstream-name"));
+    let (s, v) = t
+        .call("GET", "/v1/models/gpt-4o", Some(key), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["id"], "assistant");
+    let (s, v) = t
+        .call("GET", "/v1/models/retired", Some(key), json!({}))
+        .await;
+    assert_eq!(s, 404);
+    assert_eq!(v["error"]["code"], "model_not_found");
+    assert_eq!(v["error"]["param"], "model");
+    assert_eq!(
+        v["error"]["message"],
+        "The model 'retired' does not exist or you do not have access to it."
+    );
+}
+
+#[tokio::test]
+async fn models_list_requires_a_valid_key_and_a_balance() {
+    let t = Test::new().await;
+    let (s, v) = t.call("GET", "/v1/models", None, json!({})).await;
+    assert_eq!(s, 401);
+    assert_eq!(error_keys(&v), ERROR_KEYS);
+    assert_eq!(v["error"]["code"], "missing_api_key");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        v["error"]["message"],
+        "Missing bearer authentication in header"
+    );
+    let (s, v) = t
+        .call("GET", "/v1/models", Some("sk-wrong"), json!({}))
+        .await;
+    assert_eq!(s, 401);
+    assert_eq!(error_keys(&v), ERROR_KEYS);
+    assert_eq!(v["error"]["code"], "invalid_api_key");
+    let k = t.key().await;
+    empty_balance(&t).await;
+    let (s, v) = t
+        .call("GET", "/v1/models", k["key"].as_str(), json!({}))
+        .await;
+    assert_eq!(s, 429, "{v}");
+    assert_eq!(error_keys(&v), ERROR_KEYS);
+    assert_eq!(v["error"]["code"], "insufficient_quota");
+    assert_eq!(v["error"]["type"], "insufficient_quota");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("You exceeded your current quota."),
+        "{message}"
+    );
+    assert!(message.contains("/workspace/"), "{message}");
+}
+
+#[tokio::test]
+async fn empty_balance_blocks_chat_with_the_deposit_instructions() {
+    let t = Test::new().await;
+    let seen = recording_llm(&t).await;
+    let base = mock_payroof(Arc::default()).await;
+    configure_payroof(&t, &base).await;
+    let k = t.key().await;
+    empty_balance(&t).await;
+    let (s, v) = t
+        .call(
+            "POST",
+            "/v1/chat/completions",
+            k["key"].as_str(),
+            json!({"messages": []}),
+        )
+        .await;
+    assert_eq!(s, 429, "{v}");
+    assert_eq!(v["error"]["type"], "insufficient_quota");
+    assert_eq!(v["error"]["code"], "insufficient_quota");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("0x14da8c659ce2b10cccdaebf990d19838b0d7ec0b"),
+        "{message}"
+    );
+    assert!(message.contains("GET /v1/account"), "{message}");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_paths_and_wrong_methods_use_openai_errors() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    let key = k["key"].as_str();
+    let (s, v) = t.call("GET", "/v1/nope", key, json!({})).await;
+    assert_eq!(s, 404);
+    assert_eq!(v["error"]["code"], "unknown_url");
+    assert_eq!(v["error"]["message"], "Invalid URL (GET /v1/nope)");
+    assert_eq!(error_keys(&v), ERROR_KEYS);
+    let req = Request::get("/v1/chat/completions")
+        .header("authorization", format!("Bearer {}", key.unwrap()))
+        .body(Body::empty())
+        .unwrap();
+    let (s, headers, body) = t.raw(req).await;
+    assert_eq!(s, 405);
+    assert!(
+        headers
+            .get("allow")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("POST")
+    );
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"], "method_not_allowed");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn aliases_reach_the_upstream_by_its_name_and_hidden_models_are_not_found() {
+    let t = Test::new().await;
+    let seen = recording_llm(&t).await;
+    t.app.config_mut().await.models = catalog();
+    let k = t.key().await;
+    let key = k["key"].as_str();
+    let chat = |model: &'static str| json!({"model": model, "messages": []});
+    let (s, v) = t
+        .call("POST", "/v1/chat/completions", key, chat("gpt-4o"))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        seen.lock().unwrap()[0]["model"],
+        "vendor/secret-upstream-name"
+    );
+    for unknown in ["missing", "retired", "vendor/secret-upstream-name"] {
+        let (s, v) = t
+            .call("POST", "/v1/chat/completions", key, chat(unknown))
+            .await;
+        assert_eq!(s, 404, "{unknown}: {v}");
+        assert_eq!(v["error"]["code"], "model_not_found");
+        assert_eq!(v["error"]["param"], "model");
+    }
+    sqlx::query("UPDATE api_keys SET limits=?")
+        .bind(json!({"allowed_models": ["other"]}).to_string())
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let (s, v) = t
+        .call("POST", "/v1/chat/completions", key, chat("assistant"))
+        .await;
+    assert_eq!(s, 404, "{v}");
+    assert_eq!(v["error"]["code"], "model_not_found");
+    let (s, v) = t.call("GET", "/v1/models", key, json!({})).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"].as_array().unwrap().len(), 1);
+    assert_eq!(v["data"][0]["id"], "other");
+    let (s, _) = t.call("GET", "/v1/models/assistant", key, json!({})).await;
+    assert_eq!(s, 404);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "rejected requests never reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn deposit_webhook_credits_stablecoins_once() {
+    let t = Test::new().await;
+    let base = mock_payroof(Arc::default()).await;
+    configure_payroof(&t, &base).await;
+    let k = t.key().await;
+    let aid = k["account_id"].as_str().unwrap();
+    let reference = format!("acct-{aid}");
+    let usdc = "eip155:1/erc20:0xa0b8";
+    let before = t.balance(aid).await;
+    let (s, v) = t
+        .call("GET", "/v1/account", k["key"].as_str(), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+
+    let seen = event("evt_d1", "seen", "tr_d1", &reference, usdc, "5000000");
+    assert_eq!(deliver(&t, &seen).await.0, 200);
+    assert_eq!(
+        t.balance(aid).await,
+        before,
+        "a seen transfer is not credited"
+    );
+
+    let confirmed = event("evt_d2", "confirmed", "tr_d1", &reference, usdc, "5000000");
+    assert_eq!(deliver(&t, &confirmed).await.0, 200);
+    let credited = t.balance(aid).await;
+    assert_ne!(credited, before);
+    assert_eq!(deliver(&t, &confirmed).await.0, 200, "replay");
+    let again = event("evt_d3", "confirmed", "tr_d1", &reference, usdc, "5000000");
+    assert_eq!(deliver(&t, &again).await.0, 200, "same transfer, new event");
+    assert_eq!(t.balance(aid).await, credited, "credited once");
+
+    let weth = event(
+        "evt_d4",
+        "confirmed",
+        "tr_d2",
+        &reference,
+        "eip155:1/erc20:0xc02a",
+        "1000000000000000000",
+    );
+    assert_eq!(deliver(&t, &weth).await.0, 200);
+    let eth = event(
+        "evt_d5",
+        "confirmed",
+        "tr_d3",
+        &reference,
+        "eip155:1/slip44:60",
+        "1000000000000000000",
+    );
+    assert_eq!(deliver(&t, &eth).await.0, 200);
+    assert_eq!(
+        t.balance(aid).await,
+        credited,
+        "unsupported assets are not credited"
+    );
+    let notes: Vec<String> =
+        sqlx::query_scalar("SELECT note FROM deposit_transfers WHERE id IN ('tr_d2','tr_d3')")
+            .fetch_all(&t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(notes, ["unsupported_asset", "unsupported_asset"]);
+}
+
+#[tokio::test]
+async fn account_top_up_lists_deposit_addresses_without_secrets() {
+    let t = Test::new().await;
+    let base = mock_payroof(Arc::default()).await;
+    configure_payroof(&t, &base).await;
+    let k = t.key().await;
+    let (s, v) = t
+        .call("GET", "/v1/account", k["key"].as_str(), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let top_up = &v["top_up"];
+    assert_eq!(top_up["automatic"], true);
+    assert_eq!(top_up["eta_minutes"], 5);
+    assert_eq!(top_up["addresses"][0]["chain"], "eip155:1");
+    assert_eq!(top_up["addresses"][0]["chain_name"], "Ethereum");
+    assert_eq!(
+        top_up["addresses"][0]["address"],
+        "0x14da8c659ce2b10cccdaebf990d19838b0d7ec0b"
+    );
+    let symbols: Vec<&str> = top_up["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["symbol"].as_str().unwrap())
+        .collect();
+    assert!(
+        symbols.contains(&"USDC") && !symbols.contains(&"ETH"),
+        "{symbols:?}"
+    );
+    let text = top_up.to_string();
+    for secret in ["prf_test_token", "shop", "acct-", &base] {
+        assert!(!text.contains(secret), "{secret} leaked in {text}");
+    }
+}
+
+#[tokio::test]
+async fn account_top_up_degrades_when_payroof_is_down_or_deposits_are_off() {
+    let t = Test::new().await;
+    configure_payroof(&t, "http://127.0.0.1:1").await;
+    let k = t.key().await;
+    let (s, v) = t
+        .call("GET", "/v1/account", k["key"].as_str(), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["top_up"]["available"], false);
+    assert_eq!(v["top_up"]["addresses"], json!([]));
+    t.app.config_mut().await.payroof.deposits = false;
+    let (_, v) = t
+        .call("GET", "/v1/account", k["key"].as_str(), json!({}))
+        .await;
+    assert_eq!(v["top_up"]["automatic"], false);
+    assert_eq!(v["top_up"]["addresses"], json!([]));
+    assert!(v["top_up"].get("available").is_none());
+    assert!(
+        v["top_up"]["workspace_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/workspace/")
+    );
+}
+
+#[tokio::test]
+async fn new_accounts_get_the_default_or_configured_trial_credit() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.1");
+    t.app.config_mut().await.signup.free_credit_usd = "0.75".into();
+    let k = t.key().await;
+    assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.75");
 }

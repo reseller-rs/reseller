@@ -280,8 +280,8 @@ async fn expired_free_credit_blocks_proxy_until_admin_topup() {
             json!({"messages":[]}),
         )
         .await;
-    assert_eq!(s, 402, "{v}");
-    assert_eq!(v["error"]["code"], "insufficient_balance");
+    assert_eq!(s, 429, "{v}");
+    assert_eq!(v["error"]["code"], "insufficient_quota");
 
     let (s, v) = t
         .admin(
@@ -1164,7 +1164,7 @@ async fn suspension_blocks_proxy_and_workspace_then_restores() {
         .0,
         200
     );
-    assert_eq!(balance(&t, &aid).await, "10.25");
+    assert_eq!(balance(&t, &aid).await, "10.1");
     task.abort();
 }
 
@@ -1383,8 +1383,8 @@ async fn model_allowlist_update_takes_effect_on_next_request() {
             json!({"messages":[]}),
         )
         .await;
-    assert_eq!(s, 403, "{v}");
-    assert_eq!(v["error"]["code"], "model_not_allowed");
+    assert_eq!(s, 404, "{v}");
+    assert_eq!(v["error"]["code"], "model_not_found");
     let (s, _) = t
         .admin(
             "PATCH",
@@ -1534,7 +1534,7 @@ async fn key_pepper_rotation_invalidates_keys_and_unredeemed_codes() {
     let new_code = issue_credit_code(&t, "10").await;
     let (s, v) = redeem(&t, fresh["dashboard_token"].as_str().unwrap(), &new_code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "10.25");
+    assert_eq!(v["account"]["balance_usd"], "10.1");
 }
 
 /// Rotating the admin token only affects administrator access.
@@ -1672,7 +1672,7 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
             .await
             .unwrap();
     }
-    assert_eq!(balance(&t, aid).await, "25.25");
+    assert_eq!(balance(&t, aid).await, "25.1");
     let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions")
         .fetch_one(&t.app.db)
         .await
@@ -1751,7 +1751,7 @@ async fn workspace_panel_full_journey() {
     let code = issue_credit_code(&t, "10").await;
     let (s, v) = redeem(&t, third["dashboard_token"].as_str().unwrap(), &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "10.25");
+    assert_eq!(v["account"]["balance_usd"], "10.1");
 
     let task = mock_llm(&t, "0.01", 30).await;
     let (s, v) = t
@@ -1763,7 +1763,7 @@ async fn workspace_panel_full_journey() {
         )
         .await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(balance(&t, &aid).await, "10.237");
+    assert_eq!(balance(&t, &aid).await, "10.087");
     let usage = t.customer("GET", "account/usage", &dash, json!({})).await.1;
     assert_eq!(usage["series"].as_array().unwrap().len(), 1);
     assert_eq!(usage["series"][0]["requests"], 1);
@@ -1852,7 +1852,7 @@ async fn admin_console_management_journey() {
         )
         .await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "5.25");
+    assert_eq!(v["account"]["balance_usd"], "5.1");
     let (s, v) = t
         .admin(
             "POST",
@@ -1861,7 +1861,7 @@ async fn admin_console_management_journey() {
         )
         .await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "25.25");
+    assert_eq!(v["account"]["balance_usd"], "25.1");
     assert_eq!(v["account"]["subscription"]["plan_code"], "monthly");
     let (s, managed) = t
         .admin(
@@ -1987,7 +1987,7 @@ async fn concurrent_plan_code_redemption_grants_once() {
         .await
         .unwrap();
     assert_eq!(subs, 1);
-    assert_eq!(balance(&t, &aid).await, "20.25");
+    assert_eq!(balance(&t, &aid).await, "20.1");
 }
 
 /// Regression: a real HTTP server must meter a buffered JSON response. The
@@ -2037,7 +2037,7 @@ async fn live_http_settles_buffered_json_responses() {
     assert_eq!(r.get::<i64, _>("billed_micro"), 13_000);
     assert_eq!(r.get::<i64, _>("tokens"), 30);
     assert_eq!(r.get::<i64, _>("finished"), 1);
-    assert_eq!(balance(&t, &aid).await, "0.237");
+    assert_eq!(balance(&t, &aid).await, "0.087");
     server.abort();
     upstream.abort();
 }
@@ -2064,7 +2064,7 @@ async fn year_plan_is_seeded_at_160_usd_for_360_days() {
     let k = t.key().await;
     let (s, v) = redeem(&t, k["dashboard_token"].as_str().unwrap(), &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "160.25");
+    assert_eq!(v["account"]["balance_usd"], "160.1");
     let days = (v["account"]["subscription"]["expires_at"].as_i64().unwrap() - db::now()) / 86400;
     assert!((359..=360).contains(&days), "year plan expiry: {days} days");
 }
@@ -2188,7 +2188,7 @@ async fn overspend_via_proxy_creates_debt_settled_by_admin_topup() {
             json!({"messages":[]}),
         )
         .await;
-    assert_eq!(s, 402, "{v}");
+    assert_eq!(s, 429, "{v}");
     let (s, _) = t
         .admin(
             "POST",
@@ -2540,7 +2540,7 @@ async fn webhook_ignores_unpaid_and_unknown_orders_without_side_effects() {
         .await
         .unwrap();
     assert_eq!(events, 0);
-    assert_eq!(balance(&t, aid).await, "0.25");
+    assert_eq!(balance(&t, aid).await, "0.1");
 
     sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order_async',?,'monthly','stripe',20000000,10000000,15,'cs_async',?)")
         .bind(aid)
@@ -2550,7 +2550,7 @@ async fn webhook_ignores_unpaid_and_unknown_orders_without_side_effects() {
         .unwrap();
     let async_paid = json!({"id":"evt_async","type":"checkout.session.async_payment_succeeded","data":{"object":{"id":"cs_async","client_reference_id":"order_async","metadata":{"order_id":"order_async"},"mode":"payment","currency":"usd","amount_total":2000,"payment_status":"paid"}}});
     send(async_paid).await.unwrap();
-    assert_eq!(balance(&t, aid).await, "10.25");
+    assert_eq!(balance(&t, aid).await, "10.1");
     let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions")
         .fetch_one(&t.app.db)
         .await
@@ -2967,7 +2967,7 @@ async fn redeem_codes_can_be_edited_or_cancelled_until_redeemed() {
     // Redeem, then the record is frozen.
     let (s, v) = redeem(&t, &token, &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(balance(&t, &aid).await, "10.25");
+    assert_eq!(balance(&t, &aid).await, "10.1");
     assert_eq!(
         t.admin("PATCH", &format!("codes/{id}"), json!({"note":"late"}))
             .await
@@ -2978,7 +2978,7 @@ async fn redeem_codes_can_be_edited_or_cancelled_until_redeemed() {
         t.admin("DELETE", &format!("codes/{id}"), json!({})).await.0,
         400
     );
-    assert_eq!(balance(&t, &aid).await, "10.25");
+    assert_eq!(balance(&t, &aid).await, "10.1");
 
     // An unredeemed code can be cancelled and then no longer redeems.
     let code2 = issue_credit_code(&t, "5").await;
@@ -3000,7 +3000,7 @@ async fn redeem_codes_can_be_edited_or_cancelled_until_redeemed() {
     );
     let (s, v) = redeem(&t, &token, &code2).await;
     assert_eq!(s, 400, "{v}");
-    assert_eq!(balance(&t, &aid).await, "10.25");
+    assert_eq!(balance(&t, &aid).await, "10.1");
 }
 
 /// Codes can be issued in atomic batches: mixed definitions produce unique
@@ -3040,7 +3040,7 @@ async fn redeem_codes_can_be_issued_in_bulk_atomically() {
         assert_eq!(redeem(&t, &token, code).await.0, 200, "{code}");
         assert_eq!(redeem(&t, &token, code).await.0, 400, "reuse of {code}");
     }
-    assert_eq!(balance(&t, &aid).await, "32.75");
+    assert_eq!(balance(&t, &aid).await, "32.6");
 
     // One invalid entry rejects the whole batch without inserting anything.
     let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM redeem_codes")

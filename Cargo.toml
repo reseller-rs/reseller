@@ -1,6 +1,6 @@
 [package]
 name = "reseller"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Self-hosted OpenAI-compatible API reseller: streaming proxy, images, metering, card and crypto billing, white-label dashboards"
@@ -23,6 +23,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 getrandom = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13.0"
+percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "json", "form", "stream"] }
 rust_decimal = "1.43.0"
 serde = { version = "1.0.229", features = ["derive"] }

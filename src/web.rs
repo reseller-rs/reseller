@@ -43,7 +43,6 @@ pub async fn router(app: App) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
-        .route("/v1", get(discovery))
         .route("/", get(page))
         .route("/workspace", get(page))
         .route("/workspace/", get(page))
@@ -148,10 +147,11 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok", "service": "reseller"}))
 }
 
-async fn discovery() -> Json<serde_json::Value> {
-    Json(json!({
+fn discovery() -> serde_json::Value {
+    json!({
         "service": "reseller",
         "api_base": "/v1",
+        "models": "/v1/models",
         "keys": "/v1/keys",
         "plans": "/v1/plans",
         "signup": "/v1/signup",
@@ -164,7 +164,70 @@ async fn discovery() -> Json<serde_json::Value> {
         },
         "workspace": "/workspace/",
         "admin": "/admin/",
-    }))
+    })
+}
+
+/// How a `/v1` path outside the customer routes is served.
+#[derive(Debug, PartialEq, Eq)]
+enum V1 {
+    /// `GET /v1`.
+    Discovery,
+    /// The model list, or an upstream route.
+    Proxy,
+    /// A known path called with another method. Holds the `Allow` value.
+    Method(&'static str),
+    Unknown,
+}
+
+/// The methods a `/v1` path accepts, or `None` for an unknown path.
+fn v1_methods(path: &str) -> Option<&'static str> {
+    match path {
+        "/v1" | "/v1/models" | "/v1/realtime" => Some("GET"),
+        "/v1/chat/completions"
+        | "/v1/completions"
+        | "/v1/embeddings"
+        | "/v1/moderations"
+        | "/v1/audio/speech"
+        | "/v1/audio/transcriptions"
+        | "/v1/audio/translations"
+        | "/v1/images"
+        | "/v1/images/generations"
+        | "/v1/images/edits"
+        | "/v1/images/variations"
+        | "/v1/responses" => Some("POST"),
+        _ => {
+            let rest = path.strip_prefix("/v1/")?;
+            if let Some(id) = rest.strip_prefix("models/") {
+                return (!id.is_empty()).then_some("GET");
+            }
+            if let Some(sub) = rest.strip_prefix("realtime/") {
+                return (!sub.is_empty()).then_some("POST");
+            }
+            match rest.strip_prefix("responses/")?.split_once('/') {
+                None if rest.len() > "responses/".len() => Some("GET, DELETE"),
+                Some((id, tail)) if !id.is_empty() && !tail.is_empty() => Some("GET, POST"),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn v1_route(method: &Method, path: &str) -> V1 {
+    match v1_methods(path) {
+        None => V1::Unknown,
+        Some(allow) if allow.split(", ").any(|m| m == method.as_str()) => {
+            if path == "/v1" {
+                V1::Discovery
+            } else {
+                V1::Proxy
+            }
+        }
+        Some(allow) => V1::Method(allow),
+    }
+}
+
+fn unknown_url(method: &Method, path: &str) -> Error {
+    Error::not_found("unknown_url", format!("Invalid URL ({method} {path})"))
 }
 
 async fn ready(State(app): State<App>) -> Result<Json<serde_json::Value>> {
@@ -275,10 +338,18 @@ async fn serve(
     {
         return Ok(Json(api::customer(app, req, ip).await?).into_response());
     }
-    if path.starts_with("/v1/") {
-        return proxy::handle(app.clone(), req, ip.to_owned()).await;
+    if path == "/v1" || path.starts_with("/v1/") {
+        return match v1_route(method, path) {
+            V1::Discovery => Ok(Json(discovery()).into_response()),
+            V1::Proxy => proxy::handle(app.clone(), req, ip.to_owned()).await,
+            V1::Method(allow) => Err(Error::method_not_allowed(
+                allow,
+                format!("Method {method} is not allowed for {path}. Use {allow}."),
+            )),
+            V1::Unknown => Err(unknown_url(method, path)),
+        };
     }
-    Err(Error::not_found("not_found", "Endpoint not found"))
+    Err(unknown_url(method, path))
 }
 
 /// Server-sent overview snapshots for the console. The token is re-checked
@@ -315,6 +386,79 @@ mod tests {
             h.append(*k, v.parse().unwrap());
         }
         h
+    }
+
+    #[test]
+    fn v1_paths_are_routed_by_method() {
+        let route = |m: &Method, p: &str| v1_route(m, p);
+        let (get, post, delete) = (Method::GET, Method::POST, Method::DELETE);
+        assert_eq!(route(&get, "/v1"), V1::Discovery);
+        assert_eq!(route(&post, "/v1"), V1::Method("GET"));
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/embeddings",
+            "/v1/moderations",
+            "/v1/audio/speech",
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+            "/v1/images",
+            "/v1/images/generations",
+            "/v1/images/edits",
+            "/v1/images/variations",
+            "/v1/responses",
+            "/v1/realtime/calls",
+            "/v1/realtime/client_secrets",
+        ] {
+            assert_eq!(route(&post, path), V1::Proxy, "{path}");
+            assert_eq!(route(&get, path), V1::Method("POST"), "{path}");
+        }
+        for path in [
+            "/v1/models",
+            "/v1/models/gpt",
+            "/v1/models/meta/muse-image",
+            "/v1/realtime",
+        ] {
+            assert_eq!(route(&get, path), V1::Proxy, "{path}");
+            assert_eq!(route(&post, path), V1::Method("GET"), "{path}");
+        }
+        assert_eq!(route(&get, "/v1/responses/resp_1"), V1::Proxy);
+        assert_eq!(route(&delete, "/v1/responses/resp_1"), V1::Proxy);
+        assert_eq!(
+            route(&post, "/v1/responses/resp_1"),
+            V1::Method("GET, DELETE")
+        );
+        assert_eq!(route(&get, "/v1/responses/resp_1/input_items"), V1::Proxy);
+        assert_eq!(route(&post, "/v1/responses/resp_1/cancel"), V1::Proxy);
+        assert_eq!(
+            route(&delete, "/v1/responses/resp_1/cancel"),
+            V1::Method("GET, POST")
+        );
+    }
+
+    #[test]
+    fn unknown_v1_paths_are_not_proxied() {
+        for path in [
+            "/v1/",
+            "/v1/files",
+            "/v1/chat",
+            "/v1/chat/completions/",
+            "/v1/models/",
+            "/v1/responses/",
+            "/v1/responses//cancel",
+            "/v1/responses/resp_1/",
+            "/v1/realtime/",
+            "/v1/../etc",
+        ] {
+            assert_eq!(route_of(path), V1::Unknown, "{path}");
+        }
+        let e = unknown_url(&Method::GET, "/v1/files");
+        assert_eq!((e.status.as_u16(), e.code), (404, "unknown_url"));
+        assert_eq!(e.message, "Invalid URL (GET /v1/files)");
+    }
+
+    fn route_of(path: &str) -> V1 {
+        v1_route(&Method::POST, path)
     }
 
     #[test]

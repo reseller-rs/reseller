@@ -10,6 +10,7 @@
 mod branding;
 mod keys;
 mod mcp;
+mod models;
 mod payments;
 mod rate_limits;
 mod signup;
@@ -17,6 +18,7 @@ mod signup;
 pub use branding::{Branding, Link};
 pub use keys::KeyPolicy;
 pub use mcp::Mcp;
+pub use models::Model;
 pub use payments::{Payroof, RateSource, Stripe};
 pub use rate_limits::RateLimits;
 pub use signup::Signup;
@@ -218,6 +220,9 @@ pub struct Config {
     pub keys: KeyPolicy,
     pub rate_limits: RateLimits,
     pub mcp: Mcp,
+    /// Public model catalog (`[[models]]`). Empty serves the configured route
+    /// models and leaves request model names untouched.
+    pub models: Vec<Model>,
     /// Price table keyed by model name (case-insensitive) plus `default`.
     pub prices: BTreeMap<String, Price>,
     pub require_key: bool,
@@ -251,6 +256,7 @@ impl Default for Config {
             keys: KeyPolicy::default(),
             rate_limits: RateLimits::default(),
             mcp: Mcp::default(),
+            models: Vec::new(),
             prices: BTreeMap::from([("default".into(), Price::default())]),
             require_key: true,
             accept_any_token: false,
@@ -354,6 +360,7 @@ impl Config {
         self.signup.validate()?;
         self.keys.validate()?;
         self.mcp.validate()?;
+        models::validate(&self.models)?;
         for (model, price) in &self.prices {
             for v in price.amounts() {
                 crate::money::decimal(v).with_context(|| format!("prices.{model}"))?;

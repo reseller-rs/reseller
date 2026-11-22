@@ -8,6 +8,9 @@
 //! - [`stripe`]: hosted card Checkout, completed by a signed webhook.
 //! - [`payroof`]: watch-only crypto payments (stablecoins and native coins on
 //!   EVM chains), completed by signed `confirmed` transfer webhooks.
+//! - [`deposits`]: standing per-account Payroof addresses. Confirmed
+//!   stablecoin transfers to them credit the account directly.
+pub mod deposits;
 pub mod payroof;
 pub mod stripe;
 

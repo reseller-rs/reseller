@@ -258,7 +258,7 @@ async fn client_disconnect_mid_stream_still_bills_final_usage() {
     assert_eq!(row.get::<i64, _>("upstream_micro"), 4000);
     assert_eq!(row.get::<i64, _>("billed_micro"), 4000);
     assert_eq!(row.get::<i64, _>("estimated"), 0);
-    assert_eq!(t.balance().await, "0.246");
+    assert_eq!(t.balance().await, "0.096");
 }
 
 /// Without any upstream usage, tokens are estimated at four characters per
@@ -585,7 +585,7 @@ async fn cached_tokens_and_aggregates_agree_to_the_micro_dollar() {
     assert_eq!(series[0]["billed_cost_usd"], "0.00858");
     assert_eq!(series[0]["tokens"], 3300);
     // Free credit of 0.25 minus the billed total.
-    assert_eq!(t.balance().await, "0.24142");
+    assert_eq!(t.balance().await, "0.09142");
 }
 
 /// Images returned through chat completions (OpenRouter style) are counted
@@ -877,7 +877,7 @@ async fn multipart_model_is_priced_under_default_and_passthrough() {
 }
 
 /// The key's allowlist applies to the multipart model: allowed passes,
-/// disallowed or absent is a 403 and the upstream never gets a request.
+/// disallowed or absent is a 404 and the upstream never gets a request.
 #[tokio::test]
 async fn multipart_model_allowlist_is_enforced() {
     use reseller::config::Policy;
@@ -892,9 +892,9 @@ async fn multipart_model_allowlist_is_enforced() {
 
         for body in [multipart_body(Some("whisper-1")), multipart_body(None)] {
             let r = t.upload(body).await;
-            assert_eq!(r.status(), 403, "{policy:?}");
+            assert_eq!(r.status(), 404, "{policy:?}");
             let v: Value = r.json().await.unwrap();
-            assert_eq!(v["error"]["code"], "model_not_allowed");
+            assert_eq!(v["error"]["code"], "model_not_found");
         }
         assert_eq!(
             seen.lock().unwrap().len(),
@@ -902,14 +902,14 @@ async fn multipart_model_allowlist_is_enforced() {
             "upstream saw a rejected upload"
         );
         let rows = t.settled(3).await;
-        assert_eq!(rows[1].get::<i64, _>("status"), 403);
+        assert_eq!(rows[1].get::<i64, _>("status"), 404);
         assert_eq!(rows[1].get::<String, _>("model"), "whisper-1");
         assert!(
             rows[1]
                 .get::<String, _>("error")
-                .contains("model_not_allowed")
+                .contains("model_not_found")
         );
-        assert_eq!(rows[2].get::<i64, _>("status"), 403);
+        assert_eq!(rows[2].get::<i64, _>("status"), 404);
         // Only the allowed request was billed.
         assert_eq!(rows[1].get::<i64, _>("billed_micro"), 0);
         assert_eq!(rows[2].get::<i64, _>("billed_micro"), 0);

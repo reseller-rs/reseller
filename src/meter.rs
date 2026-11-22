@@ -12,6 +12,7 @@ use crate::{
     error::{Error, Result},
     identity::Identity,
     money,
+    payments::deposits,
 };
 use axum::http::StatusCode;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -249,14 +250,18 @@ impl Meter {
     ) -> Result<Self> {
         let config = app.config().await;
         let mut tx = db::write(&app.db).await?;
-        if let Some(identity) = &identity {
-            admit(
+        if let Some(identity) = &identity
+            && let Err(e) = admit(
                 &mut tx,
                 &config,
                 identity,
                 check_model.then_some(meta.model),
             )
-            .await?;
+            .await
+        {
+            // Release the write lock before asking Payroof for deposit details.
+            tx.rollback().await?;
+            return Err(deposits::explain_quota(app, &config, &identity.account_id, e).await);
         }
         let request_id = id();
         sqlx::query(
@@ -442,15 +447,28 @@ impl Settlement {
     }
 }
 
-/// Rejects a model that is not on the key's allowlist.
-pub fn check_model(identity: &Identity, model: &str) -> Result<()> {
-    if identity.limits.allows(model) {
+/// Checks the status and balance of an account without logging a request,
+/// for routes that are not metered.
+pub async fn preflight(app: &App, identity: &Identity) -> Result<()> {
+    let config = app.config().await;
+    let checked = {
+        let mut conn = app.db.acquire().await?;
+        check_status(&mut conn, identity).await?;
+        check_balance(&mut conn, &config, identity).await
+    };
+    match checked {
+        Err(e) => Err(deposits::explain_quota(app, &config, &identity.account_id, e).await),
+        ok => ok,
+    }
+}
+
+/// Rejects an upstream model that is not on the key's allowlist. The
+/// allowlist names catalog ids, see [`Config::upstream_allowed`].
+pub fn check_model(config: &Config, identity: &Identity, model: &str) -> Result<()> {
+    if config.upstream_allowed(&identity.limits, model) {
         Ok(())
     } else {
-        Err(Error::forbidden(
-            "model_not_allowed",
-            "Model is not allowed on this key",
-        ))
+        Err(Error::model_not_found(model))
     }
 }
 
@@ -461,7 +479,18 @@ async fn admit(
     identity: &Identity,
     model: Option<&str>,
 ) -> Result<()> {
-    // Status may have changed since authentication. Recheck under the lock.
+    check_status(conn, identity).await?;
+    if let Some(model) = model {
+        check_model(config, identity, model)?;
+    }
+    check_balance(conn, config, identity).await?;
+    check_concurrency(conn, config, &identity.account_id).await?;
+    check_limits(conn, config, identity).await
+}
+
+/// Key and account status. It may have changed since authentication, so it
+/// is checked again here.
+async fn check_status(conn: &mut SqliteConnection, identity: &Identity) -> Result<()> {
     let row = sqlx::query(
         "SELECT k.status,k.expires_at,a.status AS account_status \
          FROM api_keys k JOIN accounts a ON a.id=k.account_id WHERE k.id=?",
@@ -482,17 +511,27 @@ async fn admit(
     if row.get::<String, _>("account_status") != "active" {
         return Err(Error::forbidden("account_suspended", "Account suspended"));
     }
-    if let Some(model) = model {
-        check_model(identity, model)?;
-    }
+    Ok(())
+}
+
+/// Rejects an account without spendable balance.
+async fn check_balance(
+    conn: &mut SqliteConnection,
+    config: &Config,
+    identity: &Identity,
+) -> Result<()> {
     if db::balance(conn, &identity.account_id).await? <= 0 {
-        return Err(Error::new(
-            StatusCode::PAYMENT_REQUIRED,
-            "insufficient_balance",
-            "Add credit to continue",
-        ));
+        return Err(deposits::quota_error(config));
     }
-    check_concurrency(conn, config, &identity.account_id).await?;
+    Ok(())
+}
+
+/// The key's rate and usage limits.
+async fn check_limits(
+    conn: &mut SqliteConnection,
+    config: &Config,
+    identity: &Identity,
+) -> Result<()> {
     let key = identity.key_id.as_str();
     let limits = &identity.limits;
     if let Some(rpm) = limits.rpm.filter(|n| *n > 0) {

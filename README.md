@@ -172,12 +172,13 @@ Defaults appear in parentheses.
 | `[branding]` | White-label name, copy, logos, colours, and CSS (see [Branding and themes](#branding-and-themes)) |
 | `[llm]`, `[tts]`, `[stt]`, `[image]` | Upstreams: `base_url` (`https://api.openai.com/v1`), `api_key`, `model`, `fallbacks` (max 10), `timeout_seconds` (0 uses `upstream_timeout_seconds`, max 3600), and `headers` (max 20; credential and framing headers are refused). `[tts]` also has `voice`. |
 | `[prices.<model>]` | Upstream prices in USD (see [Pricing and metering](#pricing-and-metering)) |
-| `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.25"`), `free_credit_expiry_days` (30; 0 means never; max 3650), `ip_limit_per_month` (2; 0 turns it off), `cooldown_seconds` (30; 0 turns it off), `global_hourly_limit` (100; 0 turns it off), `pow_max_number` (100000; 0 disables proof of work; max 10000000), `pow_ttl_seconds` (300; 10 to 86400), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
+| `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.10"`), `free_credit_expiry_days` (30; 0 means never; max 3650), `ip_limit_per_month` (2; 0 turns it off), `cooldown_seconds` (30; 0 turns it off), `global_hourly_limit` (100; 0 turns it off), `pow_max_number` (100000; 0 disables proof of work; max 10000000), `pow_ttl_seconds` (300; 10 to 86400), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
 | `[keys]` | `max_per_account` (10 active keys; must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours; 0 turns it off), `rotate_cooldown_seconds` (300; 0 turns it off; max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new key) |
 | `[rate_limits]` | `management_per_minute` (120), `auth_failures_per_hour` (20), `max_concurrent_requests` (8), `checkouts_per_hour` (10), `redeem_failures_per_hour` (10), `challenges_per_minute` (10). 0 disables each one. |
 | `[mcp]` | `enabled` (`true`) and `max_media_bytes` (16 MiB; 1 byte to 256 MiB), the largest audio or image returned inline |
 | `[stripe]` | `secret_key`, `webhook_secret` |
-| `[payroof]` | Crypto payments: `project`, `token`, `webhook_secret`, `stablecoins`, `native_coins`, `chains`, rate source, `quote_ttl_minutes`, and `underpayment_tolerance_pct` (`0.5`) |
+| `[[models]]` | Public model catalog: `id`, `upstream`, `aliases`, `enabled`, `name`, `description`, `owned_by`, `created`, `context_length`, `input_modalities`, `output_modalities`, `show_pricing` |
+| `[payroof]` | Crypto payments: `deposits` (`true`), `deposit_eta_minutes` (`5`), `project`, `token`, `webhook_secret`, `stablecoins`, `native_coins`, `chains`, rate source, `quote_ttl_minutes`, and `underpayment_tolerance_pct` (`0.5`) |
 
 ### Value formats
 
@@ -406,7 +407,7 @@ Settings contain upstream and payment secrets that must be recoverable to proxy 
 
 ## Customer API
 
-Customer routes use `Authorization: Bearer <api key or dashboard token>` unless marked public. Errors use `{"error":{"code","message"}}`. List endpoints default to 50 items and cap at 200.
+Customer routes use `Authorization: Bearer <api key or dashboard token>` unless marked public. Errors use the OpenAI shape `{"error":{"message","type","param","code"}}`. List endpoints default to 50 items and cap at 200.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
@@ -417,7 +418,9 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `GET` | `/v1/keys` | Any | List the caller's keys |
 | `PATCH` | `/v1/keys/:id` | Any | Rename or block (`{"name"?, "status":"blocked"}`). Customers cannot reactivate a key. |
 | `POST` | `/v1/keys/:id/rotate` | Any | Replace the key and keep its limits, pricing, and expiry. The old key is blocked. |
-| `GET` | `/v1/account` | Any | Account, balance, credit lots, and subscription |
+| `GET` | `/v1/models` | Key | Model catalog, local and not metered |
+| `GET` | `/v1/models/:id` | Key | One catalog entry, or `404 model_not_found` |
+| `GET` | `/v1/account` | Any | Account, balance, credit lots, subscription, and `top_up` instructions |
 | `GET` | `/v1/account/usage?days=30&key=` | Any | Daily and per-model usage (`days` 1 to 365) |
 | `GET` | `/v1/account/requests?limit=20&offset=0&key=&model=&kind=&status=` | Any | Request history |
 | `POST` | `/v1/account/redeem` | Any | Body `{"code":"RES-..."}` |
@@ -488,9 +491,25 @@ Routing replaces `/v1` with the configured base path and keeps the query string.
 | `/v1/audio/speech` | TTS |
 | `/v1/audio/transcriptions`, `/v1/audio/translations` | STT |
 | `/v1/images`, `/v1/images/*` (generations, edits, variations) | Image |
-| All other `/v1/*` proxy routes (chat, responses, completions, embeddings, models, realtime) | LLM |
+| All other proxied `/v1/*` routes (chat completions, completions, embeddings, moderations, responses, realtime) | LLM |
 
-`/v1/keys`, `/v1/account`, `/v1/plans`, and `/v1/signup` are handled locally and are never proxied.
+`/v1/models`, `/v1/keys`, `/v1/account`, `/v1/plans`, and `/v1/signup` are handled locally and are never proxied. Other paths return `404 unknown_url`, and a wrong method returns `405 method_not_allowed` with an `Allow` header.
+
+### Models
+
+`GET /v1/models` lists the catalog in the OpenAI format. It needs a key, is not metered, and returns `429 insufficient_quota` when the balance is empty. The list never shows upstream names, URLs, keys, or raw prices. Disabled entries and models the key may not use are hidden, and aliases are not listed.
+
+```toml
+[[models]]
+id = "assistant"
+upstream = "vendor/large-model-2026"
+aliases = ["gpt-4o"]
+name = "Assistant"
+context_length = 128000
+show_pricing = true
+```
+
+With a catalog, a client model is resolved by id or alias and rewritten to `upstream`. An unknown, disabled, or disallowed model returns `404 model_not_found`. Filled and forced models skip this step. Without a catalog, the list shows the configured route models. Pricing, when shown, uses the caller's effective markup.
 
 ### Model and voice policies
 
@@ -535,15 +554,16 @@ JSON requests apply model and voice policies. Chat requests stream usage reporti
 
 ### Proxy errors
 
-Failures use `{ "error": { "code": "...", "message": "..." } }`.
+Failures use the OpenAI shape `{ "error": { "message": "...", "type": "...", "param": null, "code": "..." } }`. The `type` is `invalid_request_error` (400, 401, 404, 405, 409, 413, 415), `permission_error` (403), `insufficient_quota` (code `insufficient_quota`), `rate_limit_error` (other 429), or `server_error` (5xx). `param` is `"model"` for model errors. Non-JSON upstream error bodies become an error with code `upstream_error`.
 
 | Status | Codes |
 |---|---|
 | 401 | `missing_api_key`, `invalid_api_key`, `key_revoked`, `key_blocked`, `key_expired`, `dashboard_token_not_allowed` |
-| 402 | `insufficient_balance` |
-| 403 | `model_not_allowed`, `account_suspended` |
+| 403 | `account_suspended` |
+| 404 | `model_not_found`, `unknown_url` |
+| 405 | `method_not_allowed` |
 | 413 | Body too large |
-| 429 | Limits (see [Rate limits](#rate-limits)) |
+| 429 | `insufficient_quota` when the balance is empty, and limits (see [Rate limits](#rate-limits)) |
 | 502, 504 | Upstream failure |
 | 503 | `proxy_configuration_error` when the route's upstream has no API key |
 
@@ -731,6 +751,8 @@ At checkout, Reseller allocates the order's Payroof reference. It stores a quote
 - Rates come from a CoinGecko-compatible `rate_url`. `rate_ids` maps symbols to coin IDs, and rates are cached for two minutes.
 - Fixed `native_rates_usd` override the feed. Set `rate_source = "static"` to disable the feed.
 - Quotes hold for `quote_ttl_minutes`.
+
+Each account also has a standing deposit reference `acct-<account_id>`, unless `payroof.deposits` is `false`. `GET /v1/account` returns `top_up` with the addresses, assets, and `eta_minutes` (`payroof.deposit_eta_minutes`, default 5). A confirmed stablecoin transfer on an allowed chain credits the account once and never expires. Other assets are noted as `unsupported_asset` and not credited. An empty balance returns `429 insufficient_quota` with these instructions.
 
 The payment dialog shows each asset, network, amount, and deposit address. It updates itself until the order is paid.
 

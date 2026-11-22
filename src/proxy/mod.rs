@@ -5,6 +5,7 @@
 //! streams to the upstream. Responses always stream back unchanged while an
 //! [`Inspector`] extracts usage for the [`Meter`].
 mod inspect;
+mod models;
 mod multipart;
 mod websocket;
 
@@ -120,16 +121,24 @@ pub fn target(base: &str, path: &str, query: Option<&str>) -> Result<url::Url> {
     Ok(url)
 }
 
-/// Applies `policy` for one JSON field.
-fn apply_policy(body: &mut Value, key: &str, configured: &str, policy: Policy) {
+/// Applies `policy` for one JSON field. Returns whether the configured value
+/// was written, so the field no longer holds what the client sent.
+fn apply_policy(body: &mut Value, key: &str, configured: &str, policy: Policy) -> bool {
     let apply = match policy {
         Policy::Force => true,
         Policy::Default => body.get(key).is_none_or(Value::is_null),
         Policy::Passthrough => false,
-    };
-    if apply && !configured.is_empty() {
+    } && !configured.is_empty();
+    if apply {
         body[key] = configured.into();
     }
+    apply
+}
+
+/// Whether a content type names JSON.
+fn is_json(content_type: &str) -> bool {
+    let mime = content_type.split(';').next().unwrap_or("").trim();
+    mime.eq_ignore_ascii_case("application/json") || mime.ends_with("+json")
 }
 
 const HOP_BY_HOP: [&str; 8] = [
@@ -241,6 +250,9 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
     let config = app.config().await;
     let identity = identity::authenticate(&app, req.headers(), Scope::Proxy).await?;
     let path = req.uri().path().to_owned();
+    if path == "/v1/models" || path.starts_with("/v1/models/") {
+        return models::serve(&app, identity.as_ref(), &path).await;
+    }
     let kind = Kind::of(&path);
     let upstream = kind.upstream(&config);
     if upstream.api_key.is_empty() {
@@ -282,7 +294,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
             model: &model,
             ip: &ip,
         },
-        !prepared.model_pending,
+        !prepared.checked,
     )
     .await?;
     let balance = match &identity {
@@ -301,7 +313,11 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
             upstream
                 .fallbacks
                 .iter()
-                .filter(|m| identity.as_ref().is_none_or(|i| i.limits.allows(m)))
+                .filter(|m| {
+                    identity
+                        .as_ref()
+                        .is_none_or(|i| config.upstream_allowed(&i.limits, m))
+                })
                 .cloned(),
         );
     }
@@ -514,10 +530,32 @@ impl Exchange {
             }
         }
 
+        // An error page that is not JSON (for example an HTML 502 from a
+        // gateway) is replaced by an error in the API's shape.
+        let replacement = (!status.is_success()
+            && (status.is_client_error() || status.is_server_error())
+            && !is_json(&content_type))
+        .then(|| {
+            Error::new(
+                status,
+                "upstream_error",
+                format!(
+                    "The upstream provider returned an error (HTTP {})",
+                    status.as_u16()
+                ),
+            )
+        });
         let (out_tx, mut out_rx) = mpsc::channel::<std::io::Result<Bytes>>(RELAY_BUFFER);
         let mut gone = match response_head(&response, &meter, identity.as_ref(), balance, fallback)
         {
-            Ok(headers) => {
+            Ok(mut headers) => {
+                if replacement.is_some() {
+                    headers.remove(header::CONTENT_ENCODING);
+                    headers.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                }
                 let stream = async_stream::stream! {
                     while let Some(item) = out_rx.recv().await {
                         yield item;
@@ -538,6 +576,14 @@ impl Exchange {
             }
         };
 
+        if let Some(error) = replacement {
+            let body = Bytes::from(error.body().to_string());
+            meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+            meter.bytes_out = body.len() as i64;
+            let _ = out_tx.send(Ok(body)).await;
+            settle(meter).await;
+            return;
+        }
         let mut source = response.bytes_stream();
         loop {
             let chunk = match tokio::time::timeout_at(deadline, source.next()).await {
@@ -621,14 +667,14 @@ struct Prepared {
     /// Effective model (empty when unknown).
     model: String,
     payload: Payload,
-    /// The model is only learned while the upload streams. The allowlist is
-    /// enforced there instead of at admission.
-    model_pending: bool,
+    /// The key's allowlist is already enforced, or will be while the upload
+    /// streams, so admission skips it.
+    checked: bool,
 }
 
 /// Reads and rewrites the request body.
 async fn prepare(
-    config: &Config,
+    config: &Arc<Config>,
     kind: Kind,
     path: &str,
     parts: &request::Parts,
@@ -642,10 +688,8 @@ async fn prepare(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let mime = content_type.split(';').next().unwrap_or("").trim();
-    let is_json = mime.eq_ignore_ascii_case("application/json") || mime.ends_with("+json");
 
-    if is_json {
+    if is_json(content_type) {
         let bytes = to_bytes(body, config.max_json_body_bytes)
             .await
             .map_err(|_| Error::too_large("JSON body exceeds limit"))?;
@@ -654,15 +698,24 @@ async fn prepare(
         if !value.is_object() {
             return Err(Error::bad("JSON body must be an object"));
         }
-        apply_policy(&mut value, "model", &upstream.model, config.model_policy);
+        let filled = apply_policy(&mut value, "model", &upstream.model, config.model_policy);
         if kind == Kind::Tts {
             apply_policy(&mut value, "voice", &upstream.voice, config.voice_policy);
         }
-        let model = match value.get("model") {
+        let mut model = match value.get("model") {
             None | Some(Value::Null) => String::new(),
             Some(Value::String(m)) => m.clone(),
             Some(_) => return Err(Error::bad("model must be a string")),
         };
+        // A model the client chose is a public name. The one the policy wrote
+        // is already the upstream's.
+        let resolved = !filled && !model.is_empty() && !config.models.is_empty();
+        if resolved {
+            model = models::resolve(config, identity, &model)?
+                .upstream_name()
+                .to_owned();
+            value["model"] = model.clone().into();
+        }
         if path == "/v1/chat/completions" && value["stream"] == true {
             // Ask for the final usage chunk so streamed responses can be billed.
             if value.get("stream_options").is_none_or(Value::is_null) {
@@ -677,7 +730,7 @@ async fn prepare(
         return Ok(Prepared {
             model,
             payload: Payload::Json(value, bytes),
-            model_pending: false,
+            checked: resolved,
         });
     }
 
@@ -694,13 +747,22 @@ async fn prepare(
     // Multipart bodies are always parsed so the client's model is seen,
     // whatever the policy. Only the rewrite itself depends on it.
     let configured = upstream.model.as_str();
+    let identity = identity.cloned();
     let mut parser = multipart::boundary(content_type).map(|boundary| {
-        Multipart::new(
+        let parser = Multipart::new(
             &boundary,
             configured,
             config.model_policy == Policy::Force && !configured.is_empty(),
             config.model_policy != Policy::Passthrough && !configured.is_empty(),
-        )
+        );
+        if config.models.is_empty() {
+            return parser;
+        }
+        let (config, identity) = (Arc::clone(config), identity.clone());
+        parser.with_resolver(move |requested| {
+            models::resolve(&config, identity.as_ref(), requested)
+                .map(|m| m.upstream_name().to_owned())
+        })
     });
     // A forced multipart model is known up front, so admission, metering,
     // and allowlists see it.
@@ -710,9 +772,9 @@ async fn prepare(
     } else {
         String::new()
     };
-    let model_pending = parser.is_some() && !force;
+    let checked = parser.is_some() && !force;
     let counter = counter.clone();
-    let identity = identity.cloned();
+    let config = Arc::clone(config);
     let mut source = body.into_data_stream();
     let upload = async_stream::stream! {
         while let Some(chunk) = source.next().await {
@@ -728,11 +790,11 @@ async fn prepare(
                     let out = match p.push(&chunk) {
                         Ok(out) => out,
                         Err(e) => {
-                            yield Err(counter.reject(Error::bad(e)));
+                            yield Err(counter.reject(e));
                             return;
                         }
                     };
-                    if let Err(e) = observe_models(p, &counter, identity.as_ref()) {
+                    if let Err(e) = observe_models(p, &counter, &config, identity.as_ref()) {
                         yield Err(e);
                         return;
                     }
@@ -748,10 +810,7 @@ async fn prepare(
             if counter.observed().model.is_none()
                 && identity.as_ref().is_some_and(|i| !i.limits.allowed_models.is_empty())
             {
-                yield Err(counter.reject(Error::forbidden(
-                    "model_not_allowed",
-                    "This key is restricted to specific models. The request must name one",
-                )));
+                yield Err(counter.reject(Error::model_not_found("")));
                 return;
             }
             if !out.is_empty() {
@@ -762,22 +821,27 @@ async fn prepare(
     Ok(Prepared {
         model,
         payload: Payload::Stream(Some(reqwest::Body::wrap_stream(upload))),
-        model_pending,
+        checked,
     })
 }
 
 /// Applies newly completed multipart model parts: records the effective
 /// model for metering and enforces the key's allowlist, aborting the upload
-/// with a `model_not_allowed` rejection when it does not pass.
+/// with a `model_not_found` rejection when it does not pass. Models the
+/// catalog resolved already passed it.
 fn observe_models(
     parser: &mut Multipart,
     counter: &UploadCounter,
+    config: &Config,
     identity: Option<&Identity>,
 ) -> std::result::Result<(), std::io::Error> {
+    for model in parser.take_resolved() {
+        counter.observed().model = Some(model);
+    }
     for model in parser.take_models() {
         counter.observed().model = Some(model.clone());
         if let Some(identity) = identity
-            && let Err(e) = crate::meter::check_model(identity, &model)
+            && let Err(e) = crate::meter::check_model(config, identity, &model)
         {
             return Err(counter.reject(e));
         }

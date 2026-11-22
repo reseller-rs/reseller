@@ -56,7 +56,12 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             keys::create(app, Requester::Customer(&me), ip, &object(req).await?).await
         }
         (["keys", kid, "rotate"], "POST") => keys::rotate(app, kid, Some(account)).await,
-        (["account"], "GET") => billing::account(app, account).await,
+        (["account"], "GET") => {
+            let mut overview = billing::account(app, account).await?;
+            overview["top_up"] =
+                payments::deposits::top_up(app, &*app.config().await, account).await;
+            Ok(overview)
+        }
         (["account", "redeem"], "POST") => {
             let body = object(req).await?;
             security::check_redeem(app, account).await?;

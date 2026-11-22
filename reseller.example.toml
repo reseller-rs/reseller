@@ -145,8 +145,8 @@ public_url = "http://localhost:56787"
 # enabled = true
 
 # Trial credit in USD, as a decimal string. "0" grants no credit.
-# Default: "0.25".
-# free_credit_usd = "0.25"
+# Default: "0.10".
+# free_credit_usd = "0.10"
 
 # Days the trial credit stays spendable. 0 means it never expires. Maximum:
 # 3650. Default: 30.
@@ -253,6 +253,27 @@ public_url = "http://localhost:56787"
 # Largest audio or image payload that MCP tools return inline. Must be between
 # 1 byte and 256 MiB (268435456). Default: 16 MiB (16777216).
 # max_media_bytes = 16777216
+
+# =============================================================================
+#  MODEL CATALOG
+#  GET /v1/models lists these entries. Clients may use the id or an alias. The
+#  request is rewritten to upstream. Without any [[models]] the configured
+#  route models are listed. Upstream names, URLs, and raw prices are never shown.
+# =============================================================================
+
+# [[models]]
+# id = "assistant"                  # Name clients see. Required.
+# upstream = "vendor/large-model"   # Name sent upstream. Default: id.
+# aliases = ["gpt-4o"]              # Other names that resolve to this entry.
+# enabled = true                    # false hides and rejects it. Default: true.
+# name = "Assistant"                # Display name. Default: none.
+# description = "General purpose chat"
+# owned_by = "Example"              # Default: branding.name.
+# created = 1735689600              # Unix seconds. Default: 0.
+# context_length = 128000
+# input_modalities = ["text", "image"]  # Default: ["text"].
+# output_modalities = ["text"]          # Default: ["text"].
+# show_pricing = false              # Show prices with your markup. Default: false.
 
 # =============================================================================
 #  UPSTREAMS
@@ -458,6 +479,14 @@ api_key = "sk-replace-with-your-upstream-key"
 # {public_url}/webhooks/payroof.
 
 # [payroof]
+
+# Give every account a standing deposit address. Confirmed USDC or USDT
+# transfers credit the account once. Default: true.
+# deposits = true
+
+# Typical minutes from a deposit until it is credited, shown to customers.
+# Must be between 1 and 1440. Default: 5.
+# deposit_eta_minutes = 5
 
 # Payroof API origin. Default: "https://api.payroof.top".
 # api_url = "https://api.payroof.top"

@@ -116,6 +116,25 @@ CREATE TABLE payment_transfers (
  seen_at INTEGER NOT NULL, confirmed_at INTEGER
 ) STRICT;
 CREATE INDEX payment_transfers_payment ON payment_transfers(payment_id,seen_at);
+-- Standing Payroof deposit addresses: one row per account and chain. The
+-- Payroof reference of an account is "acct-" followed by its id.
+CREATE TABLE deposit_addresses (
+ account_id TEXT NOT NULL REFERENCES accounts(id), chain TEXT NOT NULL, address TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY(account_id,chain)
+) STRICT;
+-- On-chain transfers to a standing deposit address. status goes from seen to
+-- confirmed. credited_micro is the USD value credited to the account, which is
+-- 0 when the transfer was not credited. note says why (for example
+-- unsupported_asset).
+CREATE TABLE deposit_transfers (
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id),
+ chain TEXT NOT NULL, asset TEXT NOT NULL, address TEXT NOT NULL, tx_hash TEXT NOT NULL, amount TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('seen','confirmed')),
+ credited_micro INTEGER NOT NULL DEFAULT 0 CHECK(credited_micro>=0), note TEXT NOT NULL DEFAULT '',
+ seen_at INTEGER NOT NULL, confirmed_at INTEGER
+) STRICT;
+CREATE INDEX deposit_transfers_account ON deposit_transfers(account_id,seen_at);
 -- Processed payment webhook event ids. Repeated deliveries are ignored.
 CREATE TABLE payment_events (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) STRICT;
 -- Solved proof-of-work challenges, so each one counts only once until it expires.

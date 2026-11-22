@@ -24,7 +24,7 @@ use crate::{
 use axum::{
     Json,
     body::{Body, to_bytes},
-    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
+    http::{HeaderMap, Method, Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -408,18 +408,10 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
         ));
     }
     if req.method() != Method::POST {
-        let mut response = (
-            StatusCode::METHOD_NOT_ALLOWED,
-            Json(json!({"error": {
-                "code": "method_not_allowed",
-                "message": "The MCP endpoint accepts POST only. There is no server-initiated stream",
-            }})),
-        )
-            .into_response();
-        response
-            .headers_mut()
-            .insert(header::ALLOW, HeaderValue::from_static("POST"));
-        return Ok(response);
+        return Err(Error::method_not_allowed(
+            "POST",
+            "The MCP endpoint accepts POST only. There is no server-initiated stream",
+        ));
     }
     let headers = req.headers();
     if let Some(origin) = headers.get(header::ORIGIN)
@@ -607,6 +599,7 @@ pub(crate) fn internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     #[test]
     fn header_values_round_trip() {
