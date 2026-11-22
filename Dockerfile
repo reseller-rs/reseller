@@ -11,10 +11,13 @@ COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
 COPY README.md LICENSE reseller.example.toml ./
-# Cache the cargo registry and target directory between builds. --locked pins
-# the versions recorded in Cargo.lock.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+# Cache the cargo registry and target directory between builds, one cache per
+# platform and one build at a time: a multi-arch build runs its platforms in
+# parallel, and two of them unpacking into one registry fail ("File exists").
+# --locked pins the versions recorded in Cargo.lock.
+ARG TARGETPLATFORM
+RUN --mount=type=cache,id=cargo-registry-$TARGETPLATFORM,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-target-$TARGETPLATFORM,target=/build/target,sharing=locked \
     cargo build --locked --release && cp target/release/reseller /reseller
 # Create the data directory for the non-root runtime user (UID 10001).
 RUN mkdir -p /data && chown 10001:10001 /data
