@@ -423,6 +423,11 @@ impl Settlement {
             .bind(billed)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("UPDATE api_keys SET billed_micro=billed_micro+? WHERE id=?")
+                .bind(billed)
+                .bind(&identity.key_id)
+                .execute(&mut *tx)
+                .await?;
         }
         sqlx::query(
             "UPDATE totals SET requests=requests+1,tokens=tokens+?,\

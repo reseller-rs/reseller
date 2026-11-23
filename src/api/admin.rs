@@ -7,11 +7,12 @@ use super::{
 use crate::{
     App, billing,
     config::{Config, SECRET_PATHS},
-    db::{self, id, now},
+    db::{self, DAY, id, now},
     error::{Error, Result},
     identity,
     keys::{self, Requester},
-    money, payments, stats,
+    money, payments,
+    stats::{self, Audience},
 };
 use axum::{
     body::Body,
@@ -34,7 +35,7 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
     let days = || number(&q, "days", 30, 1, 365);
     match (path.as_slice(), method.as_str()) {
         (["overview"], "GET") => stats::overview(app).await,
-        (["usage"], "GET") => stats::usage(app, None, None, days()).await,
+        (["usage"], "GET") => stats::usage(app, Audience::Operator, None, None, days()).await,
 
         (["keys"], "GET") => list_keys(app, q.get("account").map(String::as_str), &q).await,
         (["keys", kid], "GET") => {
@@ -42,7 +43,7 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             Ok(json!({
                 "key": keys::key_json(&row),
                 "account": billing::account(app, row.get("account_id")).await?,
-                "usage": stats::usage(app, None, Some(kid), 30).await?,
+                "usage": stats::usage(app, Audience::Operator, None, Some(kid), 30).await?,
             }))
         }
         (["keys", kid], "PATCH") => patch_key(app, kid, Editor::Admin, &object(req).await?).await,
@@ -134,14 +135,21 @@ async fn list_accounts(app: &App, q: &Query) -> Result<Value> {
         Some("status") => "status",
         Some("balance") => "balance_micro",
         Some("keys") => "key_count",
+        Some("spend") => "billed_micro",
+        Some("usage") => "usage_30d_micro",
         _ => "created_at",
     };
-    // `order` and the direction come from fixed whitelists.
+    // `order` and the direction come from fixed whitelists. `balance_micro`
+    // matches `db::balance`; `billed_micro` is the lifetime spend of all keys.
     let sql = format!(
         "SELECT a.*,\
            COALESCE((SELECT SUM(c.remaining_micro) FROM credits c WHERE c.account_id=a.id \
-             AND c.remaining_micro>0 AND (c.expires_at IS NULL OR c.expires_at>?)),0)-a.debt_micro AS balance_micro,\
+             AND (c.expires_at IS NULL OR c.expires_at>?)),0)-a.debt_micro AS balance_micro,\
            (SELECT COUNT(*) FROM api_keys k WHERE k.account_id=a.id) AS key_count,\
+           (SELECT COUNT(*) FROM api_keys k WHERE k.account_id=a.id AND k.status='active') AS active_key_count,\
+           COALESCE((SELECT SUM(k.billed_micro) FROM api_keys k WHERE k.account_id=a.id),0) AS billed_micro,\
+           COALESCE((SELECT SUM(u.billed_micro) FROM usage_buckets u WHERE u.account_id=a.id \
+             AND u.hour>=?),0) AS usage_30d_micro,\
            (SELECT s.plan_code FROM subscriptions s WHERE s.account_id=a.id AND s.expires_at>? \
              ORDER BY s.expires_at DESC LIMIT 1) AS plan_code \
          FROM accounts a WHERE {FILTER} ORDER BY {order} {},id DESC LIMIT ? OFFSET ?",
@@ -149,6 +157,7 @@ async fn list_accounts(app: &App, q: &Query) -> Result<Value> {
     );
     let rows = sqlx::query(AssertSqlSafe(sql))
         .bind(now())
+        .bind(now() - 30 * DAY)
         .bind(now())
         .bind(&search)
         .bind(&search)
@@ -177,7 +186,7 @@ async fn account_detail(app: &App, aid: &str, q: &Query) -> Result<Value> {
     let mut key_page = list_keys(app, Some(aid), &key_query).await?;
     detail["keys"] = key_page["keys"].take();
     detail["key_total"] = key_page["total"].take();
-    detail["usage"] = stats::usage(app, Some(aid), None, 30).await?;
+    detail["usage"] = stats::usage(app, Audience::Operator, Some(aid), None, 30).await?;
     Ok(detail)
 }
 
@@ -427,13 +436,17 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
     let status = status_filter(q);
     let search = search(q);
     let page = Page::from(q);
-    const FILTER: &str = "(?='' OR status=?) AND (id LIKE ? ESCAPE '\\' OR account_id LIKE ? ESCAPE '\\' \
+    let account = q.get("account").map(String::as_str);
+    const FILTER: &str = "(?='' OR status=?) AND (? IS NULL OR account_id=?) \
+         AND (id LIKE ? ESCAPE '\\' OR account_id LIKE ? ESCAPE '\\' \
          OR plan_code LIKE ? ESCAPE '\\' OR provider LIKE ? ESCAPE '\\')";
     let total: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM payments WHERE {FILTER}"
     )))
     .bind(status)
     .bind(status)
+    .bind(account)
+    .bind(account)
     .bind(&search)
     .bind(&search)
     .bind(&search)
@@ -456,6 +469,8 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
     let rows = sqlx::query(AssertSqlSafe(sql))
         .bind(status)
         .bind(status)
+        .bind(account)
+        .bind(account)
         .bind(&search)
         .bind(&search)
         .bind(&search)

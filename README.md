@@ -18,7 +18,7 @@ reseller is a self-hosted, OpenAI-compatible API reseller written in Rust. Point
 - **Accurate metering:** integer micro-USD accounting with cached-input, per-character, per-image, per-second, and flat per-request prices. Expiring credit lots, markup overrides, and debt tracking are included.
 - **Payments:** prepaid plans, single-use redeem codes, Stripe Checkout, and Payroof crypto payments (stablecoins and native coins on EVM chains) with verified, idempotent webhooks.
 - **White-label branding:** name, copy, logo, favicon, colours, custom CSS, and an optional theme directory.
-- **Dashboards:** customer and administrator consoles, request history, usage charts, and a live statistics API.
+- **Dashboards:** responsive customer and administrator consoles with linked accounts, keys, and requests, lifetime and 30-day spend rankings, usage charts, a public developer docs page at `/docs/`, and a live statistics API.
 - **Storage and packaging:** SQLite in WAL mode. No external database or frontend build is required. The Docker image is non-root and built for AMD64 and ARM64.
 
 ## Contents
@@ -136,6 +136,7 @@ The defaults assume `localhost` and port `56787`.
 | Page or endpoint | URL |
 |---|---|
 | Landing and create account | `http://localhost:56787/` |
+| Developer docs | `http://localhost:56787/docs/` |
 | Customer workspace | `http://localhost:56787/workspace/` |
 | Administrator console | `http://localhost:56787/admin/` |
 | OpenAI-compatible base URL | `http://localhost:56787/v1` |
@@ -281,7 +282,9 @@ Cached tokens are the tokens the provider reports in `prompt_tokens_details.cach
 5. For `/v1/chat/completions`, `/v1/responses`, and `/v1/completions`, tokens are **estimated** when the upstream reports no usage at all. The estimate uses about four characters per token, based on the request text and the generated text. The request row is flagged `estimated: 1`. MCP generation results report this as `usage_estimated`.
 6. For other routes, if a provider returns no usage and no supported audio duration, only the flat `request` fee applies. Use providers that report usage.
 
-Every request row records the full breakdown behind its charge: `tokens`, `input_tokens`, `cached_tokens`, `output_tokens`, `characters`, `audio_ms`, `images`, `upstream_usd`, `billed_usd`, and `estimated`. Customers and administrators can audit each line.
+Every request row records the full breakdown behind its charge: `tokens`, `input_tokens`, `cached_tokens`, `output_tokens`, `characters`, `audio_ms`, `images`, `upstream_usd`, `billed_usd`, and `estimated`. Customers audit each line with everything except `upstream_usd`: customer request and usage views never show the provider cost. Administrators see all fields.
+
+Each key also keeps its lifetime billed spend (`billed_usd`), which outlives request log and usage retention. An account's lifetime spend is the sum over its keys.
 
 ### Limits and debt
 
@@ -415,14 +418,16 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `GET` | `/v1/signup/challenge` | Public | Proof-of-work challenge |
 | `POST` | `/v1/signup` | Public | Body `{"name"?, "contact"?, "altcha"}`. Creates an account and its first key. |
 | `POST` | `/v1/keys` | Key or token (not anonymous) | Body `{"name"}`. Creates a child key on the caller's account. Returns `401` when anonymous. |
-| `GET` | `/v1/keys` | Any | List the caller's keys |
+| `GET` | `/v1/keys?q=&status=&sort=&dir=` | Any | List the caller's keys with `billed_usd` (lifetime spend) and `usage_30d_usd`. `sort` is `created`, `name`, `status`, `last_used`, `spend`, or `usage`. |
+| `GET` | `/v1/keys/:id` | Any | One of the caller's keys with its 30-day usage series |
 | `PATCH` | `/v1/keys/:id` | Any | Rename or block (`{"name"?, "status":"blocked"}`). Customers cannot reactivate a key. |
 | `POST` | `/v1/keys/:id/rotate` | Any | Replace the key and keep its limits, pricing, and expiry. The old key is blocked. |
 | `GET` | `/v1/models` | Key | Model catalog, local and not metered |
 | `GET` | `/v1/models/:id` | Key | One catalog entry, or `404 model_not_found` |
-| `GET` | `/v1/account` | Any | Account, balance, credit lots, subscription, and `top_up` instructions |
+| `GET` | `/v1/account/models` | Any | The `/v1/models` list for the caller's key, also with a dashboard token |
+| `GET` | `/v1/account` | Any | Account, balance, lifetime `billed_usd`, credit lots, subscription, and `top_up` instructions |
 | `GET` | `/v1/account/usage?days=30&key=` | Any | Daily and per-model usage (`days` 1 to 365) |
-| `GET` | `/v1/account/requests?limit=20&offset=0&key=&model=&kind=&status=` | Any | Request history |
+| `GET` | `/v1/account/requests?limit=20&offset=0&key=&model=&kind=&status=` | Any | Request history. Rows carry `key_name` and `key_prefix`. |
 | `POST` | `/v1/account/redeem` | Any | Body `{"code":"RES-..."}` |
 | `POST` | `/v1/account/checkout` | Any | Body `{"plan_code":"monthly","method":"stripe"}` or `"crypto"` |
 | `GET` | `/v1/account/payments` | Any | The caller's orders (latest 50) |
@@ -593,16 +598,16 @@ All routes live under `/admin/api`. They require the administrator token, sent a
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/overview` | Lifetime totals, margin, accounts, and credit |
+| `GET` | `/overview` | Lifetime totals and margin. `outstanding_usd` is the unexpired credit of active accounts. Credit of suspended accounts is `suspended_credit_usd`, uncovered spend is `debt_usd`. `active_keys` counts keys that can call the API now. |
 | `GET` | `/usage?days=30` | Daily and per-model series |
 | `GET` | `/events` | Server-sent snapshot every five seconds |
-| `GET` | `/keys?q=&status=&account=&limit=&offset=` | List keys |
-| `GET` | `/keys/:id` | One key |
+| `GET` | `/keys?q=&status=&account=&sort=&dir=&limit=&offset=` | List keys with `billed_usd`, `usage_30d_usd`, and `account_contact`. `sort` adds `account`, `spend`, and `usage` to the customer sorts. |
+| `GET` | `/keys/:id` | One key with its account and 30-day usage |
 | `PATCH` | `/keys/:id` | Update name, status, limits, `markup_pct`, or `expires_at` |
 | `POST` | `/keys/:id/rotate` | Rotate (exempt from customer rotation limits) |
 | `POST` | `/keys/:id/revoke` | Revoke a key |
-| `GET` | `/accounts?q=&status=&limit=&offset=` | List accounts |
-| `GET` | `/accounts/:id` | One account |
+| `GET` | `/accounts?q=&status=&sort=&dir=&limit=&offset=` | List accounts with balance, `debt_usd`, `billed_usd`, `usage_30d_usd`, and key counts. `sort` is `created`, `contact`, `status`, `balance`, `keys`, `spend`, or `usage`. |
+| `GET` | `/accounts/:id?key_limit=&key_offset=&key_sort=&key_dir=` | One account with a page of its keys and 30-day usage |
 | `PATCH` | `/accounts/:id` | Update status, contact, note, `markup_pct`, or `can_create_keys` |
 | `POST` | `/accounts/:id/keys` | Create a key with a name and limits (bypasses creation guards) |
 | `POST` | `/accounts/:id/credits` | Add credit: `amount_usd`, `source`, optional `expires_at` and `note` |
@@ -614,12 +619,12 @@ All routes live under `/admin/api`. They require the administrator token, sent a
 | `POST` | `/codes` | Create one code, or an array of up to 100. Each item takes `credit_usd` or `plan_code`, plus optional `expires_at` and `note`. |
 | `PATCH` | `/codes/:id` | Update `expires_at` or `note` (unredeemed codes only) |
 | `DELETE` | `/codes/:id` | Cancel an unredeemed code |
-| `GET` | `/payments` | Orders, filtered by `q`, `status`, `sort`, `dir`, `limit`, and `offset` |
+| `GET` | `/payments` | Orders, filtered by `q`, `status`, `account`, `sort`, `dir`, `limit`, and `offset` |
 | `GET` | `/payments/:id` | One order, with quotes and transfers |
 | `POST` | `/payments/:id/complete` | Mark a pending or expired order as paid (grants once) |
 | `GET` | `/payroof` | Payroof configuration, catalog, and webhooks |
 | `POST` | `/payroof/webhook` | Register `{public_url}/webhooks/payroof` |
-| `GET` | `/requests` | Request log, filtered by `q`, `model`, `kind`, `status`, `path`, `ip`, `method`, `key`, `account`, `hour`, `limit`, and `offset` |
+| `GET` | `/requests` | Request log with `key_name`, `key_prefix`, and `account_contact`, filtered by `q`, `model`, `kind`, `status`, `path`, `ip`, `method`, `key`, `account`, `hour`, `limit`, and `offset` |
 | `GET` | `/requests/groups?field=model` | Group requests by `model`, `ip`, `status`, `kind`, `path`, `key`, or `hour` |
 | `GET` | `/settings` | Redacted configuration |
 | `PATCH` | `/settings` | Validated partial configuration update |

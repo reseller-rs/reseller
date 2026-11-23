@@ -229,7 +229,10 @@ fn row_json(r: &SqliteRow) -> Value {
 
 /// Paginated key listing, optionally scoped to one account.
 ///
-/// Each item includes `usage_30d_usd`, the billed usage over the last 30 days.
+/// Each item includes `billed_usd` (lifetime billed spend), `usage_30d_usd`
+/// (billed over the last 30 days), and `account_contact`. Sorts: `created`
+/// (default), `name`, `status`, `account`, `last_used`, `spend` (lifetime),
+/// and `usage` (30 days).
 async fn list_keys(app: &App, account: Option<&str>, q: &Query) -> Result<Value> {
     let search = search(q);
     let status = status_filter(q);
@@ -255,12 +258,14 @@ async fn list_keys(app: &App, account: Option<&str>, q: &Query) -> Result<Value>
         Some("account") => "account_id",
         Some("last_used") => "last_used_at",
         Some("usage") => "usage_30d_micro",
+        Some("spend") => "billed_micro",
         _ => "created_at",
     };
     // `order` and the direction come from fixed whitelists.
     let sql = format!(
         "SELECT k.*,COALESCE((SELECT SUM(u.billed_micro) FROM usage_buckets u \
-           WHERE u.key_id=k.id AND u.hour>=?),0) AS usage_30d_micro \
+           WHERE u.key_id=k.id AND u.hour>=?),0) AS usage_30d_micro,\
+           (SELECT a.contact FROM accounts a WHERE a.id=k.account_id) AS account_contact \
          FROM api_keys k WHERE {FILTER} \
          ORDER BY {order} {} NULLS LAST,id DESC LIMIT ? OFFSET ?",
         direction(q)
@@ -283,6 +288,7 @@ async fn list_keys(app: &App, account: Option<&str>, q: &Query) -> Result<Value>
         .map(|r| {
             let mut v = keys::key_json(r);
             v["usage_30d_usd"] = money::display(r.get("usage_30d_micro")).into();
+            v["account_contact"] = r.get::<String, _>("account_contact").into();
             v
         })
         .collect();
@@ -417,7 +423,8 @@ fn request_filters(sql: &mut QueryBuilder<Sqlite>, account: Option<&str>, q: &Qu
     Ok(())
 }
 
-/// Request history, either as a page of rows or grouped by `field`.
+/// Request history, either as a page of rows (each labelled with `key_name`,
+/// `key_prefix`, and `account_contact`) or grouped by `field`.
 async fn requests(app: &App, account: Option<&str>, q: &Query, grouped: bool) -> Result<Value> {
     let page = Page::from(q);
     if grouped {
@@ -448,12 +455,32 @@ async fn requests(app: &App, account: Option<&str>, q: &Query, grouped: bool) ->
     let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM requests WHERE 1=1");
     request_filters(&mut count, account, q)?;
     let total: i64 = count.build().fetch_one(&app.db).await?.get(0);
-    let mut sql = QueryBuilder::<Sqlite>::new("SELECT * FROM requests WHERE 1=1");
+    // Key name and prefix, and the account contact, label the rows in the
+    // dashboards. Subqueries keep the filter columns unambiguous.
+    let mut sql = QueryBuilder::<Sqlite>::new(
+        "SELECT r.*,(SELECT k.name FROM api_keys k WHERE k.id=r.key_id) AS key_name,\
+         (SELECT k.key_prefix FROM api_keys k WHERE k.id=r.key_id) AS key_prefix,\
+         (SELECT a.contact FROM accounts a WHERE a.id=r.account_id) AS account_contact \
+         FROM requests r WHERE 1=1",
+    );
     request_filters(&mut sql, account, q)?;
     sql.push(" ORDER BY created_at DESC LIMIT ")
         .push_bind(page.limit)
         .push(" OFFSET ")
         .push_bind(page.offset);
     let rows = sql.build().fetch_all(&app.db).await?;
-    Ok(page.wrap("requests", rows.iter().map(row_json).collect(), total))
+    let items = rows
+        .iter()
+        .map(|r| {
+            let mut v = row_json(r);
+            // Customers see what they were billed, never the provider cost.
+            if account.is_some()
+                && let Some(row) = v.as_object_mut()
+            {
+                row.remove("upstream_usd");
+            }
+            v
+        })
+        .collect();
+    Ok(page.wrap("requests", items, total))
 }

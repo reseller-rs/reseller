@@ -2,7 +2,7 @@
 # Build a static musl binary, then ship it on the empty scratch image.
 
 # Build stage: Rust toolchain on Alpine (musl libc).
-FROM rust:1.98.1-alpine AS build
+FROM rust:1.99.1-alpine AS build
 WORKDIR /build
 # Manifests first, so dependency layers can be reused when only sources change.
 COPY Cargo.toml Cargo.lock ./

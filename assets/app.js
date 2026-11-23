@@ -13,8 +13,11 @@ const brand = (() => {
 const brandName = brand.name || 'Reseller';
 const admin = location.pathname.startsWith('/admin');
 const workspace = location.pathname.startsWith('/workspace');
-const store = admin ? 'reseller.admin' : 'reseller.customer';
-let token = sessionStorage.getItem(store) || '';
+const docsPage = location.pathname.startsWith('/docs');
+const CUSTOMER_STORE = 'reseller.customer';
+const store = admin ? 'reseller.admin' : CUSTOMER_STORE;
+// The docs page reads the workspace session (same tab) to list the caller's models.
+let token = docsPage ? '' : sessionStorage.getItem(store) || '';
 let tab = 'overview';
 
 // The operator-issued workspace link carries the dashboard token as `#token=...`.
@@ -32,7 +35,7 @@ if (workspace) {
   }
 }
 
-/* Helpers -------------------------------------------------------------------- */
+/* Formatting ----------------------------------------------------------------- */
 // Every server- or user-supplied value interpolated into an HTML string must go
 // through esc() (text and quoted attribute values). Never build `style=` or
 // `on*=` attributes: the CSP forbids them.
@@ -42,8 +45,21 @@ const usdFormat = new Intl.NumberFormat('en-US', { style: 'currency', currency: 
 const usd = v => usdFormat.format(Number(v || 0));
 // Money arrives as decimal strings such as "0" or "0.000000".
 const isPositive = v => Number(v) > 0;
+const DAY = 86400;
+const nowSeconds = () => Date.now() / 1000;
 const toUnix = local => local ? Math.floor(new Date(local).getTime() / 1000) : null;
-const date = v => v ? new Date(v * 1000).toLocaleString(undefined, { hour12: false }) : 'Never';
+const date = v => v ? new Date(v * 1000).toLocaleString(undefined, { hour12: false, dateStyle: 'medium', timeStyle: 'short' }) : 'Never';
+// Usage days are UTC midnights. Format them in UTC so the label matches the bucket.
+const day = (v, opts = { month: 'short', day: 'numeric' }) => new Date(Number(v) * 1000).toLocaleDateString(undefined, { timeZone: 'UTC', ...opts });
+const relativeFormat = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+function ago(v) {
+  if (!v) return 'Never';
+  const diff = v - nowSeconds();
+  const abs = Math.abs(diff);
+  const [unit, size] = abs < 60 ? ['second', 1] : abs < 3600 ? ['minute', 60] : abs < DAY ? ['hour', 3600] : abs < 30 * DAY ? ['day', DAY] : abs < 365 * DAY ? ['month', 30 * DAY] : ['year', 365 * DAY];
+  return relativeFormat.format(Math.round(diff / size), unit);
+}
+const when = v => v ? `<time datetime="${esc(new Date(v * 1000).toISOString())}" title="${esc(date(v))}">${esc(ago(v))}</time>` : '<span class="muted">Never</span>';
 const localDateTime = v => {
   if (!v) return '';
   const d = new Date(Number(v) * 1000);
@@ -51,13 +67,35 @@ const localDateTime = v => {
   return d.toISOString().slice(0, 16);
 };
 const count = v => Number(v || 0).toLocaleString();
-const planRate = p => Number(p.price_usd) / Number(p.duration_days || 1);
-const bestCode = plans => plans.slice().sort((a, b) => planRate(a) - planRate(b))[0]?.code;
-const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', confirmed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', late: 'warn', pending: 'info', redeemed: 'info', seen: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger' }));
+const plural = (n, word) => `${count(n)} ${word}${Number(n) === 1 ? '' : 's'}`;
+const bytes = n => {
+  n = Number(n || 0);
+  if (n < 1024) return `${count(n)} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
+};
+const ms = v => {
+  const n = Number(v || 0);
+  return n < 1000 ? `${count(n)} ms` : `${(n / 1000).toFixed(n < 10_000 ? 2 : 1)} s`;
+};
+const shortId = id => id ? `${String(id).slice(0, 8)}...` : '-';
+const percent = (part, whole) => whole > 0 ? `${((part / whole) * 100).toFixed(1)}%` : '-';
+// Best value: most credit per dollar, then the lowest price per day.
+const bestCode = plans => plans.slice().sort((a, b) =>
+  (Number(b.credit_usd) / Number(b.price_usd)) - (Number(a.credit_usd) / Number(a.price_usd))
+  || (Number(a.price_usd) / a.duration_days) - (Number(b.price_usd) / b.duration_days))[0]?.code;
+const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', confirmed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', late: 'warn', pending: 'info', redeemed: 'info', seen: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger', 'used up': 'muted' }));
 const METHOD_LABELS = { stripe: 'Card', crypto: 'Crypto' };
 const methodLabel = m => METHOD_LABELS[m] || m;
+const KIND_LABELS = { llm: 'Text', tts: 'Speech', stt: 'Transcription', image: 'Image' };
+const kindLabel = k => KIND_LABELS[k] || k || '-';
+const SOURCE_LABELS = { free: 'Trial credit', purchase: 'Purchase', admin: 'Operator grant', refund: 'Refund', subscription: 'Plan credit' };
+const sourceLabel = s => SOURCE_LABELS[s] || s;
 const pill = (value, tone) => `<span class="pill tone-${tone || TONES.get(String(value).toLowerCase()) || 'muted'}">${esc(value)}</span>`;
-const requestPill = r => r.status >= 400 ? pill(r.status, 'danger') : r.status ? pill(r.status, 'ok') : pill('In progress', 'info');
+const requestPill = r => !r.finished ? pill('In progress', 'info') : r.status >= 400 ? pill(r.status, 'danger') : pill(r.status, 'ok');
+const lotState = c => c.expires_at && c.expires_at < nowSeconds() ? 'expired' : isPositive(c.remaining_usd) ? 'active' : 'used up';
 const KEY_NAMES = [
   'My application', 'Production', 'Staging', 'Development', 'Mobile app',
   'Backend service', 'Data pipeline', 'Chat assistant', 'Automation', 'Playground',
@@ -65,6 +103,27 @@ const KEY_NAMES = [
   'Analytics', 'Internal tools', 'Sandbox', 'Batch jobs', 'Scheduled tasks',
 ];
 const suggestedName = () => KEY_NAMES[Math.floor(Math.random() * KEY_NAMES.length)];
+
+/* Entity links ----------------------------------------------------------------
+   Rendered as buttons and handled by one document-level listener (see the end
+   of this file), so they work in views and dialogs alike. */
+const accountLabel = (id, contact) => contact || shortId(id);
+function accountLink(id, contact) {
+  if (!id) return '<span class="muted">-</span>';
+  if (!admin) return esc(accountLabel(id, contact));
+  return `<button type="button" class="link" data-open-account="${esc(id)}" title="Open account ${esc(id)}">${esc(accountLabel(id, contact))}</button>`;
+}
+function keyLink(id, name, prefix) {
+  if (!id) return '<span class="muted">-</span>';
+  const label = name || (prefix ? `${prefix}...` : shortId(id));
+  return `<button type="button" class="link" data-open-key="${esc(id)}" title="Open key details">${esc(label)}</button>`;
+}
+const goButton = (label, name, params = {}, cls = 'ghost small') =>
+  `<button type="button" class="${cls}" data-go="${esc(name)}" data-go-params="${esc(new URLSearchParams(params))}">${esc(label)}</button>`;
+const copyable = (value, label, display = value) =>
+  `<button type="button" class="copy-value" data-copy-value="${esc(value)}" data-copy-label="${esc(label)}" title="Copy ${esc(label.toLowerCase())}"><code>${esc(display)}</code></button>`;
+
+/* Session ---------------------------------------------------------------------- */
 
 function signOut() {
   // Stop in-flight work and drop cached data so nothing from this session leaks
@@ -77,8 +136,7 @@ function signOut() {
   token = '';
   tab = 'overview';
   requestIndex.clear();
-  requestModelCache = { values: [], expiresAt: 0 };
-  for (const state of Object.values(listStates)) Object.assign(state, DEFAULT_LIST_STATE);
+  for (const [name, state] of Object.entries(listStates)) Object.assign(state, LIST_DEFAULTS[name]);
   history.replaceState(null, '', location.pathname);
   renderHeader();
   if (workspace || admin) login();
@@ -87,11 +145,12 @@ function signOut() {
 function renderHeader() {
   const el = document.querySelector('#header-actions');
   if (!el) return;
-  if (token) {
-    el.innerHTML = '<button type="button" id="header-logout" class="ghost">Sign out</button>';
+  const docs = `<a class="nav-link${docsPage ? ' current' : ''}" href="/docs/"${docsPage ? ' aria-current="page"' : ''}>Docs</a>`;
+  if (token && (workspace || admin)) {
+    el.innerHTML = `${docs}<button type="button" id="header-logout" class="ghost">Sign out</button>`;
     el.querySelector('#header-logout').onclick = signOut;
   } else {
-    el.innerHTML = '<a class="button" href="/workspace/">Workspace</a>';
+    el.innerHTML = `${docs}<a class="button" href="/workspace/">Workspace</a>`;
   }
 }
 
@@ -116,11 +175,11 @@ const copyText = async (text, label) => {
     return false;
   }
 };
-function flash(el, ms = 1400) {
+function flash(el, duration = 1400) {
   if (!el) return;
   el.classList.add('copied');
   clearTimeout(el._flashTimer);
-  el._flashTimer = setTimeout(() => el.classList.remove('copied'), ms);
+  el._flashTimer = setTimeout(() => el.classList.remove('copied'), duration);
 }
 function flashCopied(button) {
   if (!button) return;
@@ -184,7 +243,8 @@ async function signup(fields, onProgress, signal) {
 
 async function api(path, method = 'GET', data, options = {}) {
   const headers = {};
-  if (token) headers[admin ? 'x-admin-token' : 'authorization'] = admin ? token : `Bearer ${token}`;
+  const credential = options.token ?? token;
+  if (credential) headers[admin ? 'x-admin-token' : 'authorization'] = admin ? credential : `Bearer ${credential}`;
   if (data !== undefined) headers['content-type'] = 'application/json';
   const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data), signal: options.signal });
   // Proxies and crashes can return non-JSON bodies. Surface the status instead of a parse error.
@@ -196,9 +256,13 @@ async function api(path, method = 'GET', data, options = {}) {
 const endpoint = name => admin ? `/admin/api/${name}` : `/v1/${name}`;
 const get = (path, signal) => api(path, 'GET', undefined, { signal });
 
-function table(columns, rows, group) {
-  if (!rows.length) return emptyState('Nothing here yet', 'Activity will appear here as it happens.');
-  const row = r => `<tr>${columns.map(c => `<td>${c[1](r)}</td>`).join('')}</tr>`;
+/* Building blocks -------------------------------------------------------------- */
+
+// columns: [label, render, className?]. Cells carry data-label so narrow screens
+// can show each row as a labelled card.
+function table(columns, rows, { group, empty } = {}) {
+  if (!rows.length) return emptyState(...(empty || ['Nothing here yet', 'Activity will appear here as it happens.']));
+  const row = r => `<tr>${columns.map(([label, render, cls]) => `<td data-label="${esc(label)}"${cls ? ` class="${cls}"` : ''}>${render(r)}</td>`).join('')}</tr>`;
   let body = `<tbody>${rows.map(row).join('')}</tbody>`;
   if (group?.value) {
     const buckets = new Map();
@@ -209,59 +273,131 @@ function table(columns, rows, group) {
     });
     body = [...buckets].map(([label, items]) => `<tbody><tr class="group-row"><th colspan="${columns.length}" scope="rowgroup">${esc(label)} <span>${count(items.length)}</span></th></tr>${items.map(row).join('')}</tbody>`).join('');
   }
-  return `<div class="table-wrap"><table><thead><tr>${columns.map(c => `<th scope="col">${esc(c[0])}</th>`).join('')}</tr></thead>${body}</table></div>`;
+  return `<div class="table-wrap stack"><table><thead><tr>${columns.map(([label, , cls]) => `<th scope="col"${cls ? ` class="${cls}"` : ''}>${esc(label)}</th>`).join('')}</tr></thead>${body}</table></div>`;
 }
-function metric(label, value, hint) {
-  return `<div class="card metric-card"><div class="label">${esc(label)}</div><div class="metric">${esc(value)}</div>${hint ? `<div class="hint">${esc(hint)}</div>` : ''}</div>`;
+function metric(label, value, hint, { tone, html } = {}) {
+  return `<div class="card metric-card${tone ? ` tone-${tone}` : ''}"><div class="label">${esc(label)}</div><div class="metric">${html ? value : esc(value)}</div>${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
 }
+// A compact label/value list. Values are HTML; escape them at the call site.
+const facts = items => `<dl class="facts">${items.filter(Boolean).map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${value}</dd></div>`).join('')}</dl>`;
 function emptyState(title, text) {
-  return `<div class="empty"><strong>${esc(title)}</strong><br>${esc(text)}</div>`;
+  return `<div class="empty"><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
 }
 function loading(text = 'Loading...') {
   return `<div class="loading"><span class="spinner" aria-hidden="true"></span>${esc(text)}</div>`;
 }
 
-function modal(title, content, setup, className) {
+function modal(title, content, setup, size) {
   const d = document.createElement('dialog');
-  if (className) d.classList.add(className);
-  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button type="button" data-close aria-label="Close dialog">x</button></div><div class="dialog-content">${content}</div>`;
+  if (size) d.classList.add(size);
+  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button type="button" data-close aria-label="Close dialog">&times;</button></div><div class="dialog-content">${content}</div>`;
   document.body.append(d);
   d.querySelector('[data-close]').onclick = () => d.close();
+  // Close on a backdrop click (the dialog box itself fills its own rect).
+  d.addEventListener('click', e => {
+    if (e.target !== d) return;
+    const r = d.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) d.close();
+  });
   d.addEventListener('close', () => d.remove());
   d.showModal();
   setup?.(d);
   return d;
 }
+// A dialog whose body loads asynchronously and can be refreshed in place.
+function liveModal(title, size, fetcher, render) {
+  const d = modal(title, `<div class="live-body">${loading()}</div>`, null, size);
+  const body = d.querySelector('.live-body');
+  let seq = 0;
+  const refresh = async () => {
+    const mine = ++seq;
+    try {
+      const data = await fetcher();
+      if (mine !== seq || !body.isConnected) return;
+      body.innerHTML = render(data, refresh);
+      wireCopies(body);
+      wireCharts(body);
+      render.after?.(body, data, refresh);
+    } catch (e) {
+      if (mine !== seq || !body.isConnected) return;
+      body.innerHTML = `<div class="card error">${esc(e.message)}</div>`;
+    }
+  };
+  refresh();
+}
 
-const DEFAULT_LIST_STATE = { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 };
-const listStates = {
-  keys: { ...DEFAULT_LIST_STATE },
-  accounts: { ...DEFAULT_LIST_STATE },
-  payments: { ...DEFAULT_LIST_STATE },
+/* List state and routing --------------------------------------------------------
+   The hash holds the tab and its filters, e.g. #requests?key=<id>, so every
+   filtered view can be linked, bookmarked, and reached with Back. */
+const LIST_DEFAULTS = {
+  keys: { q: '', status: '', sort: 'created', dir: 'desc', group: '', account: '', limit: 20, offset: 0 },
+  accounts: { q: '', status: '', sort: 'created', dir: 'desc', group: '', limit: 20, offset: 0 },
+  payments: { q: '', status: '', sort: 'created', dir: 'desc', group: '', account: '', limit: 20, offset: 0 },
+  requests: { q: '', kind: '', status: '', model: '', account: '', key: '', limit: 20, offset: 0 },
 };
-const listParams = state => {
-  const params = new URLSearchParams({ limit: state.limit, offset: state.offset, sort: state.sort, dir: state.dir });
-  if (state.q) params.set('q', state.q);
-  if (state.status) params.set('status', state.status);
-  return params;
-};
+const FILTERS = Object.fromEntries(Object.entries(LIST_DEFAULTS).map(([name, d]) => [name, Object.keys(d).filter(k => k !== 'limit' && k !== 'offset')]));
+const listStates = Object.fromEntries(Object.entries(LIST_DEFAULTS).map(([name, d]) => [name, { ...d }]));
+const TABS = admin
+  ? ['overview', 'accounts', 'keys', 'requests', 'payments', 'plans', 'codes', 'settings']
+  : ['overview', 'keys', 'requests', 'usage', 'billing', 'connect'];
+const TAB_LABELS = { overview: 'Overview', accounts: 'Accounts', keys: 'API keys', requests: 'Requests', payments: 'Payments', plans: 'Plans', codes: 'Redeem codes', settings: 'Settings', usage: 'Usage', billing: 'Billing', connect: 'Connect' };
+
+function hashFor(name) {
+  const state = listStates[name];
+  const params = new URLSearchParams();
+  if (state) for (const f of FILTERS[name]) if (state[f] && state[f] !== LIST_DEFAULTS[name][f]) params.set(f, state[f]);
+  const qs = params.toString();
+  return `#${name}${qs ? `?${qs}` : ''}`;
+}
+// Reads the tab and its filters from the hash into the list state.
+function applyRoute() {
+  const [name, qs = ''] = location.hash.slice(1).split('?');
+  tab = TABS.includes(name) ? name : 'overview';
+  const state = listStates[tab];
+  if (state) {
+    const params = new URLSearchParams(qs);
+    Object.assign(state, LIST_DEFAULTS[tab], { limit: state.limit });
+    for (const f of FILTERS[tab]) if (params.get(f)) state[f] = params.get(f);
+  }
+}
+// Navigates to a tab. With params, its filters are replaced by them.
+function go(name, params) {
+  document.querySelectorAll('dialog[open]').forEach(d => d.close());
+  const state = listStates[name];
+  if (state && params) Object.assign(state, LIST_DEFAULTS[name], { limit: state.limit }, params);
+  const next = hashFor(name);
+  if (location.hash === next) {
+    applyRoute();
+    selectTab();
+    load();
+  } else {
+    location.hash = next;
+  }
+}
+// Records filter changes made in place without adding history entries.
+const syncHash = () => history.replaceState(null, '', hashFor(tab));
+
 function listToolbar(id, state, { placeholder, statuses, sorts, groups }) {
   const options = (items, selected) => items.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`).join('');
-  return `<form class="list-toolbar" data-list-form="${id}">
-    <input name="q" type="search" value="${esc(state.q)}" aria-label="Search" placeholder="${esc(placeholder)}">
+  return `<form class="toolbar" data-list-form="${id}" role="search">
+    <input class="toolbar-search" name="q" type="search" value="${esc(state.q)}" aria-label="Search" placeholder="${esc(placeholder)}">
     <select name="status" aria-label="Filter by status"><option value="">All statuses</option>${options(statuses, state.status)}</select>
     <select name="sort" aria-label="Sort by">${options(sorts, state.sort)}</select>
-    <select name="dir" aria-label="Sort direction"><option value="desc"${state.dir === 'desc' ? ' selected' : ''}>Descending</option><option value="asc"${state.dir === 'asc' ? ' selected' : ''}>Ascending</option></select>
-    <select name="group" aria-label="Group by"><option value="">No grouping</option>${options(groups, state.group)}</select>
-    <button type="submit">Apply</button><button type="button" class="ghost" data-list-clear="${id}">Clear</button>
+    <select name="dir" aria-label="Sort direction"><option value="desc"${state.dir === 'desc' ? ' selected' : ''}>High to low, newest first</option><option value="asc"${state.dir === 'asc' ? ' selected' : ''}>Low to high, oldest first</option></select>
+    ${groups ? `<select name="group" aria-label="Group by"><option value="">No grouping</option>${options(groups, state.group)}</select>` : ''}
+    <div class="toolbar-actions"><button type="submit" class="primary">Apply</button><button type="button" class="ghost" data-list-clear="${id}">Reset</button></div>
   </form>`;
+}
+// A removable filter shown above a list, e.g. "Account: ops@example.com".
+function filterChip(id, field, label, value, extra = '') {
+  return `<div class="filter-chip"><span class="label">${esc(label)}</span><strong>${value}</strong>${extra}<button type="button" class="chip-remove" data-chip-remove="${esc(id)}" data-chip-field="${esc(field)}" aria-label="Remove ${esc(label.toLowerCase())} filter">&times;</button></div>`;
 }
 function listPager(id, state, total, shown) {
   const start = total ? state.offset + 1 : 0;
   const end = state.offset + shown;
   return `<div class="pager">
-    <span class="hint">Showing ${count(start)} to ${count(end)} of ${count(total)}</span>
-    <div class="actions"><label class="inline" for="${id}-size">Rows</label><select id="${id}-size" data-list-size="${id}">${[20, 50, 100].map(n => `<option${state.limit === n ? ' selected' : ''}>${n}</option>`).join('')}</select><button type="button" class="ghost" data-list-prev="${id}"${state.offset === 0 ? ' disabled' : ''}>Previous</button><button type="button" class="ghost" data-list-next="${id}"${end >= total ? ' disabled' : ''}>Next</button></div>
+    <span class="hint">${total ? `Showing ${count(start)} to ${count(end)} of ${count(total)}` : 'No matching rows'}</span>
+    <div class="pager-actions"><label class="inline" for="${id}-size">Rows</label><select id="${id}-size" data-list-size="${id}">${[20, 50, 100].map(n => `<option${state.limit === n ? ' selected' : ''}>${n}</option>`).join('')}</select><button type="button" class="ghost" data-list-prev="${id}"${state.offset === 0 ? ' disabled' : ''}>Previous</button><button type="button" class="ghost" data-list-next="${id}"${end >= total ? ' disabled' : ''}>Next</button></div>
   </div>`;
 }
 function bindForm(form, handler) {
@@ -305,6 +441,120 @@ function planCard(p, best, cta) {
   </article>`;
 }
 
+/* Charts ----------------------------------------------------------------------- */
+
+// Sums a usage series into one entry per UTC day over the last `days`, with
+// empty days filled in so the time axis is continuous.
+function dailyTotals(series, days = 30) {
+  const totals = new Map();
+  for (const r of series) {
+    const current = totals.get(Number(r.day)) || { cost: 0, requests: 0, tokens: 0 };
+    current.cost += Number(r.billed_cost_usd);
+    current.requests += Number(r.requests || 0);
+    current.tokens += Number(r.tokens || 0);
+    totals.set(Number(r.day), current);
+  }
+  const today = Math.floor(nowSeconds() / DAY) * DAY;
+  const first = Math.min(today - days * DAY, ...totals.keys());
+  const out = [];
+  for (let d = first; d <= today; d += DAY) out.push([d, totals.get(d) || { cost: 0, requests: 0, tokens: 0 }]);
+  return out;
+}
+// Per-model totals of a usage series, largest spend first.
+function modelTotals(series) {
+  const models = new Map();
+  for (const r of series) {
+    const m = models.get(r.model) || { model: r.model, cost: 0, upstream: 0, requests: 0, tokens: 0 };
+    m.cost += Number(r.billed_cost_usd);
+    m.upstream += Number(r.upstream_cost_usd || 0);
+    m.requests += Number(r.requests || 0);
+    m.tokens += Number(r.tokens || 0);
+    models.set(r.model, m);
+  }
+  return [...models.values()].sort((a, b) => b.cost - a.cost || b.requests - a.requests);
+}
+const seriesTotals = series => series.reduce((t, r) => ({
+  cost: t.cost + Number(r.billed_cost_usd),
+  requests: t.requests + Number(r.requests || 0),
+  tokens: t.tokens + Number(r.tokens || 0),
+}), { cost: 0, requests: 0, tokens: 0 });
+
+let chartSeq = 0;
+function chart(series, { days = 30, compact = false } = {}) {
+  if (!series.length) return emptyState('No usage yet', 'Usage appears here after the first API request.');
+  const entries = dailyTotals(series, days);
+  const totalCost = entries.reduce((sum, [, v]) => sum + v.cost, 0);
+  const mode = totalCost > 0 ? 'cost' : 'requests';
+  const value = v => mode === 'cost' ? v.cost : v.requests;
+  const max = Math.max(...entries.map(([, v]) => value(v)), 1e-12);
+  const W = 600, H = compact ? 120 : 170, base = H - 6, top = 10;
+  const step = W / entries.length;
+  const barWidth = Math.max(3, Math.min(22, step * .62));
+  const id = `usage-${++chartSeq}`;
+  const bars = entries.map(([d, v], i) => {
+    const x = step * i + step / 2;
+    const height = value(v) > 0 ? Math.max(2, (value(v) / max) * (base - top)) : 0;
+    const summary = `${day(d, { weekday: 'short', month: 'short', day: 'numeric' })}|${usd(v.cost)} billed|${plural(v.requests, 'request')}|${count(v.tokens)} tokens`;
+    return `<g class="chart-column" tabindex="0" data-chart-x="${(x / W).toFixed(4)}" data-chart-summary="${esc(summary)}"><rect class="chart-hit" x="${(step * i).toFixed(1)}" y="0" width="${step.toFixed(1)}" height="${base}"/>${height ? `<rect class="chart-bar" x="${(x - barWidth / 2).toFixed(1)}" y="${(base - height).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${height.toFixed(1)}" rx="2"/>` : ''}<title>${esc(summary.replaceAll('|', ', '))}</title></g>`;
+  }).join('');
+  const mid = entries[Math.floor(entries.length / 2)][0];
+  return `<div class="chart-wrap${compact ? ' compact' : ''}">
+    <div class="chart-legend"><span><i></i>${mode === 'cost' ? `Billed per day, last ${days} days` : `Requests per day, last ${days} days (nothing billed)`}</span><strong>${mode === 'cost' ? esc(usd(totalCost)) : count(entries.reduce((sum, [, v]) => sum + v.requests, 0))}</strong></div>
+    <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-labelledby="${id}-title"><title id="${id}-title">${mode === 'cost' ? 'Daily billed cost' : 'Daily request count'}</title>
+      <line x1="0" y1="${base}" x2="${W}" y2="${base}"/>
+      ${bars}
+    </svg>
+    <div class="chart-tooltip" role="status" aria-live="polite" hidden></div>
+    <div class="chart-foot"><span>${esc(day(entries[0][0]))}</span><span>${esc(day(mid))}</span><span>${esc(day(entries[entries.length - 1][0]))}</span></div>
+  </div>`;
+}
+
+function wireCharts(root) {
+  root.querySelectorAll('.chart-wrap').forEach(wrap => {
+    const tooltip = wrap.querySelector('.chart-tooltip');
+    const show = column => {
+      const [heading, ...lines] = column.dataset.chartSummary.split('|');
+      tooltip.innerHTML = `<strong>${esc(heading)}</strong>${lines.map(line => `<span>${esc(line)}</span>`).join('')}`;
+      tooltip.hidden = false;
+      // Keep the tooltip inside the chart: anchor it at the column, clamped.
+      const x = Number(column.dataset.chartX);
+      tooltip.style.left = `${Math.min(Math.max(x * 100, 16), 84)}%`;
+      column.classList.add('active');
+    };
+    const hide = column => {
+      tooltip.hidden = true;
+      column.classList.remove('active');
+    };
+    wrap.querySelectorAll('.chart-column').forEach(column => {
+      column.addEventListener('mouseenter', () => show(column));
+      column.addEventListener('focus', () => show(column));
+      column.addEventListener('mouseleave', () => hide(column));
+      column.addEventListener('blur', () => hide(column));
+    });
+  });
+}
+
+// Spend per model as a table with each model's share of the total.
+function modelTable(series, { upstream = false } = {}) {
+  const models = modelTotals(series);
+  const total = models.reduce((s, m) => s + m.cost, 0);
+  const columns = [
+    ['Model', m => `<code>${esc(m.model || '-')}</code>`, 'wrap'],
+    ['Requests', m => `<span class="num">${count(m.requests)}</span>`, 'end'],
+    ['Tokens', m => `<span class="num">${count(m.tokens)}</span>`, 'end'],
+    ['Billed', m => `<span class="num">${esc(usd(m.cost))}</span>`, 'end'],
+  ];
+  if (upstream) columns.push(['Upstream', m => `<span class="num">${esc(usd(m.upstream))}</span>`, 'end']);
+  columns.push(['Share', m => `<span class="share"><span class="share-bar"><i data-share="${total > 0 ? Math.round((m.cost / total) * 100) : 0}"></i></span><span class="num">${percent(m.cost, total)}</span></span>`]);
+  return table(columns, models, { empty: ['No usage yet', 'Model totals appear after the first request.'] });
+}
+// Share bars are sized with CSSOM (the CSP forbids inline style attributes).
+function wireShares(root) {
+  root.querySelectorAll('[data-share]').forEach(i => { i.style.width = `${i.dataset.share}%`; });
+}
+
+/* Key creation and secrets ----------------------------------------------------- */
+
 function redeemForm() {
   modal('Redeem a credit code', `
     <form>
@@ -332,7 +582,7 @@ function secrets(v) {
       <button type="button" class="small" data-copy="key">Copy</button>
     </div>
     <div class="cred-row">
-      <span class="cred-label" title="Dashboard token">Dashboard</span>
+      <span class="cred-label">Dashboard token</span>
       <code class="cred-value" title="${esc(v.dashboard_token)}">${esc(v.dashboard_token)}</code>
       <button type="button" class="small" data-copy="token">Copy</button>
     </div>
@@ -357,21 +607,21 @@ function secrets(v) {
     const copyAll = d.querySelector('[data-copy-all]');
     copyAll.onclick = () => copyText(JSON.stringify(v, null, 2), 'Credentials').then(ok => ok && flashCopied(copyAll));
     d.querySelector('[data-open]')?.addEventListener('click', () => {
-      sessionStorage.setItem('reseller.customer', v.dashboard_token);
+      sessionStorage.setItem(CUSTOMER_STORE, v.dashboard_token);
       location.href = '/workspace/';
     });
   }, 'wide');
 }
 
 function keyForm() {
-  const signedIn = Boolean(token);
+  const signedIn = Boolean(token) && !docsPage;
   modal(signedIn ? 'Create an API key' : 'Create an account', `
     <form>
       <label for="key-name">Key name</label>
       <input id="key-name" name="name" maxlength="80" value="${esc(suggestedName())}" placeholder="My application" required>
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
-      <p class="field-help">New accounts receive evaluation credit. Additional keys share your existing balance.</p>
+      <p class="field-help">${signedIn ? 'The new key shares your account balance.' : 'New accounts receive evaluation credit. Additional keys share the same balance.'}</p>
       <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
       <div class="actions"><button class="primary" type="submit">Create key</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
@@ -395,127 +645,263 @@ function keyForm() {
   }));
 }
 
-/* Account management modals -------------------------------------------------- */
+/* Key details ------------------------------------------------------------------ */
+
+function limitList(l = {}) {
+  const parts = [];
+  if (l.rpm) parts.push(['Requests per minute', count(l.rpm)]);
+  if (l.requests) parts.push(['Requests', `${count(l.requests.max)} per ${plural(l.requests.window_hours, 'hour')}`]);
+  if (l.tokens) parts.push(['Tokens', `${count(l.tokens.max)} per ${plural(l.tokens.window_hours, 'hour')}`]);
+  if (l.spend) parts.push(['Spend', `${usd(l.spend.max_usd)} per ${plural(l.spend.window_hours, 'hour')}`]);
+  if (l.max_children) parts.push(['Child keys', count(l.max_children)]);
+  if (l.allowed_models?.length) parts.push(['Models', l.allowed_models.map(m => `<code>${esc(m)}</code>`).join(' ')]);
+  return parts.map(([k, v]) => [k, k === 'Models' ? v : esc(v)]);
+}
+async function blockKey(kid) {
+  if (!(await confirmModal('Block key?', admin
+    ? 'Requests with this key are refused until it is set back to active.'
+    : 'Requests with this key are refused. Only the operator can unblock it.', 'Block key', true))) return false;
+  await api(endpoint(`keys/${kid}`), 'PATCH', { status: 'blocked' });
+  notice('Key blocked');
+  return true;
+}
+async function revokeKey(kid) {
+  if (!(await confirmModal('Revoke key?', 'Permanently revoke this key and its dashboard token? This cannot be undone.', 'Revoke key', true))) return false;
+  await api(endpoint(`keys/${kid}/revoke`), 'POST', {});
+  notice('Key revoked');
+  return true;
+}
+async function rotateKey(kid) {
+  if (!(await confirmModal('Rotate key?', 'A new secret replaces this key and the old one stops working. Applications using it need the new key.', 'Rotate key'))) return false;
+  secrets(await api(endpoint(`keys/${kid}/rotate`), 'POST', {}));
+  return true;
+}
+
+function keyDetails(kid) {
+  const render = v => {
+    const k = v.key;
+    const a = v.account?.account;
+    const series = v.usage?.series || [];
+    const t = seriesTotals(series);
+    const limits = limitList(k.limits);
+    const expired = k.expires_at && k.expires_at < nowSeconds();
+    return `
+      <div class="entity-head">
+        <div class="entity-title"><h3>${esc(k.name)}</h3>${pill(k.status)}${expired ? pill('expired', 'warn') : ''}</div>
+        <div class="entity-sub">${copyable(k.key_prefix + '...', 'Key prefix')}<span class="hint">ID</span>${copyable(k.id, 'Key ID', shortId(k.id))}</div>
+      </div>
+      <div class="tiles">
+        ${metric('Spent, all time', usd(k.billed_usd))}
+        ${metric('Last 30 days', usd(t.cost), esc(plural(t.requests, 'request')))}
+        ${metric('Tokens, 30 days', count(t.tokens))}
+        ${metric('Last used', when(k.last_used_at), `Created ${esc(date(k.created_at))}`, { html: true })}
+      </div>
+      <div class="quick-links">
+        ${goButton('View requests', 'requests', { key: k.id }, 'primary small')}
+        <button type="button" class="small" data-key-edit>${admin ? 'Edit key' : 'Rename'}</button>
+        <button type="button" class="small" data-key-rotate${k.status !== 'active' ? ' disabled' : ''}>Rotate</button>
+        ${k.status === 'active' ? '<button type="button" class="small danger" data-key-block>Block</button>' : ''}
+        ${admin && k.status !== 'revoked' ? '<button type="button" class="small danger" data-key-revoke>Revoke</button>' : ''}
+      </div>
+      <section class="detail-section">${chart(series, { compact: true })}</section>
+      ${series.length ? `<section class="detail-section"><h4>By model</h4>${modelTable(series, { upstream: admin })}</section>` : ''}
+      <div class="detail-columns">
+        <section class="detail-section"><h4>Settings</h4>${facts([
+          ['Expires', k.expires_at ? esc(date(k.expires_at)) : 'Never'],
+          admin && ['Markup', k.markup_pct ? `${esc(k.markup_pct)}%` : 'Account default'],
+          ...(limits.length ? limits : [['Limits', 'Account defaults']]),
+        ])}</section>
+        ${a ? `<section class="detail-section"><h4>Account</h4>${facts([
+          ['Account', accountLink(a.id, a.contact)],
+          ['Status', pill(a.status)],
+          ['Balance', `<span class="num">${esc(usd(a.balance_usd))}</span>`],
+          ['Spent, all time', `<span class="num">${esc(usd(a.billed_usd))}</span>`],
+        ])}</section>` : ''}
+      </div>`;
+  };
+  render.after = (body, v, refresh) => {
+    wireShares(body);
+    const k = v.key;
+    const run = fn => async e => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      try {
+        if (await fn()) {
+          refresh();
+          if (document.querySelector('#content')) load();
+        }
+      } catch (err) {
+        notice(err.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    };
+    body.querySelector('[data-key-edit]').onclick = () => editKeyForm(k.id, k.name, () => { refresh(); load(); });
+    body.querySelector('[data-key-rotate]').onclick = run(() => rotateKey(k.id));
+    body.querySelector('[data-key-block]')?.addEventListener('click', run(() => blockKey(k.id)));
+    body.querySelector('[data-key-revoke]')?.addEventListener('click', run(() => revokeKey(k.id)));
+  };
+  liveModal('API key', 'large', () => api(endpoint(`keys/${encodeURIComponent(kid)}`)), render);
+}
+
+async function editKeyForm(kid, name, done) {
+  const key = admin ? (await api(endpoint(`keys/${kid}`))).key : { name };
+  const limits = key.limits || {};
+  const windowFields = (field, label, value, placeholder, step = '1') => `<div><label for="key-${field}-max">${label}</label><input id="key-${field}-max" name="${field}_max" type="number" min="${step === '1' ? '1' : '0.000001'}" step="${step}" value="${esc(value?.max || '')}" placeholder="No limit"></div><div><label for="key-${field}-window">Window (hours)</label><input id="key-${field}-window" name="${field}_window" type="number" min="1" value="${esc(value?.window_hours || '')}" placeholder="${placeholder}"></div>`;
+  modal(admin ? 'Edit API key' : 'Rename API key', `<form>
+    <label for="edit-key-name">Key name</label><input id="edit-key-name" name="name" maxlength="80" value="${esc(key.name)}" required>
+    ${admin ? `<div class="form-grid"><div><label for="edit-key-status">Status</label><select id="edit-key-status" name="status">${key.status === 'revoked' ? '<option value="revoked">Revoked (permanent)</option>' : `<option value="active"${key.status === 'active' ? ' selected' : ''}>Active</option><option value="blocked"${key.status === 'blocked' ? ' selected' : ''}>Blocked</option>`}</select></div><div><label for="edit-key-markup">Markup %</label><input id="edit-key-markup" name="markup_pct" type="number" step="0.000001" value="${esc(key.markup_pct || '')}" placeholder="Account default"></div><div><label for="edit-key-expiry">Expires</label><input id="edit-key-expiry" name="expires_at" type="datetime-local" value="${esc(localDateTime(key.expires_at))}"></div><div><label for="edit-key-rpm">Requests per minute</label><input id="edit-key-rpm" name="rpm" type="number" min="1" value="${esc(limits.rpm || '')}" placeholder="No limit"></div></div>
+    <details class="advanced-fields"><summary>Usage limits and models</summary><div class="form-grid">${windowFields('requests', 'Request limit', limits.requests, '24')}${windowFields('tokens', 'Token limit', limits.tokens, '720')}${windowFields('spend', 'Spend limit (USD)', limits.spend && { max: limits.spend.max_usd, window_hours: limits.spend.window_hours }, '720', '0.000001')}<div><label for="edit-key-children">Maximum child keys</label><input id="edit-key-children" name="max_children" type="number" min="1" value="${esc(limits.max_children || '')}" placeholder="No limit"></div></div><label for="edit-key-models">Allowed models</label><textarea id="edit-key-models" name="allowed_models" rows="4" placeholder="One model per line. Blank allows all">${esc((limits.allowed_models || []).join('\n'))}</textarea></details>` : ''}
+    <div class="actions"><button class="primary" type="submit">Save changes</button></div>
+  </form>`, d => bindForm(d.querySelector('form'), async b => {
+    const payload = { name: b.name };
+    if (admin) {
+      const bounded = (field, fallback) => b[`${field}_max`] ? { max: Number(b[`${field}_max`]), window_hours: Number(b[`${field}_window`]) || fallback } : null;
+      Object.assign(payload, {
+        status: b.status,
+        markup_pct: b.markup_pct || null,
+        expires_at: toUnix(b.expires_at),
+        limits: {
+          rpm: b.rpm ? Number(b.rpm) : null,
+          requests: bounded('requests', 24),
+          tokens: bounded('tokens', 720),
+          spend: b.spend_max ? { max_usd: b.spend_max, window_hours: Number(b.spend_window) || 720 } : null,
+          max_children: b.max_children ? Number(b.max_children) : null,
+          allowed_models: b.allowed_models.split(/[\n,]/).map(v => v.trim()).filter(Boolean),
+        },
+      });
+    }
+    await api(endpoint(`keys/${kid}`), 'PATCH', payload);
+    d.close();
+    notice('Key updated');
+    await (done || load)();
+  }), 'wide');
+}
+
+/* Account management (operator) ------------------------------------------------ */
 
 function manageAccount(aid) {
-  const d = modal('Manage account', `<div class="manage-body">${loading('Loading account...')}</div>`, null, 'large');
-  const body = d.querySelector('.manage-body');
-  let keyOffset = 0;
   const keyLimit = 10;
+  let keyOffset = 0;
   let hasPlans;
-  let refreshSeq = 0;
-  const refresh = async () => {
-    const seq = ++refreshSeq;
-    try {
-      const [account, planData] = await Promise.all([
-        api(endpoint(`accounts/${aid}?key_limit=${keyLimit}&key_offset=${keyOffset}`)),
-        hasPlans === undefined ? api(endpoint('plans')) : Promise.resolve(null),
-      ]);
-      if (seq !== refreshSeq || !body.isConnected) return; // newer refresh or dialog closed
-      if (planData) hasPlans = planData.plans.some(p => p.active);
-      render(account, hasPlans);
-    } catch (e) {
-      if (seq !== refreshSeq || !body.isConnected) return;
-      body.innerHTML = `<div class="card error">${esc(e.message)}</div>`;
-    }
+  const fetcher = async () => {
+    const [account, planData] = await Promise.all([
+      api(endpoint(`accounts/${aid}?key_limit=${keyLimit}&key_offset=${keyOffset}&key_sort=spend`)),
+      hasPlans === undefined ? api(endpoint('plans')) : Promise.resolve(null),
+    ]);
+    if (planData) hasPlans = planData.plans.some(p => p.active);
+    return account;
   };
-  const render = (v, hasPlans) => {
+  const render = v => {
     const a = v.account;
     const sub = a.subscription;
     const keys = v.keys || [];
     const keyTotal = Number(v.key_total ?? keys.length);
     const credits = v.credits || [];
-    const billed = (v.usage?.series || []).reduce((sum, s) => sum + Number(s.billed_cost_usd), 0);
-    const now = Date.now() / 1000;
-    body.innerHTML = `
-      <div class="account-head account-identity">
-        <div class="account-id">
-          <span class="cred-label">Account</span>
-          <code title="${esc(a.id)}, click to copy" data-copy-id="${esc(a.id)}">${esc(a.id.slice(0, 8))}...</code>
-        </div>
-        ${pill(a.status)}
+    const series = v.usage?.series || [];
+    const t = seriesTotals(series);
+    const activeLots = credits.filter(c => lotState(c) === 'active');
+    return `
+      <div class="entity-head">
+        <div class="entity-title"><h3>${esc(a.contact || 'No contact')}</h3>${pill(a.status)}</div>
+        <div class="entity-sub"><span class="hint">ID</span>${copyable(a.id, 'Account ID', shortId(a.id))}<span class="hint">Created ${esc(date(a.created_at))}</span></div>
+        ${a.note ? `<p class="entity-note">${esc(a.note)}</p>` : ''}
       </div>
-      <div class="account-summary">
-        <span><strong>${esc(usd(a.balance_usd))}</strong> balance</span>
-        ${isPositive(a.debt_usd) ? `<span class="warn"><strong>${esc(usd(a.debt_usd))}</strong> debt</span>` : ''}
-        <span><strong>${count(keyTotal)}</strong> keys</span>
-        <span><strong>${sub ? esc(sub.plan_code) : 'None'}</strong> plan${sub ? `, expires ${esc(date(sub.expires_at))}` : ''}</span>
+      <div class="tiles">
+        ${metric('Balance', usd(a.balance_usd), isPositive(a.debt_usd) ? `Debt ${esc(usd(a.debt_usd))} settles from the next top-up` : `${esc(plural(activeLots.length, 'active credit lot'))}`, { tone: isPositive(a.debt_usd) ? 'warn' : '' })}
+        ${metric('Spent, all time', usd(a.billed_usd))}
+        ${metric('Last 30 days', usd(t.cost), esc(`${plural(t.requests, 'request')}, ${count(t.tokens)} tokens`))}
+        ${metric('Plan', sub ? sub.plan_code : 'None', sub ? `Until ${esc(date(sub.expires_at))}` : 'No active plan')}
       </div>
-      <div class="account-meta">
-        <span>Contact <strong>${esc(a.contact || '-')}</strong></span>
-        <span>Created <strong>${esc(date(a.created_at))}</strong></span>
-        <span>Billed (30d) <strong>${esc(usd(billed))}</strong></span>
-        <span>Markup <strong>${a.markup_pct ? `${esc(a.markup_pct)}%` : 'global'}</strong></span>
-        <span>Key creation <strong>${a.can_create_keys ? 'allowed' : 'guarded'}</strong></span>
-      </div>
-      ${a.note ? `<p class="account-note">Note: ${esc(a.note)}</p>` : ''}
-      <div class="actions account-actions">
+      <div class="quick-links">
+        ${goButton('Requests', 'requests', { account: a.id })}
+        ${goButton(`Keys (${count(keyTotal)})`, 'keys', { account: a.id })}
+        ${goButton('Payments', 'payments', { account: a.id })}
+        <span class="spacer"></span>
         <button type="button" class="primary small" data-credit>Add credit</button>
         ${hasPlans ? '<button type="button" class="small" data-sub>Grant plan</button>' : ''}
         <button type="button" class="small" data-key>Create key</button>
-        <button type="button" class="small" data-edit>Edit account</button>
-        ${a.status === 'active' ? '<button type="button" class="danger small account-status-action" data-suspend>Suspend account</button>' : '<button type="button" class="small account-status-action" data-activate>Reactivate account</button>'}
+        <button type="button" class="small" data-edit>Edit</button>
+        ${a.status === 'active' ? '<button type="button" class="danger small" data-suspend>Suspend</button>' : '<button type="button" class="small" data-activate>Reactivate</button>'}
       </div>
-      <div class="account-lists">
-        <section class="account-keys">
-          <h3>Keys (${count(keyTotal)})</h3>
-          ${keys.length
-            ? `<ul class="mini-list">${keys.map(k => `<li>${pill(k.status)}<strong>${esc(k.name)}</strong><code>${esc(k.key_prefix)}...</code><span class="hint">${esc(date(k.last_used_at))}</span></li>`).join('')}</ul>`
-            : '<p class="hint">No keys.</p>'}
-          ${keyTotal > keyLimit ? `<div class="mini-pager"><span class="hint">${count(keyOffset + 1)} to ${count(Math.min(keyOffset + keys.length, keyTotal))} of ${count(keyTotal)}</span><div class="actions"><button type="button" class="ghost small" data-key-prev${keyOffset === 0 ? ' disabled' : ''}>Previous</button><button type="button" class="ghost small" data-key-next${keyOffset + keys.length >= keyTotal ? ' disabled' : ''}>Next</button></div></div>` : ''}
-        </section>
-        <section>
-          <h3>Credit lots (${count(credits.length)})</h3>
-          ${credits.length
-            ? `<ul class="mini-list">${credits.slice(0, 3).map(c => `<li>${pill(c.source, c.expires_at && c.expires_at < now ? 'warn' : 'muted')}<strong>${esc(usd(c.remaining_usd))}</strong><span class="hint">of ${esc(usd(c.amount_usd))}${c.expires_at ? `, expires ${esc(date(c.expires_at))}` : ', no expiry'}</span></li>`).join('')}${credits.length > 3 ? `<li class="hint">+${count(credits.length - 3)} more</li>` : ''}</ul>`
-            : '<p class="hint">No credits.</p>'}
-        </section>
-      </div>`;
-    body.querySelector('[data-copy-id]').onclick = () => copyText(a.id, 'Account ID').then(ok => ok && flash(body.querySelector('[data-copy-id]')));
+      ${a.status === 'suspended' ? '<p class="callout warn">Suspended: its keys cannot call the API and workspace sign-in is blocked. Its credit is not counted as outstanding.</p>' : ''}
+      <section class="detail-section">${chart(series, { compact: true })}</section>
+      <section class="detail-section">
+        <div class="section-head"><h4>Keys by spend</h4><span class="hint">${count(keyTotal)} total</span></div>
+        ${table([
+          ['Key', k => `${keyLink(k.id, k.name)}<div class="hint"><code>${esc(k.key_prefix)}...</code></div>`, 'wrap'],
+          ['Status', k => pill(k.status)],
+          ['Spent', k => `<span class="num">${esc(usd(k.billed_usd))}</span>`, 'end'],
+          ['30 days', k => `<span class="num">${esc(usd(k.usage_30d_usd))}</span>`, 'end'],
+          ['Last used', k => when(k.last_used_at)],
+        ], keys, { empty: ['No keys', 'Create a key for this account.'] })}
+        ${keyTotal > keyLimit ? `<div class="pager"><span class="hint">${count(keyOffset + 1)} to ${count(Math.min(keyOffset + keys.length, keyTotal))} of ${count(keyTotal)}</span><div class="pager-actions"><button type="button" class="ghost small" data-key-prev${keyOffset === 0 ? ' disabled' : ''}>Previous</button><button type="button" class="ghost small" data-key-next${keyOffset + keys.length >= keyTotal ? ' disabled' : ''}>Next</button></div></div>` : ''}
+      </section>
+      ${series.length ? `<section class="detail-section"><h4>Spend by model, last 30 days</h4>${modelTable(series, { upstream: true })}</section>` : ''}
+      <section class="detail-section">
+        <div class="section-head"><h4>Credit lots</h4><span class="hint">Spent soonest-expiring first</span></div>
+        ${creditTable(credits)}
+      </section>
+      <section class="detail-section"><h4>Settings</h4>${facts([
+        ['Markup', a.markup_pct ? `${esc(a.markup_pct)}%` : 'Global default'],
+        ['Key creation', a.can_create_keys ? 'Beyond self-service limits' : 'Self-service limits'],
+        ['Contact', esc(a.contact || '-')],
+      ])}</section>`;
+  };
+  render.after = (body, v, refresh) => {
+    wireShares(body);
+    const a = v.account;
     body.querySelector('[data-credit]').onclick = () => creditForm(aid, refresh);
     body.querySelector('[data-sub]')?.addEventListener('click', () => grantForm(aid, refresh));
     body.querySelector('[data-key]').onclick = () => createAccountKeyForm(aid, refresh);
     body.querySelector('[data-edit]').onclick = () => editAccountForm(a, refresh);
     body.querySelector('[data-key-prev]')?.addEventListener('click', () => { keyOffset = Math.max(0, keyOffset - keyLimit); refresh(); });
     body.querySelector('[data-key-next]')?.addEventListener('click', () => { keyOffset += keyLimit; refresh(); });
+    const setStatus = async (status, message) => {
+      try {
+        await api(endpoint(`accounts/${aid}`), 'PATCH', { status });
+        notice(message);
+        refresh();
+        if (document.querySelector('#content')) load();
+      } catch (e) {
+        notice(e.message, true);
+      }
+    };
     body.querySelector('[data-suspend]')?.addEventListener('click', async () => {
-      if (!(await confirmModal('Suspend account?', 'All of its keys stop proxying and workspace sign-in is blocked until the account is reactivated.', 'Suspend', true))) return;
-      try {
-        await api(endpoint(`accounts/${aid}`), 'PATCH', { status: 'suspended' });
-        notice('Account suspended');
-        refresh();
-      } catch (e) {
-        notice(e.message, true);
-      }
+      if (await confirmModal('Suspend account?', 'All of its keys stop working and workspace sign-in is blocked until the account is reactivated.', 'Suspend', true)) setStatus('suspended', 'Account suspended');
     });
-    body.querySelector('[data-activate]')?.addEventListener('click', async () => {
-      try {
-        await api(endpoint(`accounts/${aid}`), 'PATCH', { status: 'active' });
-        notice('Account reactivated');
-        refresh();
-      } catch (e) {
-        notice(e.message, true);
-      }
-    });
+    body.querySelector('[data-activate]')?.addEventListener('click', () => setStatus('active', 'Account reactivated'));
   };
-  refresh();
+  liveModal('Manage account', 'large', fetcher, render);
+}
+
+function creditTable(credits) {
+  return table([
+    ['Source', c => esc(sourceLabel(c.source))],
+    ['Amount', c => `<span class="num">${esc(usd(c.amount_usd))}</span>`, 'end'],
+    ['Remaining', c => `<span class="num">${esc(usd(c.remaining_usd))}</span>`, 'end'],
+    ['State', c => pill(lotState(c))],
+    ['Expires', c => c.expires_at ? esc(date(c.expires_at)) : '<span class="muted">Never</span>'],
+  ], credits, { empty: ['No credit yet', 'Credit lots appear after a top-up, plan, or grant.'] });
 }
 
 function creditForm(aid, done) {
   modal('Add credit', `
     <form>
-      <label for="credit-amount">Amount (USD)</label>
-      <input id="credit-amount" name="amount_usd" inputmode="decimal" placeholder="10" required>
-      <label for="credit-source">Source</label>
-      <select id="credit-source" name="source">
-        <option value="admin" selected>Admin grant</option>
-        <option value="refund">Refund</option>
-        <option value="purchase">Purchase</option>
-      </select>
+      <div class="form-grid">
+        <div><label for="credit-amount">Amount (USD)</label><input id="credit-amount" name="amount_usd" inputmode="decimal" placeholder="10" required></div>
+        <div><label for="credit-source">Source</label>
+        <select id="credit-source" name="source">
+          <option value="admin" selected>Operator grant</option>
+          <option value="refund">Refund</option>
+          <option value="purchase">Purchase</option>
+        </select></div>
+      </div>
       <label for="credit-expiry">Expires (optional)</label>
       <input id="credit-expiry" name="expires_at" type="datetime-local">
       <label for="credit-note">Note (optional)</label>
       <input id="credit-note" name="note" placeholder="Goodwill credit">
+      <p class="field-help">Outstanding debt is repaid first. Only the rest becomes spendable.</p>
       <div class="actions"><button class="primary" type="submit">Add credit</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     const payload = { amount_usd: b.amount_usd, source: b.source, note: b.note };
@@ -573,17 +959,18 @@ function createAccountKeyForm(aid, done) {
 function editAccountForm(a, done) {
   modal('Edit account', `
     <form>
-      <label for="account-contact">Contact</label>
-      <input id="account-contact" name="contact" type="email" value="${esc(a.contact)}" placeholder="ops@example.com">
+      <div class="form-grid">
+        <div><label for="account-contact">Contact</label><input id="account-contact" name="contact" type="email" value="${esc(a.contact)}" placeholder="ops@example.com"></div>
+        <div><label for="account-status">Status</label>
+        <select id="account-status" name="status">
+          <option value="active"${a.status === 'active' ? ' selected' : ''}>Active</option>
+          <option value="suspended"${a.status === 'suspended' ? ' selected' : ''}>Suspended</option>
+        </select></div>
+      </div>
       <label for="account-note">Note</label>
       <input id="account-note" name="note" value="${esc(a.note)}" placeholder="VIP customer">
-      <label for="account-status">Status</label>
-      <select id="account-status" name="status">
-        <option value="active"${a.status === 'active' ? ' selected' : ''}>Active</option>
-        <option value="suspended"${a.status === 'suspended' ? ' selected' : ''}>Suspended</option>
-      </select>
-      <label for="account-markup">Markup % (blank = global default)</label>
-      <input id="account-markup" name="markup_pct" inputmode="decimal" value="${a.markup_pct ? esc(a.markup_pct) : ''}" placeholder="30">
+      <label for="account-markup">Markup %</label>
+      <input id="account-markup" name="markup_pct" inputmode="decimal" value="${a.markup_pct ? esc(a.markup_pct) : ''}" placeholder="Global default">
       <label class="inline check-line"><input type="checkbox" name="can_create_keys"${a.can_create_keys ? ' checked' : ''}> Allow key creation beyond self-service limits</label>
       <div class="actions"><button class="primary" type="submit">Save changes</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
@@ -597,12 +984,82 @@ function editAccountForm(a, done) {
     d.close();
     notice('Account updated');
     done?.();
-  }));
+  }), 'wide');
 }
 
-/* API and MCP guidance ------------------------------------------------------- */
+/* Requests --------------------------------------------------------------------- */
 
-const codeBlock = text => `<div class="code-block"><button type="button" class="small ghost" data-copy-code>Copy</button><pre><code>${esc(text)}</code></pre></div>`;
+// Rows seen in any request table, so details open without another fetch.
+const requestIndex = new Map();
+function remember(rows) {
+  if (requestIndex.size > 2000) requestIndex.clear();
+  rows.forEach(r => requestIndex.set(r.id, r));
+}
+const routeCell = r => `<span class="route"><span class="method">${esc(r.method)}</span><code>${esc(r.path)}</code></span>`;
+function requestTable(rows, { compact = false } = {}) {
+  remember(rows);
+  const columns = [
+    ['Time', r => when(r.created_at)],
+    ['Request', r => `${routeCell(r)}${r.model ? `<div class="hint"><code>${esc(r.model)}</code></div>` : ''}`, 'wrap'],
+  ];
+  if (!compact) columns.push(['Key', r => `${keyLink(r.key_id, r.key_name, r.key_prefix)}${admin ? `<div class="hint">${accountLink(r.account_id, r.account_contact)}</div>` : ''}`, 'wrap']);
+  columns.push(
+    ['Status', r => `${requestPill(r)}${r.finished ? `<div class="hint">${esc(ms(r.duration_ms))}</div>` : ''}`],
+    ['Tokens', r => `<span class="num">${count(r.tokens)}</span>`, 'end'],
+    ['Billed', r => `<span class="num">${esc(usd(r.billed_usd))}</span>`, 'end'],
+    ['', r => `<button type="button" class="small" data-request-details="${esc(r.id)}">Details</button>`, 'end'],
+  );
+  return table(columns, rows, { empty: ['No requests', 'Requests appear here as soon as a key is used.'] });
+}
+
+function requestDetails(r) {
+  document.querySelector('dialog[data-request-dialog]')?.close();
+  const usage = [
+    ['Total tokens', count(r.tokens)],
+    r.input_tokens > 0 && ['Input tokens', count(r.input_tokens)],
+    r.cached_tokens > 0 && ['Cached input', count(r.cached_tokens)],
+    r.output_tokens > 0 && ['Output tokens', count(r.output_tokens)],
+    r.characters > 0 && ['Characters', count(r.characters)],
+    r.audio_ms > 0 && ['Audio', esc(ms(r.audio_ms))],
+    r.images > 0 && ['Images', count(r.images)],
+  ];
+  const d = modal('Request details', `
+    <div class="request-hero">
+      ${routeCell(r)}
+      <div class="request-meta">${requestPill(r)}<span>${esc(date(r.created_at))}</span><span>${esc(ms(r.duration_ms))}</span></div>
+    </div>
+    ${r.error ? `<div class="callout danger"><strong>Error</strong><p>${esc(r.error)}</p></div>` : ''}
+    <div class="tiles">
+      ${metric('Billed', usd(r.billed_usd), r.estimated ? 'Tokens estimated: the provider reported no usage' : 'Deducted from the balance')}
+      ${admin ? metric('Upstream cost', usd(r.upstream_usd), `Margin ${esc(usd(Number(r.billed_usd) - Number(r.upstream_usd)))}`) : ''}
+      ${metric('Tokens', count(r.tokens), r.estimated ? 'Estimated' : 'Reported by the provider')}
+    </div>
+    <div class="detail-columns">
+      <section class="detail-section"><h4>Request</h4>${facts([
+        ['Request ID', copyable(r.id, 'Request ID')],
+        ['Model', r.model ? `<code>${esc(r.model)}</code>` : '-'],
+        ['Kind', esc(kindLabel(r.kind))],
+        ['Key', `${keyLink(r.key_id, r.key_name, r.key_prefix)}${r.key_prefix ? ` <code>${esc(r.key_prefix)}...</code>` : ''}`],
+        admin && ['Account', accountLink(r.account_id, r.account_contact)],
+        ['Client IP', `<code>${esc(r.ip || '-')}</code>`],
+      ])}</section>
+      <section class="detail-section"><h4>Usage and transfer</h4>${facts([
+        ...usage,
+        ['Sent', esc(bytes(r.bytes_in))],
+        ['Received', esc(bytes(r.bytes_out))],
+      ])}</section>
+    </div>
+    <div class="actions section">
+      ${r.key_id ? goButton('All requests from this key', 'requests', { key: r.key_id }) : ''}
+      ${admin && r.account_id ? goButton('All requests from this account', 'requests', { account: r.account_id }) : ''}
+    </div>`, null, 'wide');
+  d.dataset.requestDialog = '';
+  wireCopies(d);
+}
+
+/* API and MCP guidance ----------------------------------------------------------- */
+
+const codeBlock = (text, label) => `<div class="code-block">${label ? `<div class="code-label">${esc(label)}</div>` : ''}<button type="button" class="small ghost" data-copy-code>Copy</button><pre><code>${esc(text)}</code></pre></div>`;
 
 function snippetTabs(items) {
   return `<div class="snippets">
@@ -624,14 +1081,26 @@ function wireDocs(root) {
   });
 }
 
-function apiSnippets() {
+// Example model names: the caller's catalog when known, else placeholders.
+function exampleModels(models = []) {
+  const pick = (output, input) => models.find(m => (m.architecture?.output_modalities || ['text']).includes(output)
+    && (!input || (m.architecture?.input_modalities || ['text']).includes(input)))?.id;
+  return {
+    chat: pick('text', 'text') || 'your-model',
+    tts: pick('audio') || 'your-tts-model',
+    stt: pick('text', 'audio') || 'your-stt-model',
+    image: pick('image') || 'your-image-model',
+  };
+}
+
+function apiSnippets(m = exampleModels()) {
   const base = `${location.origin}/v1`;
   return [
     { label: 'cURL', code: `curl ${base}/chat/completions \\
   -H "Authorization: Bearer $RESELLER_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "model": "your-model",
+    "model": "${m.chat}",
     "messages": [{"role": "user", "content": "Hello"}]
   }'` },
     { label: 'Python', code: `# pip install openai
@@ -640,7 +1109,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="${base}", api_key=os.environ["RESELLER_KEY"])
 reply = client.chat.completions.create(
-    model="your-model",
+    model="${m.chat}",
     messages=[{"role": "user", "content": "Hello"}],
 )
 print(reply.choices[0].message.content)` },
@@ -649,23 +1118,28 @@ import OpenAI from "openai";
 
 const client = new OpenAI({ baseURL: "${base}", apiKey: process.env.RESELLER_KEY });
 const reply = await client.chat.completions.create({
-  model: "your-model",
+  model: "${m.chat}",
   messages: [{ role: "user", content: "Hello" }],
 });
 console.log(reply.choices[0].message.content);` },
+    { label: 'Streaming', code: `curl -N ${base}/chat/completions \\
+  -H "Authorization: Bearer $RESELLER_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${m.chat}", "stream": true,
+       "messages": [{"role": "user", "content": "Count to five"}]}'` },
     { label: 'Speech', code: `curl ${base}/audio/speech \\
   -H "Authorization: Bearer $RESELLER_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{"model": "your-tts-model", "input": "Hello there", "voice": "alloy"}' \\
+  -d '{"model": "${m.tts}", "input": "Hello there", "voice": "alloy"}' \\
   --output speech.mp3` },
     { label: 'Transcription', code: `curl ${base}/audio/transcriptions \\
   -H "Authorization: Bearer $RESELLER_KEY" \\
-  -F model=your-stt-model \\
+  -F model=${m.stt} \\
   -F file=@audio.mp3` },
     { label: 'Image', code: `curl ${base}/images/generations \\
   -H "Authorization: Bearer $RESELLER_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{"model": "your-image-model", "prompt": "A lighthouse at dusk", "size": "1024x1024"}'` },
+  -d '{"model": "${m.image}", "prompt": "A lighthouse at dusk", "size": "1024x1024"}'` },
   ];
 }
 
@@ -690,13 +1164,40 @@ function mcpPanel(cliKey) {
 }
 
 const ENDPOINT_DOCS = [
-  ['POST', '/v1/chat/completions', 'Chat completions, with streaming.'],
+  ['POST', '/v1/chat/completions', 'Chat completions. Set "stream": true for server-sent events.'],
   ['POST', '/v1/responses', 'Responses API.'],
+  ['POST', '/v1/completions', 'Legacy text completions.'],
   ['POST', '/v1/embeddings', 'Text embeddings.'],
+  ['POST', '/v1/moderations', 'Content moderation.'],
   ['POST', '/v1/audio/speech', 'Text to speech. Returns audio.'],
   ['POST', '/v1/audio/transcriptions', 'Speech to text. Multipart file upload.'],
+  ['POST', '/v1/audio/translations', 'Speech to English text. Multipart file upload.'],
   ['POST', '/v1/images/generations', 'Image generation from a prompt.'],
-  ['GET', '/v1/models', 'Models offered by the service.'],
+  ['POST', '/v1/images/edits', 'Image edits. Multipart upload.'],
+  ['GET', '/v1/realtime', 'Realtime API over WebSocket.'],
+  ['GET', '/v1/models', 'Models your key can use.'],
+];
+const ACCOUNT_DOCS = [
+  ['GET', '/v1/account', 'Balance, debt, plan, credit lots, and top-up instructions.'],
+  ['GET', '/v1/account/usage?days=30', 'Daily usage per model. Add key=<id> for one key.'],
+  ['GET', '/v1/account/requests?limit=20', 'Request history. Filters: key, model, kind, status (2xx, 4xx, 5xx).'],
+  ['GET', '/v1/keys', 'Your keys with lifetime and 30-day spend.'],
+  ['POST', '/v1/keys', 'Create another key on the same balance. Body {"name"}.'],
+  ['PATCH', '/v1/keys/<id>', 'Rename or block a key.'],
+  ['POST', '/v1/keys/<id>/rotate', 'Replace the secret. The old key stops working.'],
+  ['POST', '/v1/account/redeem', 'Redeem a credit code. Body {"code"}.'],
+];
+const ERROR_DOCS = [
+  ['400', 'invalid_request_error', '-', 'The request body or parameters are invalid.'],
+  ['401', 'invalid_request_error', 'missing_api_key, invalid_api_key', 'No key, or an unknown key, was sent.'],
+  ['401', 'invalid_request_error', 'key_revoked, key_blocked, key_expired', 'The key exists but cannot be used.'],
+  ['401', 'invalid_request_error', 'dashboard_token_not_allowed', 'Dashboard tokens manage the account. Use the API key for API calls.'],
+  ['403', 'permission_error', 'account_suspended', 'The operator suspended the account.'],
+  ['404', 'invalid_request_error', 'model_not_found', 'The model does not exist or the key may not use it.'],
+  ['404', 'invalid_request_error', 'unknown_url', 'The path is not an API route.'],
+  ['429', 'insufficient_quota', 'insufficient_quota', 'The balance is empty. The message explains how to top up.'],
+  ['429', 'rate_limit_error', 'rate_limit_exceeded, request_limit_exceeded, token_limit_exceeded, spend_limit_exceeded, concurrency_limit_exceeded', 'A key or account limit was reached. Wait for Retry-After seconds.'],
+  ['502, 504', 'server_error', 'upstream_error', 'The model provider failed or timed out. Nothing is billed for failed requests without usage.'],
 ];
 const MCP_TOOL_DOCS = [
   ['generate_text', 'API key', 'Generate text with a chat model.'],
@@ -712,9 +1213,164 @@ const MCP_TOOL_DOCS = [
   ['redeem_code', 'Key or token', 'Redeem a single-use credit code.'],
   ['start_checkout', 'Key or token', 'Start a card or crypto purchase.'],
 ];
-const docTable = (columns, rows) => `<div class="doc-table">${table(columns, rows)}</div>`;
+const methodTag = m => `<span class="method method-${esc(m.toLowerCase())}">${esc(m)}</span>`;
+const endpointTable = rows => table([
+  ['Method', r => methodTag(r[0])],
+  ['Path', r => `<code>${esc(r[1])}</code>`, 'wrap'],
+  ['Description', r => esc(r[2]), 'wrap'],
+], rows);
 
-/* Views ---------------------------------------------------------------------- */
+function modelCatalog(models) {
+  if (!models.length) return emptyState('No models listed', 'The operator has not published a model catalog.');
+  return table([
+    ['Model ID', m => copyable(m.id, 'Model ID'), 'wrap'],
+    ['Name', m => `${esc(m.name || m.id)}${m.description ? `<div class="hint">${esc(m.description)}</div>` : ''}`, 'wrap'],
+    ['Input', m => esc((m.architecture?.input_modalities || ['text']).join(', '))],
+    ['Output', m => esc((m.architecture?.output_modalities || ['text']).join(', '))],
+    ['Context', m => m.context_length ? `<span class="num">${count(m.context_length)}</span>` : '<span class="muted">-</span>', 'end'],
+  ], models);
+}
+
+/* Docs page ---------------------------------------------------------------------- */
+
+const DOC_SECTIONS = [
+  ['quick-start', 'Quick start'],
+  ['authentication', 'Authentication'],
+  ['models', 'Models'],
+  ['endpoints', 'Endpoints'],
+  ['examples', 'Examples'],
+  ['billing', 'Billing and balance'],
+  ['errors', 'Errors and limits'],
+  ['account-api', 'Account API'],
+  ['mcp', 'MCP for agents'],
+];
+
+async function docs() {
+  // Same-tab workspace session, if any, to show the caller's own models.
+  const session = sessionStorage.getItem(CUSTOMER_STORE) || '';
+  let models = null;
+  if (session) {
+    try {
+      models = (await api('/v1/account/models', 'GET', undefined, { token: session })).data || [];
+    } catch {
+      models = null;
+    }
+  }
+  const m = exampleModels(models || []);
+  const base = `${location.origin}/v1`;
+  main.innerHTML = `
+    <div class="docs-layout">
+      <nav class="docs-nav" aria-label="Documentation">
+        <div class="eyebrow">Documentation</div>
+        <ol>${DOC_SECTIONS.map(([id, label]) => `<li><a href="#${id}" data-doc-link="${id}">${esc(label)}</a></li>`).join('')}</ol>
+      </nav>
+      <article class="docs-body">
+        <header class="docs-hero">
+          <div class="eyebrow">${esc(brandName)} API</div>
+          <h1>Developer docs</h1>
+          <p class="lead">One OpenAI-compatible endpoint for text, speech, transcription, and images. Use any OpenAI SDK: change the base URL and the key, keep the rest of your code.</p>
+          <div class="docs-facts">
+            <div><span class="label">Base URL</span>${copyable(base, 'Base URL')}</div>
+            <div><span class="label">MCP endpoint</span>${copyable(`${location.origin}/mcp`, 'MCP endpoint')}</div>
+            <div><span class="label">Auth header</span><code>Authorization: Bearer $RESELLER_KEY</code></div>
+          </div>
+        </header>
+
+        <section id="quick-start" class="doc-section">
+          <h2>Quick start</h2>
+          <ol class="start-steps">
+            <li class="card"><span class="step-num">1</span><div><h3>Get a key</h3><p>${session ? 'Create one in the workspace under API keys.' : 'Create an account. A short proof of work runs in your browser, no card needed.'}</p></div></li>
+            <li class="card"><span class="step-num">2</span><div><h3>Export it</h3><p>Store it as <code>RESELLER_KEY</code> in your shell or secret store.</p></div></li>
+            <li class="card"><span class="step-num">3</span><div><h3>Call the API</h3><p>Point your SDK at the base URL and send a request.</p></div></li>
+          </ol>
+          ${codeBlock(`export RESELLER_KEY="sk-res-..."\ncurl ${base}/chat/completions \\\n  -H "Authorization: Bearer $RESELLER_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": "${m.chat}", "messages": [{"role": "user", "content": "Hello"}]}'`, 'Terminal')}
+          <div class="actions start">${session ? '<a class="button primary" href="/workspace/#keys">Open API keys</a>' : '<button type="button" class="primary" data-create>Create an account</button><a class="button ghost" href="/workspace/">Sign in</a>'}</div>
+        </section>
+
+        <section id="authentication" class="doc-section">
+          <h2>Authentication</h2>
+          <p>Every API call needs an API key (<code>sk-res-...</code>), sent as a bearer token. The <code>x-api-key</code> header works as well.</p>
+          ${facts([
+            ['API key', 'Calls the API and MCP generation tools. Shown once when created or rotated.'],
+            ['Dashboard token', 'Signs in to the workspace and manages the account. It cannot call the API.'],
+            ['Several keys', 'All keys of an account share one balance. Create one key per app to see spend per app.'],
+          ])}
+          <p class="hint">Lost a key? Rotate it under API keys. The old secret stops working at once.</p>
+        </section>
+
+        <section id="models" class="doc-section">
+          <h2>Models</h2>
+          <p>Send the model ID in the <code>model</code> field. <code>GET /v1/models</code> lists the models your key may use, in the OpenAI format.</p>
+          ${models ? modelCatalog(models) : `<div class="callout info"><strong>Your model list</strong><p>Sign in to the <a href="/workspace/">workspace</a> in this tab to see the models your key can use here, or call the endpoint below.</p></div>`}
+          ${codeBlock(`curl ${base}/models -H "Authorization: Bearer $RESELLER_KEY"`)}
+        </section>
+
+        <section id="endpoints" class="doc-section">
+          <h2>Endpoints</h2>
+          <p>Requests and responses follow the OpenAI API, including streaming. Upstream errors keep the OpenAI error shape.</p>
+          ${endpointTable(ENDPOINT_DOCS)}
+          <p class="hint"><a href="/v1">GET /v1</a> returns a machine-readable route list.</p>
+        </section>
+
+        <section id="examples" class="doc-section">
+          <h2>Examples</h2>
+          <p>Each example reads the key from <code>$RESELLER_KEY</code>${models ? ' and uses a model from your list' : ''}.</p>
+          ${snippetTabs(apiSnippets(m))}
+        </section>
+
+        <section id="billing" class="doc-section">
+          <h2>Billing and balance</h2>
+          <ul class="doc-list">
+            <li>Usage is prepaid. Each request is priced from its reported usage (tokens, characters, audio seconds, or images) and deducted from the account balance.</li>
+            <li>Credit comes from plans, credit codes, card or crypto payments, and the trial grant. Credit that expires soonest is spent first.</li>
+            <li>A request that runs past the remaining balance completes. The difference is recorded as debt and settled from the next top-up.</li>
+            <li>When the balance is empty, calls return <code>429 insufficient_quota</code> with top-up steps in the message.</li>
+            <li>Every charge is listed per request in the workspace under Requests, and <code>GET /v1/account</code> returns the balance.</li>
+          </ul>
+        </section>
+
+        <section id="errors" class="doc-section">
+          <h2>Errors and limits</h2>
+          <p>Errors use the OpenAI shape: <code>{"error": {"message", "type", "param", "code"}}</code>. Every <code>429</code> carries a <code>Retry-After</code> header in seconds.</p>
+          ${table([
+            ['Status', r => `<strong class="num">${esc(r[0])}</strong>`],
+            ['Type', r => `<code>${esc(r[1])}</code>`],
+            ['Code', r => r[2] === '-' ? '<span class="muted">-</span>' : r[2].split(', ').map(c => `<code>${esc(c)}</code>`).join(' '), 'wrap'],
+            ['Meaning', r => esc(r[3]), 'wrap'],
+          ], ERROR_DOCS)}
+        </section>
+
+        <section id="account-api" class="doc-section">
+          <h2>Account API</h2>
+          <p>Manage the account from code with the API key or the dashboard token.</p>
+          ${endpointTable(ACCOUNT_DOCS)}
+        </section>
+
+        <section id="mcp" class="doc-section">
+          <h2>MCP for agents</h2>
+          <p>Agents connect over the Model Context Protocol. Generation tools are billed like API calls.</p>
+          ${mcpPanel('$RESELLER_KEY')}
+          <h3 class="docs-title">Tools</h3>
+          ${table([['Tool', r => `<code>${esc(r[0])}</code>`], ['Credential', r => esc(r[1])], ['Description', r => esc(r[2]), 'wrap']], MCP_TOOL_DOCS)}
+        </section>
+      </article>
+    </div>`;
+  wireDocs(main);
+  wireCopies(main);
+  main.querySelector('[data-create]')?.addEventListener('click', keyForm);
+  // Highlight the section in view.
+  const links = new Map([...main.querySelectorAll('[data-doc-link]')].map(a => [a.dataset.docLink, a]));
+  const observer = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      links.forEach((a, id) => a.toggleAttribute('aria-current', id === entry.target.id));
+    }
+  }, { rootMargin: '-15% 0px -70% 0px' });
+  main.querySelectorAll('.doc-section').forEach(s => observer.observe(s));
+  if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
+}
+
+/* Landing and sign-in ------------------------------------------------------------ */
 
 async function landing() {
   main.innerHTML = `
@@ -725,7 +1381,7 @@ async function landing() {
         <p>${esc(brand.hero_text || 'Language, speech, audio, and images through one familiar API. Create a key, connect your app, and stay in control of every request.')}</p>
         <div class="actions section">
           <button type="button" class="primary" id="create">Get an API key</button>
-          <a class="button ghost" href="/workspace/">Open workspace</a>
+          <a class="button ghost" href="/docs/">Read the docs</a>
         </div>
         <p class="section"><small>OpenAI-compatible, usage-based billing, live statistics</small></p>
       </div>
@@ -753,11 +1409,9 @@ async function landing() {
         <li class="card"><span class="step-num">3</span><div><h3>Connect an agent</h3><p>Add <code>${esc(location.origin)}/mcp</code> to an MCP client, or run the local bridge.</p></div></li>
       </ol>
       <div class="card">
-        <div class="card-head"><h3>Call the API</h3><span class="hint">Set <code>RESELLER_KEY</code> to your key</span></div>
+        <div class="card-head"><h3>Call the API</h3><a class="button ghost small" href="/docs/#examples">All examples</a></div>
         ${snippetTabs(apiSnippets())}
       </div>
-      <h3 class="docs-title">Connect an agent over MCP</h3>
-      ${mcpPanel('sk-res-...')}
     </section>
     <section class="section">
       <div class="row">
@@ -838,32 +1492,34 @@ function login() {
   document.querySelector('#create')?.addEventListener('click', keyForm);
 }
 
-async function shell() {
-  const tabs = admin ? ['overview', 'keys', 'accounts', 'plans', 'codes', 'payments', 'requests', 'settings'] : ['overview', 'connect', 'keys', 'usage', 'requests', 'billing'];
-  const requested = location.hash.slice(1);
-  if (tabs.includes(requested)) tab = requested;
-  else history.replaceState(null, '', `#${tab}`);
-  main.innerHTML = `
-    <div class="tabs" role="tablist">
-      ${tabs.map(t => `<button type="button" role="tab" id="tab-${t}" data-tab="${t}" aria-controls="content" aria-selected="${t === tab}" tabindex="${t === tab ? 0 : -1}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}
-    </div>
-    <section id="content" role="tabpanel">${loading()}</section>`;
-  const tabButtons = [...main.querySelectorAll('[data-tab]')];
+/* Shell -------------------------------------------------------------------------- */
+
+function selectTab() {
   const content = main.querySelector('#content');
-  const select = () => tabButtons.forEach(t => {
+  main.querySelectorAll('[data-tab]').forEach(t => {
     const selected = t.dataset.tab === tab;
     t.setAttribute('aria-selected', String(selected));
     t.tabIndex = selected ? 0 : -1;
-    if (selected) content.setAttribute('aria-labelledby', t.id);
+    if (selected) {
+      content?.setAttribute('aria-labelledby', t.id);
+      t.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
   });
-  select();
+}
+
+async function shell() {
+  applyRoute();
+  if (location.hash.slice(1).split('?')[0] !== tab) history.replaceState(null, '', hashFor(tab));
+  main.innerHTML = `
+    <div class="tabs" role="tablist" aria-label="${admin ? 'Console sections' : 'Workspace sections'}">
+      ${TABS.map(t => `<button type="button" role="tab" id="tab-${t}" data-tab="${t}" aria-controls="content" aria-selected="${t === tab}" tabindex="${t === tab ? 0 : -1}">${esc(TAB_LABELS[t])}</button>`).join('')}
+    </div>
+    <section id="content" role="tabpanel">${loading()}</section>`;
+  const tabButtons = [...main.querySelectorAll('[data-tab]')];
+  selectTab();
   tabButtons.forEach((b, i) => {
     b.onclick = () => {
-      if (tab === b.dataset.tab) return;
-      tab = b.dataset.tab;
-      location.hash = tab;
-      select();
-      load();
+      if (tab !== b.dataset.tab) go(b.dataset.tab);
     };
     // Arrow/Home/End keys move between tabs (roving tabindex pattern).
     b.onkeydown = e => {
@@ -876,12 +1532,9 @@ async function shell() {
     };
   });
   window.onhashchange = () => {
-    const next = location.hash.slice(1);
-    if (tabs.includes(next) && next !== tab) {
-      tab = next;
-      select();
-      load();
-    }
+    applyRoute();
+    selectTab();
+    load();
   };
   await load();
 }
@@ -896,7 +1549,8 @@ async function load() {
   const content = document.querySelector('#content');
   if (!content) return; // signed out or navigated away
   content.setAttribute('aria-busy', 'true');
-  content.innerHTML = loading();
+  if (!content.children.length || content.dataset.view !== tab) content.innerHTML = loading();
+  content.dataset.view = tab;
   try {
     const html = await views[tab](controller.signal);
     if (gen !== generation) return;
@@ -911,469 +1565,345 @@ async function load() {
   }
 }
 
-let chartSeq = 0;
-function chart(series) {
-  const days = new Map();
-  for (const r of series) {
-    const current = days.get(r.day) || { cost: 0, requests: 0, tokens: 0 };
-    current.cost += Number(r.billed_cost_usd);
-    current.requests += Number(r.requests || 0);
-    current.tokens += Number(r.tokens || 0);
-    days.set(r.day, current);
-  }
-  const entries = [...days.entries()].sort((a, b) => Number(a[0]) - Number(b[0]));
-  if (!entries.length) return emptyState('No usage yet', 'Make your first API request to see usage here.');
-  const totalCost = entries.reduce((sum, [, v]) => sum + v.cost, 0);
-  const mode = totalCost > 0 ? 'cost' : 'requests';
-  const value = v => mode === 'cost' ? v.cost : v.requests;
-  const max = Math.max(...entries.map(([, v]) => value(v)), 1e-12);
-  const W = 600, H = 170, base = H - 18, top = 18;
-  const step = W / entries.length;
-  const barWidth = Math.max(4, Math.min(28, step * .58));
-  const points = entries.map(([, v], i) => [
-    step * i + step / 2,
-    base - (value(v) / max) * (base - top)
-  ]);
-  const line = points.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
-  const area = `${points[0][0].toFixed(1)},${base} ${line} ${points[points.length - 1][0].toFixed(1)},${base}`;
-  const id = `usage-${++chartSeq}`;
-  const bars = entries.map(([day, v], i) => {
-    const height = value(v) > 0 ? Math.max(3, base - points[i][1]) : 1;
-    const summary = `${new Date(Number(day) * 1000).toLocaleDateString()}|${usd(v.cost)} billed|${count(v.requests)} request${v.requests === 1 ? '' : 's'}|${count(v.tokens)} tokens`;
-    return `<g class="chart-column" tabindex="0" data-chart-summary="${esc(summary)}"><rect class="chart-hit" x="${(step * i).toFixed(1)}" y="0" width="${step.toFixed(1)}" height="${base}"/><rect class="chart-bar" x="${(points[i][0] - barWidth / 2).toFixed(1)}" y="${(base - height).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${height.toFixed(1)}" rx="3"/><circle class="chart-dot" cx="${points[i][0].toFixed(1)}" cy="${points[i][1].toFixed(1)}" r="3"/><title>${esc(summary.replaceAll('|', ', '))}</title></g>`;
-  }).join('');
-  return `<div class="chart-wrap">
-    <div class="chart-legend"><span><i></i>${mode === 'cost' ? 'Daily billed cost' : 'Daily requests (no billed cost)'}</span><strong>${mode === 'cost' ? esc(usd(totalCost)) : count(entries.reduce((sum, [, v]) => sum + v.requests, 0))}</strong></div>
-    <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${mode === 'cost' ? 'Daily billed cost' : 'Daily request count'}">
-      <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#c7f590" stop-opacity=".32"/>
-        <stop offset="100%" stop-color="#c7f590" stop-opacity="0"/>
-      </linearGradient></defs>
-      <line x1="0" y1="${base}" x2="${W}" y2="${base}"/>
-      <polygon points="${area}" fill="url(#${id})"/>
-      ${bars}
-      <polyline points="${line}"/>
-    </svg>
-    <div class="chart-tooltip" role="status" aria-live="polite" hidden></div>
-    <div class="chart-foot"><span>${esc(new Date(Number(entries[0][0]) * 1000).toLocaleDateString())}</span><span>${esc(new Date(Number(entries[entries.length - 1][0]) * 1000).toLocaleDateString())}</span></div>
-  </div>`;
-}
+const pageHead = (title, subtitle, actions = '') => `<div class="page-head"><div><h2>${esc(title)}</h2>${subtitle ? `<p class="muted">${subtitle}</p>` : ''}</div>${actions ? `<div class="actions">${actions}</div>` : ''}</div>`;
 
-function wireCharts(root) {
-  root.querySelectorAll('.chart-wrap').forEach(wrap => {
-    const tooltip = wrap.querySelector('.chart-tooltip');
-    const show = column => {
-      const [heading, ...lines] = column.dataset.chartSummary.split('|');
-      tooltip.innerHTML = `<strong>${esc(heading)}</strong>${lines.map(line => `<span>${esc(line)}</span>`).join('')}`;
-      tooltip.hidden = false;
-      column.classList.add('active');
-    };
-    const hide = column => {
-      tooltip.hidden = true;
-      column.classList.remove('active');
-    };
-    wrap.querySelectorAll('.chart-column').forEach(column => {
-      column.addEventListener('mouseenter', () => show(column));
-      column.addEventListener('focus', () => show(column));
-      column.addEventListener('mouseleave', () => hide(column));
-      column.addEventListener('blur', () => hide(column));
-    });
-  });
-}
+/* Views -------------------------------------------------------------------------- */
 
-const requestIndex = new Map();
-const requestTable = rows => {
-  requestIndex.clear();
-  rows.forEach(r => requestIndex.set(r.id, r));
-  return table([
-    ['Time', r => esc(date(r.created_at))],
-    ['Route', r => `<code>${esc(r.path)}</code>`],
-    ['Model', r => esc(r.model || '-')],
-    ['Status', r => requestPill(r)],
-    ['Tokens', r => `<span class="num">${count(r.tokens)}</span>`],
-    ['Billed', r => `<span class="num">${esc(usd(r.billed_usd))}</span>`],
-    ['Latency', r => `<span class="num">${count(r.duration_ms)} ms</span>`],
-    ['', r => `<button type="button" class="small" data-request-details="${esc(r.id)}">View</button>`]
-  ], rows);
-};
-
-function requestDetails(r) {
-  document.querySelector('dialog[data-request-dialog]')?.close();
-  const cell = (label, value) => `<div><span class="label">${esc(label)}</span><div class="kv-value">${value}</div></div>`;
-  const ref = value => value
-    ? `<code title="${esc(value)}, click to copy" data-copy-value="${esc(value)}">${esc(value.slice(0, 13))}...</code>`
-    : '<span class="muted">-</span>';
-  const d = modal('Request details', `
-    <div class="request-summary">
-      <div><span class="label">Route</span><div class="request-route"><strong>${esc(r.method)}</strong><code>${esc(r.path)}</code></div></div>
-      <div><span class="label">Status</span>${requestPill(r)}</div>
-      <div><span class="label">Started</span><div class="kv-value nowrap">${esc(date(r.created_at))}</div></div>
-      <div><span class="label">Duration</span><div class="kv-value num">${count(r.duration_ms)} ms</div></div>
-    </div>
-    <section class="detail-section"><h3>Identity</h3><div class="kv">
-      ${cell('Request ID', ref(r.id))}
-      ${cell('Model', esc(r.model || '-'))}
-      ${cell('Kind', esc(r.kind || '-'))}
-      ${cell('Account', ref(r.account_id))}
-      ${cell('Key', ref(r.key_id))}
-      ${cell('IP', esc(r.ip || '-'))}
-    </div></section>
-    <section class="detail-section"><h3>Usage and transfer</h3><div class="kv">
-      ${cell('Tokens', `<span class="num">${count(r.tokens)}</span>`)}
-      ${cell('Upstream cost', `<span class="num">${esc(usd(r.upstream_usd))}</span>`)}
-      ${cell('Billed', `<span class="num">${esc(usd(r.billed_usd))}</span>`)}
-      ${cell('Bytes in', `<span class="num">${count(r.bytes_in)}</span>`)}
-      ${cell('Bytes out', `<span class="num">${count(r.bytes_out)}</span>`)}
-      ${cell('Finished', r.finished ? 'Yes' : '<span class="pill tone-info">In progress</span>')}
-    </div></section>
-    ${r.error ? `<section class="detail-section detail-error"><h3>Error</h3><p>${esc(r.error)}</p></section>` : ''}`, d => {
-    d.querySelectorAll('[data-copy-value]').forEach(el => {
-      el.onclick = () => copyText(el.dataset.copyValue, 'Value').then(ok => ok && flash(el));
-    });
-  }, 'wide');
-  d.dataset.requestDialog = '';
-}
-
-let requestModelCache = { values: [], expiresAt: 0 };
 const views = {
   async overview(signal) {
     if (admin) {
-      const [v, u] = await Promise.all([get(endpoint('overview'), signal), get(endpoint('usage'), signal)]);
-      return `<div class="stats">
-          ${metric('Total requests', count(v.requests))}
-          ${metric('API revenue', usd(v.billed_cost_usd))}
-          ${metric('Gross margin', usd(v.margin_usd))}
-          ${metric('Active keys', count(v.active_keys))}
+      const [v, u, topKeys, topAccounts] = await Promise.all([
+        get(endpoint('overview'), signal),
+        get(endpoint('usage'), signal),
+        get(endpoint('keys?sort=usage&dir=desc&limit=5'), signal),
+        get(endpoint('accounts?sort=usage&dir=desc&limit=5'), signal),
+      ]);
+      const billed = Number(v.billed_cost_usd);
+      const top = (rows, label, link, value) => rows.filter(r => isPositive(value(r))).length
+        ? `<ol class="leaderboard">${rows.filter(r => isPositive(value(r))).map(r => `<li><span class="leader-name">${link(r)}</span><span class="num">${esc(usd(value(r)))}</span></li>`).join('')}</ol>`
+        : `<p class="hint">No ${label} spent anything in the last 30 days.</p>`;
+      return `${pageHead('Overview', 'Platform totals since launch. Charts and rankings cover the last 30 days.', '<button type="button" data-refresh class="ghost small">Refresh</button>')}
+        <div class="stats">
+          ${metric('API revenue', usd(v.billed_cost_usd), `${esc(count(v.requests))} requests, ${esc(count(v.tokens))} tokens`)}
+          ${metric('Upstream cost', usd(v.upstream_cost_usd), 'Paid to model providers')}
+          ${metric('Gross margin', usd(v.margin_usd), `${percent(Number(v.margin_usd), billed)} of revenue`)}
+          ${metric('Outstanding credit', usd(v.outstanding_usd), isPositive(v.suspended_credit_usd) ? `Spendable by active accounts. ${esc(usd(v.suspended_credit_usd))} more is held by suspended accounts.` : 'Unexpired credit active accounts can spend')}
         </div>
         <div class="card">
-          <div class="card-head"><h3>Usage at a glance</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
+          <div class="card-head"><h3>Usage</h3>${goButton('Request log', 'requests')}</div>
           ${chart(u.series)}
         </div>
         <div class="stats">
-          ${metric('Accounts', count(v.accounts))}
-          ${metric('Tokens', count(v.tokens))}
-          ${metric('Upstream cost', usd(v.upstream_cost_usd))}
-          ${metric('Outstanding credit', usd(v.outstanding_usd))}
+          ${metric('Accounts', count(v.accounts), Number(v.suspended_accounts) ? `${esc(count(v.suspended_accounts))} suspended` : 'None suspended')}
+          ${metric('Usable keys', count(v.active_keys), 'Active, unexpired, on active accounts')}
+          ${metric('Customer debt', usd(v.debt_usd), 'Spend not yet covered by credit', { tone: isPositive(v.debt_usd) ? 'warn' : '' })}
+        </div>
+        <div class="split-even">
+          <div class="card">
+            <div class="card-head"><h3>Top keys, 30 days</h3>${goButton('All keys', 'keys', { sort: 'usage' })}</div>
+            ${top(topKeys.keys, 'key', k => `${keyLink(k.id, k.name)}<span class="hint">${esc(accountLabel(k.account_id, k.account_contact))}</span>`, k => k.usage_30d_usd)}
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Top accounts, 30 days</h3>${goButton('All accounts', 'accounts', { sort: 'usage' })}</div>
+            ${top(topAccounts.accounts, 'account', a => accountLink(a.id, a.contact), a => a.usage_30d_usd)}
+          </div>
         </div>
         <div class="card docs-note">
-          <h3>Docs</h3>
-          <p>Customers connect through the OpenAI-compatible API at <code>${esc(location.origin)}/v1</code> and MCP at <code>${esc(location.origin)}/mcp</code> (POST only). <a href="/v1">Open API discovery</a> for the route list. The Connect tab in the workspace has ready-made snippets.</p>
+          <div class="card-head"><h3>Customer docs</h3><a class="button ghost small" href="/docs/">Open docs</a></div>
+          <p>Customers connect through the OpenAI-compatible API at <code>${esc(location.origin)}/v1</code> and MCP at <code>${esc(location.origin)}/mcp</code>. The public docs page lists endpoints, examples, errors, and billing rules.</p>
         </div>`;
     }
     const [v, u, r] = await Promise.all([get('/v1/account', signal), get('/v1/account/usage', signal), get('/v1/account/requests?limit=5', signal)]);
-    const sub = v.account.subscription;
-    return `<div class="banner">
+    const a = v.account;
+    const sub = a.subscription;
+    const t = seriesTotals(u.series);
+    const activeLots = v.credits.filter(c => lotState(c) === 'active');
+    const empty = !isPositive(a.balance_usd);
+    return `<div class="banner${empty ? ' warn' : ''}">
         <div>
           <div class="label">Available balance</div>
-          <div class="metric">${esc(usd(v.account.balance_usd))}</div>
-          <div class="hint">${isPositive(v.account.debt_usd) ? `Outstanding debt ${esc(usd(v.account.debt_usd))} settles from the next top-up.` : 'Ready to spend on any key on this account.'}</div>
+          <div class="metric">${esc(usd(a.balance_usd))}</div>
+          <div class="hint">${isPositive(a.debt_usd) ? `Outstanding debt ${esc(usd(a.debt_usd))} settles from the next top-up.` : empty ? 'API calls are refused until you add credit.' : 'Shared by every key on this account.'}</div>
         </div>
-        <div class="actions"><button type="button" class="primary" data-create>Create key</button></div>
+        <div class="actions">${goButton('Add credit', 'billing', {}, empty ? 'primary' : 'ghost')}<button type="button" class="${empty ? 'ghost' : 'primary'}" data-create>Create key</button></div>
       </div>
       <div class="stats">
-        ${metric('Account status', v.account.status)}
-        ${metric('Current plan', sub ? sub.plan_code : 'Evaluation', sub ? `Expires ${date(sub.expires_at)}` : 'No active plan')}
-        ${metric('Credit lots', count(v.credits.length), 'Soonest-expiring credit is spent first')}
+        ${metric('Spent, all time', usd(a.billed_usd))}
+        ${metric('Last 30 days', usd(t.cost), esc(`${plural(t.requests, 'request')}, ${count(t.tokens)} tokens`))}
+        ${metric('Plan', sub ? sub.plan_code : 'None', sub ? `Until ${esc(date(sub.expires_at))}` : 'Pay as you go')}
+        ${metric('Active credit lots', count(activeLots.length), 'Soonest-expiring credit is spent first')}
       </div>
       <div class="card">
-        <div class="card-head"><h3>Your usage</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
+        <div class="card-head"><h3>Your usage</h3>${goButton('Usage details', 'usage')}</div>
         ${chart(u.series)}
       </div>
       <div class="card">
-        <div class="card-head"><h3>Recent requests</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
-        ${requestTable(r.requests)}
+        <div class="card-head"><h3>Recent requests</h3>${goButton('All requests', 'requests')}</div>
+        ${requestTable(r.requests, { compact: true })}
       </div>`;
   },
   async connect(signal) {
     let prefix = token.startsWith('sk-res-') ? token.slice(0, 15) : '';
-    if (!prefix) {
-      try {
-        const k = (await get('/v1/keys?limit=50', signal)).keys || [];
-        prefix = (k.find(x => x.status === 'active') || k[0] || {}).key_prefix || '';
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-      }
-    }
-    const value = (label, text, note) => `<div class="conn-row"><span class="label">${esc(label)}</span><code data-copy-value="${esc(text)}" data-copy-label="${esc(label)}" title="Click to copy">${esc(text)}</code>${note ? `<span class="hint">${esc(note)}</span>` : ''}</div>`;
-    return `<div class="card">
+    const [keys, models] = await Promise.all([
+      prefix ? Promise.resolve([]) : get('/v1/keys?limit=50', signal).then(v => v.keys || []).catch(e => { if (e.name === 'AbortError') throw e; return []; }),
+      get('/v1/account/models', signal).then(v => v.data || []).catch(e => { if (e.name === 'AbortError') throw e; return []; }),
+    ]);
+    if (!prefix) prefix = (keys.find(x => x.status === 'active') || keys[0] || {}).key_prefix || '';
+    const m = exampleModels(models);
+    return `${pageHead('Connect', 'Everything an app or agent needs to call the API.', '<a class="button ghost small" href="/docs/">Full docs</a>')}
+      <div class="card">
         <div class="card-head"><h3>Connection details</h3></div>
-        ${value('API base URL', `${location.origin}/v1`, 'Works with any OpenAI-compatible SDK.')}
-        ${value('MCP endpoint', `${location.origin}/mcp`, 'Streamable HTTP, POST only.')}
-        <div class="conn-row"><span class="label">API key</span>${prefix ? `<code>${esc(prefix)}...</code>` : '<span class="muted">Not available</span>'}<span class="hint">Only the prefix is shown. The full secret appears once when a key is created. Lost it? Rotate the key in Keys.</span></div>
-        <p class="hint">Snippets below read the key from <code>$RESELLER_KEY</code>. Export it in your shell first.</p>
+        ${facts([
+          ['API base URL', `${copyable(`${location.origin}/v1`, 'API base URL')}<div class="hint">Works with any OpenAI-compatible SDK.</div>`],
+          ['MCP endpoint', `${copyable(`${location.origin}/mcp`, 'MCP endpoint')}<div class="hint">Streamable HTTP, POST only.</div>`],
+          ['API key', `${prefix ? `<code>${esc(prefix)}...</code>` : '<span class="muted">No active key</span>'}<div class="hint">Only the prefix is shown. The full secret appears once when a key is created. Lost it? Rotate the key under API keys.</div>`],
+        ])}
       </div>
       <div class="card">
-        <div class="card-head"><h3>Call the API</h3></div>
-        ${snippetTabs(apiSnippets())}
+        <div class="card-head"><h3>Your models</h3><span class="hint">${esc(plural(models.length, 'model'))}</span></div>
+        ${modelCatalog(models)}
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Call the API</h3><span class="hint">Reads the key from <code>$RESELLER_KEY</code></span></div>
+        ${snippetTabs(apiSnippets(m))}
       </div>
       <h3 class="docs-title">Connect an agent over MCP</h3>
-      ${mcpPanel('$RESELLER_KEY')}
-      <h3 class="docs-title">API endpoints</h3>
-      ${docTable([['Method', r => `<code>${esc(r[0])}</code>`], ['Path', r => `<code>${esc(r[1])}</code>`], ['Description', r => esc(r[2])]], ENDPOINT_DOCS)}
-      <p class="hint">Other OpenAI-compatible routes such as <code>/v1/completions</code> are proxied too. <a href="/v1">API discovery</a> lists every route.</p>
-      <h3 class="docs-title">MCP tools</h3>
-      ${docTable([['Tool', r => `<code>${esc(r[0])}</code>`], ['Credential', r => esc(r[1])], ['Description', r => esc(r[2])]], MCP_TOOL_DOCS)}
-      <p class="hint">Generation tools need an API key. Account tools also accept a dashboard token.</p>
-      <div class="card docs-note">
-        <h3>How billing works</h3>
-        <p>Each request is billed at the provider cost or the operator's price table. The amount is deducted from your prepaid balance. Every charge is visible per request in Requests, in the Billed column. API and MCP calls are billed the same way.</p>
-      </div>`;
+      ${mcpPanel('$RESELLER_KEY')}`;
   },
   async keys(signal) {
     const state = listStates.keys;
-    const v = await get(`${endpoint('keys')}?${listParams(state)}`, signal);
-    const limits = l => {
-      const parts = [];
-      if (l.rpm) parts.push(`${count(l.rpm)} rpm`);
-      if (l.requests) parts.push(`${count(l.requests.max)} req / ${count(l.requests.window_hours)}h`);
-      if (l.tokens) parts.push(`${count(l.tokens.max)} tokens / ${count(l.tokens.window_hours)}h`);
-      if (l.spend) parts.push(`${esc(usd(l.spend.max_usd))} / ${count(l.spend.window_hours)}h`);
-      if (l.allowed_models?.length) parts.push(`${count(l.allowed_models.length)} model${l.allowed_models.length === 1 ? '' : 's'}`);
-      if (l.max_children) parts.push(`${count(l.max_children)} children`);
-      return parts.length ? `<span class="hint">${parts.join('<br>')}</span>` : '<span class="muted">Account default</span>';
-    };
-    const used = r => Number(r.usage_30d_usd ?? 0);
+    const params = listParams(state);
+    if (admin && state.account) params.set('account', state.account);
+    const v = await get(`${endpoint('keys')}?${params}`, signal);
     const columns = [
-      ['Key', r => `<strong>${esc(r.name)}</strong><br><code class="muted">${esc(r.key_prefix)}...</code>`],
-      ['Status', r => `${pill(r.status)}${r.expires_at ? `<br><span class="hint">expires ${esc(date(r.expires_at))}</span>` : ''}`],
+      ['Key', r => `${keyLink(r.id, r.name)}<div class="hint"><code>${esc(r.key_prefix)}...</code></div>`, 'wrap'],
+      ['Status', r => `${pill(r.status)}${r.expires_at ? `<div class="hint">${r.expires_at < nowSeconds() ? 'expired' : 'expires'} ${esc(date(r.expires_at))}</div>` : ''}`],
     ];
-    if (admin) columns.push(['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}...</code>`]);
+    if (admin) columns.push(['Account', r => accountLink(r.account_id, r.account_contact), 'wrap']);
     columns.push(
-      ['Limits', r => limits(r.limits)],
-      ['Used (30d)', r => `<span class="num">${esc(usd(used(r)))}</span>`],
-      ['Last used', r => esc(date(r.last_used_at))],
-      ['Actions', r => `<div class="actions">
-        <button type="button" data-edit-key="${esc(r.id)}" data-key-name="${esc(r.name)}">Edit</button>
-        <button type="button" data-rotate="${esc(r.id)}"${r.status !== 'active' ? ' disabled' : ''}>Rotate</button>
-        ${admin ? `<button type="button" class="danger" data-block="${esc(r.id)}"${r.status !== 'active' ? ' disabled' : ''}>Block</button>` : ''}
-        ${admin ? `<button type="button" class="danger" data-revoke="${esc(r.id)}"${r.status === 'revoked' ? ' disabled' : ''}>Revoke</button>` : ''}
-      </div>`]
+      ['Spent', r => `<span class="num">${esc(usd(r.billed_usd))}</span>`, 'end'],
+      ['30 days', r => `<span class="num">${esc(usd(r.usage_30d_usd))}</span>`, 'end'],
+      ['Last used', r => when(r.last_used_at)],
     );
+    columns.push(['', r => `<div class="actions">
+        ${goButton('Requests', 'requests', { key: r.id }, 'small')}
+        <button type="button" class="small" data-edit-key="${esc(r.id)}" data-key-name="${esc(r.name)}">${admin ? 'Edit' : 'Rename'}</button>
+        <button type="button" class="small" data-rotate="${esc(r.id)}"${r.status !== 'active' ? ' disabled' : ''}>Rotate</button>
+      </div>`, 'end']);
     const toolbar = listToolbar('keys', state, {
-      placeholder: 'Search key name, prefix, or ID...',
+      placeholder: 'Search name, prefix, or ID',
       statuses: [['active', 'Active'], ['blocked', 'Blocked'], ['revoked', 'Revoked']],
-      sorts: [['created', 'Newest'], ['name', 'Name'], ['status', 'Status'], ...(admin ? [['account', 'Account']] : []), ['usage', '30-day usage'], ['last_used', 'Last used']],
+      sorts: [['created', 'Created'], ['spend', 'Spent, all time'], ['usage', 'Spent, 30 days'], ['last_used', 'Last used'], ['name', 'Name'], ['status', 'Status'], ...(admin ? [['account', 'Account']] : [])],
       groups: [['status', 'Group by status'], ...(admin ? [['account', 'Group by account']] : [])],
     });
-    const group = state.group === 'status' ? { value: r => r.status } : state.group === 'account' ? { value: r => r.account_id } : null;
-    return `<div class="card-head"><div><h3>API keys</h3><span class="muted">${count(v.total)} total</span></div>${admin ? '' : '<button type="button" class="primary" data-create>+ Create key</button>'}</div>
-      ${toolbar}${table(columns, v.keys, group)}${listPager('keys', state, Number(v.total || 0), v.keys.length)}`;
+    const group = state.group === 'status' ? { value: r => r.status } : state.group === 'account' ? { value: r => accountLabel(r.account_id, r.account_contact) } : null;
+    const scope = admin && state.account
+      ? `<div class="filter-chips">${filterChip('keys', 'account', 'Account', esc(accountLabel(state.account, v.keys[0]?.account_contact)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`)}</div>`
+      : '';
+    return `${pageHead('API keys', `${esc(count(v.total))} ${admin ? 'keys' : 'keys on this account'}. Open a key for its usage, limits, and requests.`, admin ? '' : '<button type="button" class="primary" data-create>Create key</button>')}
+      ${toolbar}${scope}${table(columns, v.keys, { group, empty: ['No keys match', 'Change the filters or create a key.'] })}${listPager('keys', state, Number(v.total || 0), v.keys.length)}`;
   },
   async accounts(signal) {
     const state = listStates.accounts;
     const v = await get(`${endpoint('accounts')}?${listParams(state)}`, signal);
     const toolbar = listToolbar('accounts', state, {
-      placeholder: 'Search account ID or contact...',
+      placeholder: 'Search account ID or contact',
       statuses: [['active', 'Active'], ['suspended', 'Suspended']],
-      sorts: [['created', 'Newest'], ['contact', 'Contact'], ['balance', 'Balance'], ['keys', 'Key count'], ['status', 'Status']],
+      sorts: [['created', 'Created'], ['spend', 'Spent, all time'], ['usage', 'Spent, 30 days'], ['balance', 'Balance'], ['keys', 'Key count'], ['contact', 'Contact'], ['status', 'Status']],
       groups: [['status', 'Group by status'], ['plan', 'Group by plan']],
     });
     const group = state.group === 'status' ? { value: r => r.status } : state.group === 'plan' ? { value: r => r.plan_code || 'No active plan' } : null;
-    return `<div class="card-head"><div><h3>Customer accounts</h3><span class="muted">${count(v.total)} total</span></div></div>
+    return `${pageHead('Accounts', `${esc(count(v.total))} customer accounts. Open one to manage credit, keys, and status.`)}
       ${toolbar}${table([
-        ['Account', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}...</code>`],
-        ['Contact', r => esc(r.contact || '-')],
-        ['Balance', r => `<strong class="num">${esc(usd(r.balance_usd))}</strong>`],
-        ['Keys', r => `<span class="num">${count(r.key_count)}</span>`],
-        ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : '<span class="muted">-</span>'],
+        ['Account', r => `${accountLink(r.id, r.contact)}<div class="hint"><code>${esc(shortId(r.id))}</code></div>`, 'wrap'],
         ['Status', r => pill(r.status)],
-        ['Created', r => esc(date(r.created_at))],
-        ['Actions', r => `<button type="button" data-account="${esc(r.id)}">Manage</button>`]
-      ], v.accounts, group)}${listPager('accounts', state, Number(v.total || 0), v.accounts.length)}`;
+        ['Balance', r => `<strong class="num${Number(r.balance_usd) < 0 ? ' negative' : ''}">${esc(usd(r.balance_usd))}</strong>${isPositive(r.debt_usd) ? `<div class="hint warn">debt ${esc(usd(r.debt_usd))}</div>` : ''}`, 'end'],
+        ['Spent', r => `<span class="num">${esc(usd(r.billed_usd))}</span>`, 'end'],
+        ['30 days', r => `<span class="num">${esc(usd(r.usage_30d_usd))}</span>`, 'end'],
+        ['Keys', r => `<span class="num">${count(r.active_key_count)} / ${count(r.key_count)}</span><div class="hint">active / all</div>`, 'end'],
+        ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : '<span class="muted">-</span>'],
+        ['Created', r => when(r.created_at)],
+        ['', r => `<div class="actions"><button type="button" class="small primary" data-open-account="${esc(r.id)}">Manage</button>${goButton('Keys', 'keys', { account: r.id }, 'small')}${goButton('Requests', 'requests', { account: r.id }, 'small')}</div>`, 'end'],
+      ], v.accounts, { group, empty: ['No accounts match', 'Change the filters.'] })}${listPager('accounts', state, Number(v.total || 0), v.accounts.length)}`;
   },
   async plans(signal) {
     const v = await get(endpoint('plans'), signal);
     const best = bestCode(v.plans.filter(p => p.active));
-    return `<div class="card-head"><h3>Plans</h3><button type="button" class="primary" data-plan>+ Create plan</button></div>
-      <p class="muted">Deactivate a plan to hide it from customers. Plans referenced by subscriptions, payments, or redeem codes cannot be deleted, only retired.</p>
+    return `${pageHead('Plans', 'Deactivate a plan to hide it from customers. Plans referenced by subscriptions, payments, or redeem codes cannot be deleted, only retired.', '<button type="button" class="primary" data-plan>Create plan</button>')}
       ${table([
-        ['Code', r => `<code>${esc(r.code)}</code>`],
-        ['Name', r => esc(r.name)],
-        ['Price', r => `<span class="num">${esc(usd(r.price_usd))}</span>`],
-        ['Credit', r => `<span class="num">${esc(usd(r.credit_usd))}</span>`],
-        ['Days', r => count(r.duration_days)],
+        ['Plan', r => `<strong>${esc(r.name)}</strong><div class="hint"><code>${esc(r.code)}</code></div>`, 'wrap'],
+        ['Price', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
+        ['Credit', r => `<span class="num">${esc(usd(r.credit_usd))}</span>`, 'end'],
+        ['Days', r => `<span class="num">${count(r.duration_days)}</span>`, 'end'],
         ['Status', r => r.active ? pill(r.code === best ? 'best value' : 'active', 'ok') : pill('inactive', 'muted')],
-        ['Actions', r => `<div class="actions">
-          <button type="button" data-edit-plan="${esc(r.code)}" data-plan-name="${esc(r.name)}" data-plan-price="${esc(r.price_usd)}" data-plan-credit="${esc(r.credit_usd)}" data-plan-days="${esc(r.duration_days)}" data-plan-active="${Boolean(r.active)}" data-plan-description="${esc(r.description)}">Edit</button>
-          <button type="button" class="danger" data-delete-plan="${esc(r.code)}">Delete</button>
-        </div>`]
+        ['', r => `<div class="actions">
+          <button type="button" class="small" data-edit-plan="${esc(r.code)}" data-plan-name="${esc(r.name)}" data-plan-price="${esc(r.price_usd)}" data-plan-credit="${esc(r.credit_usd)}" data-plan-days="${esc(r.duration_days)}" data-plan-active="${Boolean(r.active)}" data-plan-description="${esc(r.description)}">Edit</button>
+          <button type="button" class="small danger" data-delete-plan="${esc(r.code)}">Delete</button>
+        </div>`, 'end'],
       ], v.plans)}`;
   },
   async codes(signal) {
     const v = await get(endpoint('codes'), signal);
-    const now = Date.now() / 1000;
+    const now = nowSeconds();
     const state = r => r.redeemed_at ? pill('redeemed', 'info') : r.expires_at && r.expires_at < now ? pill('expired', 'warn') : pill('available', 'ok');
-    return `<div class="card-head"><h3>Prepaid redeem codes</h3><button type="button" class="primary" data-code>+ Issue code</button></div>
-      <p class="muted">Codes are shown once and stored hashed. Unredeemed codes can be edited or cancelled. Redeemed codes are kept as audit records.</p>
+    return `${pageHead('Redeem codes', 'Codes are shown once and stored hashed. Unredeemed codes can be edited or cancelled. Redeemed codes are kept as audit records.', '<button type="button" class="primary" data-code>Issue codes</button>')}
       ${table([
-        ['Code prefix', r => `<code>${esc(r.code_prefix)}...</code>`],
-        ['Plan', r => r.plan_code ? `<code>${esc(r.plan_code)}</code>` : 'Credit'],
-        ['Credit', r => r.credit_usd ? `<span class="num">${esc(usd(r.credit_usd))}</span>` : '-'],
+        ['Code', r => `<code>${esc(r.code_prefix)}...</code>${r.note ? `<div class="hint">${esc(r.note)}</div>` : ''}`, 'wrap'],
+        ['Grants', r => r.plan_code ? `Plan <code>${esc(r.plan_code)}</code>` : `<span class="num">${esc(usd(r.credit_usd))}</span>`],
         ['Status', state],
-        ['Redeemed', r => esc(date(r.redeemed_at))],
-        ['Expires', r => esc(date(r.expires_at))],
-        ['Actions', r => `<div class="actions">
-          <button type="button" data-edit-code="${esc(r.id)}" data-code-expires="${esc(r.expires_at ?? '')}" data-code-note="${esc(r.note)}"${r.redeemed_at ? ' disabled' : ''}>Edit</button>
-          <button type="button" class="danger" data-delete-code="${esc(r.id)}"${r.redeemed_at ? ' disabled' : ''}>Delete</button>
-        </div>`]
+        ['Redeemed by', r => r.redeemed_by ? `${accountLink(r.redeemed_by)}<div class="hint">${esc(date(r.redeemed_at))}</div>` : '<span class="muted">-</span>'],
+        ['Expires', r => r.expires_at ? esc(date(r.expires_at)) : '<span class="muted">Never</span>'],
+        ['', r => r.redeemed_at ? '' : `<div class="actions">
+          <button type="button" class="small" data-edit-code="${esc(r.id)}" data-code-expires="${esc(r.expires_at ?? '')}" data-code-note="${esc(r.note)}">Edit</button>
+          <button type="button" class="small danger" data-delete-code="${esc(r.id)}">Delete</button>
+        </div>`, 'end'],
       ], v.codes)}`;
   },
   async payments(signal) {
     const state = listStates.payments;
-    const v = await get(`${endpoint('payments')}?${listParams(state)}`, signal);
+    const params = listParams(state);
+    if (state.account) params.set('account', state.account);
+    const v = await get(`${endpoint('payments')}?${params}`, signal);
     const toolbar = listToolbar('payments', state, {
-      placeholder: 'Search order, account, plan, or provider...',
+      placeholder: 'Search order, account, plan, or provider',
       statuses: [['pending', 'Pending'], ['paid', 'Paid']],
-      sorts: [['created', 'Newest'], ['status', 'Status'], ['provider', 'Method'], ['account', 'Account'], ['plan', 'Plan'], ['amount', 'Amount']],
+      sorts: [['created', 'Created'], ['amount', 'Amount'], ['status', 'Status'], ['provider', 'Method'], ['account', 'Account'], ['plan', 'Plan']],
       groups: [['status', 'Group by status'], ['method', 'Group by method'], ['plan', 'Group by plan'], ['account', 'Group by account']],
     });
     const group = state.group ? { value: r => state.group === 'plan' ? r.plan_code : state.group === 'account' ? r.account_id : state.group === 'method' ? methodLabel(r.method) : r.status } : null;
-    return `<div class="card-head"><div><h3>Payment orders</h3><span class="muted">${count(v.total)} card and crypto orders</span></div><button type="button" class="ghost" data-payroof>Crypto payments setup</button></div>
-      ${toolbar}${table([
-        ['Created', r => esc(date(r.created_at))],
-        ['Order', r => `<code title="${esc(r.id)}">${esc(r.id.slice(0, 8))}...</code>`],
-        ['Account', r => `<code title="${esc(r.account_id)}">${esc(r.account_id.slice(0, 8))}...</code>`],
+    const scope = state.account ? `<div class="filter-chips">${filterChip('payments', 'account', 'Account', esc(shortId(state.account)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`)}</div>` : '';
+    return `${pageHead('Payments', `${esc(count(v.total))} card and crypto orders.`, '<button type="button" class="ghost" data-payroof>Crypto payments setup</button>')}
+      ${toolbar}${scope}${table([
+        ['Created', r => when(r.created_at)],
+        ['Order', r => `<code title="${esc(r.id)}">${esc(shortId(r.id))}</code>`],
+        ['Account', r => accountLink(r.account_id)],
         ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
         ['Method', r => esc(methodLabel(r.method))],
-        ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`],
-        ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`],
-        ['Status', r => pill(r.status)],
-        ['Paid', r => esc(date(r.paid_at))],
-        ['', r => `<button type="button" class="small ghost" data-payment="${esc(r.id)}">Details</button>`]
-      ], v.payments, group)}${listPager('payments', state, Number(v.total || 0), v.payments.length)}`;
+        ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
+        ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`, 'end'],
+        ['Status', r => `${pill(r.status)}${r.paid_at ? `<div class="hint">${esc(date(r.paid_at))}</div>` : ''}`],
+        ['', r => `<button type="button" class="small" data-payment="${esc(r.id)}">Details</button>`, 'end'],
+      ], v.payments, { group, empty: ['No payments match', 'Orders appear when customers check out.'] })}${listPager('payments', state, Number(v.total || 0), v.payments.length)}`;
   },
   async requests(signal) {
-    // Model suggestions for the search box are admin-only and cached for a minute.
-    if (admin && requestModelCache.expiresAt <= Date.now()) {
-      try {
-        const groups = (await get(endpoint('requests/groups?field=model&limit=200'), signal)).groups;
-        requestModelCache = { values: groups.map(g => g.label).filter(Boolean), expiresAt: Date.now() + 60_000 };
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        // Suggestions are optional. The filter form still works without them.
-      }
-    }
-    const models = admin ? requestModelCache.values : [];
-    return `<div class="card-head"><h3>Request history</h3><button type="button" data-refresh class="ghost small">Refresh</button></div>
-      <form id="request-filter" class="request-filters${admin ? ' admin' : ''}">
-        <input class="request-search" name="q" type="search" list="request-models" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID...">
-        <datalist id="request-models">${models.map(m => `<option value="${esc(m)}"></option>`).join('')}</datalist>
-        <select name="kind" aria-label="Kind">
-          <option value="">All kinds</option>
-          <option value="llm">LLM</option>
-          <option value="tts">TTS</option>
-          <option value="stt">STT</option>
-          <option value="image">Image</option>
-        </select>
-        <select name="status" aria-label="Status">
-          <option value="">All statuses</option>
-          <option value="2xx">2xx success</option>
-          <option value="4xx">4xx client error</option>
-          <option value="5xx">5xx upstream error</option>
-          <option value="pending">In progress</option>
-        </select>
-        ${admin ? '<input name="account" aria-label="Account ID" placeholder="Account ID"><input name="key" aria-label="Key ID" placeholder="Key ID">' : ''}
-        <div class="filter-actions"><button type="submit" class="primary">Apply filters</button><button type="button" class="ghost" data-clear>Clear</button></div>
+    const state = listStates.requests;
+    const params = new URLSearchParams({ limit: state.limit, offset: state.offset });
+    for (const f of FILTERS.requests) if (state[f]) params.set(f, state[f]);
+    const [v, models] = await Promise.all([
+      get(`${endpoint(admin ? 'requests' : 'account/requests')}?${params}`, signal),
+      requestModels(signal),
+    ]);
+    const first = v.requests[0];
+    const chips = [];
+    if (state.key) chips.push(filterChip('requests', 'key', 'Key', esc(first?.key_name || shortId(state.key)), `<button type="button" class="link" data-open-key="${esc(state.key)}">Open key</button>`));
+    if (state.account && admin) chips.push(filterChip('requests', 'account', 'Account', esc(accountLabel(state.account, first?.account_contact)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`));
+    if (state.model) chips.push(filterChip('requests', 'model', 'Model', `<code>${esc(state.model)}</code>`));
+    const option = (value, label, selected) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`;
+    return `${pageHead('Requests', admin ? 'Every proxied request with its usage and charge.' : 'Every request made with your keys and what it was billed.', '<button type="button" data-refresh class="ghost small">Refresh</button>')}
+      <form class="toolbar" data-list-form="requests" role="search">
+        <input class="toolbar-search" name="q" type="search" value="${esc(state.q)}" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID">
+        <select name="model" aria-label="Model"><option value="">All models</option>${[...new Set([state.model, ...models].filter(Boolean))].map(m => option(m, m, state.model)).join('')}</select>
+        <select name="kind" aria-label="Kind">${option('', 'All kinds', state.kind)}${Object.entries(KIND_LABELS).map(([k, l]) => option(k, l, state.kind)).join('')}</select>
+        <select name="status" aria-label="Status">${[['', 'All statuses'], ['2xx', 'Succeeded (2xx)'], ['4xx', 'Rejected (4xx)'], ['5xx', 'Failed (5xx)'], ['pending', 'In progress']].map(([k, l]) => option(k, l, state.status)).join('')}</select>
+        <input type="hidden" name="key" value="${esc(state.key)}"><input type="hidden" name="account" value="${esc(state.account)}">
+        <div class="toolbar-actions"><button type="submit" class="primary">Apply</button><button type="button" class="ghost" data-list-clear="requests">Reset</button></div>
       </form>
-      <div id="request-results">${loading('Loading requests...')}</div>
-      <div class="pager">
-        <span class="hint" id="request-range"></span>
-        <div class="actions">
-          <label class="inline" for="request-size">Rows</label>
-          <select id="request-size" aria-label="Rows per page"><option>20</option><option>50</option><option>100</option></select>
-          <button type="button" data-prev class="ghost">Previous</button>
-          <button type="button" data-next class="ghost">Next</button>
-        </div>
-      </div>`;
+      ${chips.length ? `<div class="filter-chips">${chips.join('')}</div>` : ''}
+      ${requestTable(v.requests)}
+      ${listPager('requests', state, Number(v.total || 0), v.requests.length)}`;
   },
   async usage(signal) {
     const v = await get('/v1/account/usage', signal);
-    return `<div class="card"><div class="card-head"><h3>Usage (last 30 days)</h3></div>${chart(v.series)}</div>
-      ${table([
-        ['Day', r => esc(new Date(r.day * 1000).toLocaleDateString())],
-        ['Model', r => `<code>${esc(r.model)}</code>`],
-        ['Requests', r => `<span class="num">${count(r.requests)}</span>`],
-        ['Tokens', r => `<span class="num">${count(r.tokens)}</span>`],
-        ['Billed', r => `<span class="num">${esc(usd(r.billed_cost_usd))}</span>`]
-      ], v.series)}`;
+    const t = seriesTotals(v.series);
+    const days = [...dailyTotals(v.series)].filter(([, d]) => d.requests > 0).reverse();
+    return `${pageHead('Usage', 'Billed usage of all keys over the last 30 days. Open a key under API keys for its own numbers.')}
+      <div class="stats">
+        ${metric('Billed', usd(t.cost))}
+        ${metric('Requests', count(t.requests))}
+        ${metric('Tokens', count(t.tokens))}
+      </div>
+      <div class="card"><div class="card-head"><h3>Daily spend</h3></div>${chart(v.series)}</div>
+      <div class="card"><div class="card-head"><h3>By model</h3></div>${modelTable(v.series)}</div>
+      <div class="card"><div class="card-head"><h3>By day</h3></div>${table([
+        ['Day', ([d]) => esc(day(d, { weekday: 'short', month: 'short', day: 'numeric' }))],
+        ['Requests', ([, d]) => `<span class="num">${count(d.requests)}</span>`, 'end'],
+        ['Tokens', ([, d]) => `<span class="num">${count(d.tokens)}</span>`, 'end'],
+        ['Billed', ([, d]) => `<span class="num">${esc(usd(d.cost))}</span>`, 'end'],
+      ], days, { empty: ['No usage yet', 'Daily totals appear after the first request.'] })}</div>`;
   },
   async billing(signal) {
     const [v, p, orders] = await Promise.all([get('/v1/account', signal), get('/v1/plans', signal), get('/v1/account/payments', signal)]);
-    const now = Date.now() / 1000;
+    const a = v.account;
     const best = bestCode(p.plans);
     const methods = p.payment_methods || [];
+    const topUp = v.top_up;
     const cta = plan => methods.length
       ? `<div class="pay-buttons">${methods.map((m, i) => `<button type="button" class="${i === 0 ? 'primary' : 'ghost'}" data-buy="${esc(plan.code)}" data-method="${esc(m)}">${m === 'stripe' ? 'Pay by card' : 'Pay with crypto'}</button>`).join('')}</div>`
       : '<span class="hint">Online payments are not enabled. Use a credit code.</span>';
-    return `<section class="billing-catalog">
-          <div class="catalog-head"><div><h3>Add API credit</h3><p>Choose a prepaid, non-renewing package. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto payments accept USDC, USDT, and native coins on supported networks.' : ''}</p></div><button type="button" class="ghost" data-redeem>Have a credit code?</button></div>
-          <div class="plans plan-catalog">${p.plans.length
-            ? p.plans.map(plan => planCard(plan, best, cta(plan))).join('')
-            : emptyState('No plans available', 'Ask the operator for a redeem code instead.')}</div>
+    return `<div class="banner">
+        <div><div class="label">Available balance</div><div class="metric">${esc(usd(a.balance_usd))}</div><div class="hint">${isPositive(a.debt_usd) ? `Debt ${esc(usd(a.debt_usd))} is repaid from the next top-up.` : `Spent so far: ${esc(usd(a.billed_usd))}`}</div></div>
+        <div class="actions"><button type="button" class="ghost" data-redeem>Redeem a code</button></div>
+      </div>
+      ${topUp?.addresses?.length ? `<div class="card">
+        <div class="card-head"><h3>Top up with stablecoins</h3><span class="hint">Credited automatically in about ${count(topUp.eta_minutes)} minutes</span></div>
+        <p>Send ${esc([...new Set(topUp.assets.map(x => x.symbol))].join(' or '))} to your personal address on one of these networks. Any amount is credited 1:1 in USD.</p>
+        ${facts(topUp.addresses.map(x => [x.chain_name, copyable(x.address, `${x.chain_name} address`)]))}
+      </div>` : ''}
+      <section class="billing-catalog">
+        <div class="catalog-head"><div><h3>Prepaid plans</h3><p>Non-renewing packages. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto checkout accepts USDC, USDT, and native coins on supported networks.' : ''}</p></div></div>
+        <div class="plans plan-catalog">${p.plans.length
+          ? p.plans.map(plan => planCard(plan, best, cta(plan))).join('')
+          : emptyState('No plans available', 'Ask the operator for a redeem code instead.')}</div>
       </section>
       ${orders.payments.length ? `<h3 class="section">Your payments</h3>
       ${table([
-        ['Created', r => esc(date(r.created_at))],
+        ['Created', r => when(r.created_at)],
         ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
         ['Method', r => esc(methodLabel(r.method))],
-        ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`],
-        ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`],
+        ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
+        ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`, 'end'],
         ['Status', r => pill(r.status)],
-        ['', r => r.method === 'crypto' ? `<button type="button" class="small ghost" data-order="${esc(r.id)}">${r.status === 'pending' ? 'Pay' : 'Details'}</button>` : '']
+        ['', r => r.method === 'crypto' ? `<button type="button" class="small${r.status === 'pending' ? ' primary' : ''}" data-order="${esc(r.id)}">${r.status === 'pending' ? 'Pay' : 'Details'}</button>` : '', 'end'],
       ], orders.payments)}` : ''}
-      <h3 class="section">Your credit ledger</h3>
-      ${table([
-        ['Source', r => esc(r.source)],
-        ['Amount', r => `<span class="num">${esc(usd(r.amount_usd))}</span>`],
-        ['Remaining', r => `<span class="num">${esc(usd(r.remaining_usd))}</span>`],
-        ['Expires', r => r.expires_at && r.expires_at < now ? pill('expired', 'warn') : esc(date(r.expires_at))]
-      ], v.credits)}`;
+      <h3 class="section">Credit ledger</h3>
+      ${creditTable(v.credits)}`;
   },
   async settings(signal) {
     const v = await get(endpoint('settings'), signal);
-    return `<div class="card-head"><h3>Runtime settings</h3><span class="muted">Stored in SQLite</span></div>
-      <p class="muted">Secret fields are redacted. Leave them blank to keep their current values. USD amounts and percentages are decimal strings. CORS changes require a restart. <code>branding</code> controls the name, copy, logo, favicon, colours (<code>css_vars</code>), and custom CSS of these pages. <code>stripe</code> and <code>payroof</code> enable card and crypto checkout.</p>
+    return `${pageHead('Settings', 'Runtime configuration stored in SQLite. Secret fields are redacted: leave them blank to keep their values. USD amounts and percentages are decimal strings. CORS changes need a restart.')}
+      <div class="callout info"><p><code>branding</code> controls the name, copy, logo, favicon, colours (<code>css_vars</code>), and custom CSS of these pages. <code>stripe</code> and <code>payroof</code> enable card and crypto checkout. <code>models</code> is the catalog customers see.</p></div>
       <form id="settings" class="card">
         <label for="settings-json">Configuration JSON</label>
         <textarea id="settings-json" name="json" rows="30" spellcheck="false">${esc(JSON.stringify(v.settings, null, 2))}</textarea>
         <div class="actions"><button class="primary" type="submit">Save settings</button></div>
       </form>`;
-  }
+  },
 };
 
-async function editKeyForm(button) {
-  const key = admin ? (await api(endpoint(`keys/${button.dataset.editKey}`))).key : { name: button.dataset.keyName || 'My key' };
-  const limits = key.limits || {};
-  const windowFields = (name, label, value, placeholder, step = '1') => `<div><label for="key-${name}-max">${label}</label><input id="key-${name}-max" name="${name}_max" type="number" min="${step === '1' ? '1' : '0.000001'}" step="${step}" value="${esc(value?.max || '')}" placeholder="No limit"></div><div><label for="key-${name}-window">Window (hours)</label><input id="key-${name}-window" name="${name}_window" type="number" min="1" value="${esc(value?.window_hours || '')}" placeholder="${placeholder}"></div>`;
-  modal('Edit API key', `<form>
-    <label for="edit-key-name">Key name</label><input id="edit-key-name" name="name" maxlength="80" value="${esc(key.name)}" required>
-    ${admin ? `<div class="form-grid"><div><label for="edit-key-status">Status</label><select id="edit-key-status" name="status">${key.status === 'revoked' ? '<option value="revoked">Revoked (permanent)</option>' : `<option value="active"${key.status === 'active' ? ' selected' : ''}>Active</option><option value="blocked"${key.status === 'blocked' ? ' selected' : ''}>Blocked</option>`}</select></div><div><label for="edit-key-markup">Markup %</label><input id="edit-key-markup" name="markup_pct" type="number" step="0.000001" value="${esc(key.markup_pct || '')}" placeholder="Account default"></div><div><label for="edit-key-expiry">Expires</label><input id="edit-key-expiry" name="expires_at" type="datetime-local" value="${esc(localDateTime(key.expires_at))}"></div><div><label for="edit-key-rpm">Requests per minute</label><input id="edit-key-rpm" name="rpm" type="number" min="1" value="${esc(limits.rpm || '')}" placeholder="No limit"></div></div>
-    <details class="advanced-fields"><summary>Usage limits and models</summary><div class="form-grid">${windowFields('requests', 'Request limit', limits.requests, '24')}${windowFields('tokens', 'Token limit', limits.tokens, '720')}${windowFields('spend', 'Spend limit (USD)', limits.spend && { max: limits.spend.max_usd, window_hours: limits.spend.window_hours }, '720', '0.000001')}<div><label for="edit-key-children">Maximum child keys</label><input id="edit-key-children" name="max_children" type="number" min="1" value="${esc(limits.max_children || '')}" placeholder="No limit"></div></div><label for="edit-key-models">Allowed models</label><textarea id="edit-key-models" name="allowed_models" rows="4" placeholder="One model per line. Blank allows all">${esc((limits.allowed_models || []).join('\n'))}</textarea></details>` : ''}
-    <div class="actions"><button class="primary" type="submit">Save changes</button></div>
-  </form>`, d => bindForm(d.querySelector('form'), async b => {
-    const payload = { name: b.name };
-    if (admin) {
-      const bounded = (name, fallback) => b[`${name}_max`] ? { max: Number(b[`${name}_max`]), window_hours: Number(b[`${name}_window`]) || fallback } : null;
-      Object.assign(payload, {
-        status: b.status,
-        markup_pct: b.markup_pct || null,
-        expires_at: toUnix(b.expires_at),
-        limits: {
-          rpm: b.rpm ? Number(b.rpm) : null,
-          requests: bounded('requests', 24),
-          tokens: bounded('tokens', 720),
-          spend: b.spend_max ? { max_usd: b.spend_max, window_hours: Number(b.spend_window) || 720 } : null,
-          max_children: b.max_children ? Number(b.max_children) : null,
-          allowed_models: b.allowed_models.split(/[\n,]/).map(v => v.trim()).filter(Boolean),
-        },
-      });
-    }
-    await api(endpoint(`keys/${button.dataset.editKey}`), 'PATCH', payload);
-    d.close();
-    notice('Key updated');
-    await load();
-  }), 'wide');
+const listParams = state => {
+  const params = new URLSearchParams({ limit: state.limit, offset: state.offset, sort: state.sort, dir: state.dir });
+  if (state.q) params.set('q', state.q);
+  if (state.status) params.set('status', state.status);
+  return params;
+};
+
+// Model names for the request filter, cached for a minute.
+let requestModelCache = { values: [], expiresAt: 0 };
+async function requestModels(signal) {
+  if (requestModelCache.expiresAt > Date.now()) return requestModelCache.values;
+  try {
+    const values = admin
+      ? (await get(endpoint('requests/groups?field=model&limit=200'), signal)).groups.map(g => g.label)
+      : modelTotals((await get('/v1/account/usage', signal)).series).map(m => m.model);
+    requestModelCache = { values: values.filter(Boolean).sort(), expiresAt: Date.now() + 60_000 };
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    // Suggestions are optional. The filter still works without them.
+  }
+  return requestModelCache.values;
 }
+
+/* Plans and codes ------------------------------------------------------------------ */
 
 function planForm(initial = {}) {
   const editing = Boolean(initial.code);
@@ -1426,7 +1956,7 @@ function editCodeForm(button) {
   }));
 }
 
-/* Payments ------------------------------------------------------------------- */
+/* Payments ------------------------------------------------------------------------- */
 
 const shortHash = v => v && v.length > 18 ? `${v.slice(0, 10)}...${v.slice(-6)}` : v || '';
 function wireCopies(root) {
@@ -1436,29 +1966,28 @@ function wireCopies(root) {
 }
 function transfersTable(transfers) {
   if (!transfers?.length) return '';
-  return `<h3 class="section">Transfers</h3>${table([
+  return `<section class="detail-section"><h4>Transfers</h4>${table([
     ['Seen', r => esc(date(r.seen_at))],
     ['Network', r => `<code>${esc(r.chain)}</code>`],
-    ['Transaction', r => `<code title="${esc(r.transaction)}">${esc(shortHash(r.transaction))}</code>`],
+    ['Transaction', r => copyable(r.transaction, 'Transaction hash', shortHash(r.transaction))],
     ['Status', r => pill(r.status)],
-    ['Credited', r => `<span class="num">${esc(usd(r.value_usd))}</span>`],
-    ['Note', r => r.note ? pill(r.note.replace(/_/g, ' '), 'warn') : '']
-  ], transfers)}`;
+    ['Credited', r => `<span class="num">${esc(usd(r.value_usd))}</span>`, 'end'],
+    ['Note', r => r.note ? pill(r.note.replace(/_/g, ' '), 'warn') : ''],
+  ], transfers)}</section>`;
 }
 function cryptoView(o) {
   const open = o.status === 'pending';
-  const quotes = (o.quotes || []).map(q => `<tr>
-      <td><strong>${esc(q.symbol)}</strong><div class="hint">${esc(q.chain_name)}</div></td>
-      <td><button type="button" class="link-copy num" data-copy-value="${esc(q.amount)}" data-copy-label="Amount" title="Copy amount">${esc(q.amount)} ${esc(q.symbol)}</button>${q.rate_usd !== '1' ? `<div class="hint">at ${esc(usd(q.rate_usd))} / ${esc(q.symbol)}</div>` : ''}</td>
-      <td><button type="button" class="link-copy address" data-copy-value="${esc(q.address)}" data-copy-label="Address" title="Copy address"><code>${esc(q.address)}</code></button></td>
-    </tr>`).join('');
-  return `<div class="crypto-summary">
-      <div>${metric('Order total', usd(o.price_usd), `${o.plan_code} plan`)}</div>
-      <div>${metric('Confirmed', usd(o.received_usd), o.status === 'paid' ? 'Credit added' : 'Updates automatically')}</div>
-      <div class="card metric-card"><div class="label">Status</div><div class="metric">${pill(o.status)}</div><div class="hint">${open && o.expires_at ? `Quote valid until ${esc(date(o.expires_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}` : ''}</div></div>
+  return `<div class="tiles">
+      ${metric('Order total', usd(o.price_usd), `${esc(o.plan_code)} plan`)}
+      ${metric('Confirmed', usd(o.received_usd), o.status === 'paid' ? 'Credit added' : 'Updates automatically')}
+      ${metric('Status', pill(o.status), open && o.expires_at ? `Quote valid until ${esc(date(o.expires_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}` : '', { html: true })}
     </div>
-    ${open ? `<p class="muted">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Your credit is added after network confirmations. Partial payments in several assets add up. Stablecoins are valued 1:1 with USD, native coins at the quoted rate.</p>
-    <div class="table-wrap"><table class="quotes"><thead><tr><th scope="col">Asset</th><th scope="col">Amount</th><th scope="col">Deposit address</th></tr></thead><tbody>${quotes}</tbody></table></div>` : ''}
+    ${open ? `<p class="muted">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Credit is added after network confirmations. Partial payments in several assets add up. Stablecoins count 1:1 in USD, native coins at the quoted rate.</p>
+    ${table([
+      ['Asset', q => `<strong>${esc(q.symbol)}</strong><div class="hint">${esc(q.chain_name)}</div>`],
+      ['Amount', q => `${copyable(q.amount, 'Amount', `${q.amount} ${q.symbol}`)}${q.rate_usd !== '1' ? `<div class="hint">at ${esc(usd(q.rate_usd))} per ${esc(q.symbol)}</div>` : ''}`, 'wrap'],
+      ['Deposit address', q => copyable(q.address, 'Address'), 'wrap'],
+    ], o.quotes || [])}` : ''}
     ${transfersTable(o.transfers)}`;
 }
 function cryptoOrder(initial) {
@@ -1494,22 +2023,28 @@ function cryptoOrder(initial) {
 }
 async function paymentDetails(id) {
   const o = await api(endpoint(`payments/${encodeURIComponent(id)}`));
-  const quotes = (o.quotes || []).length ? `<h3 class="section">Quotes</h3>${table([
-    ['Asset', q => `${esc(q.symbol)} <span class="hint">${esc(q.chain_name)}</span>`],
-    ['Amount', q => `<span class="num">${esc(q.amount)}</span>`],
-    ['Rate', q => esc(usd(q.rate_usd))],
-    ['Address', q => `<code title="${esc(q.address)}">${esc(shortHash(q.address))}</code>`]
-  ], o.quotes)}` : '';
   const payable = o.status === 'pending' || o.status === 'expired';
-  modal(`Payment ${o.id.slice(0, 8)}...`, `
-    <div class="crypto-summary">
-      <div>${metric('Price', usd(o.price_usd), `${o.plan_code}, ${methodLabel(o.method)}`)}</div>
-      <div>${metric('Received', usd(o.received_usd), `Credit ${usd(o.credit_usd)} for ${o.duration_days} days`)}</div>
-      <div class="card metric-card"><div class="label">Status</div><div class="metric">${pill(o.status)}</div><div class="hint">${o.paid_at ? `Paid ${esc(date(o.paid_at))} by ${esc(o.paid_by)}` : `Created ${esc(date(o.created_at))}`}</div></div>
+  modal(`Payment ${shortId(o.id)}`, `
+    <div class="tiles">
+      ${metric('Price', usd(o.price_usd), `${esc(o.plan_code)}, ${esc(methodLabel(o.method))}`)}
+      ${metric('Received', usd(o.received_usd), `Grants ${esc(usd(o.credit_usd))} for ${esc(plural(o.duration_days, 'day'))}`)}
+      ${metric('Status', pill(o.status), o.paid_at ? `Paid ${esc(date(o.paid_at))}${o.paid_by ? ` by ${esc(o.paid_by)}` : ''}` : `Created ${esc(date(o.created_at))}`, { html: true })}
     </div>
-    <p class="muted">Account <code>${esc(o.account_id)}</code></p>
-    ${quotes}${transfersTable(o.transfers)}
-    ${payable ? `<div class="actions section"><button type="button" class="primary" data-complete>Mark as paid and grant credit</button></div><p class="field-help">Use after verifying a late, underpaid, or otherwise flagged payment by hand. Credit is granted once.</p>` : ''}`, d => {
+    <section class="detail-section"><h4>Order</h4>${facts([
+      ['Order ID', copyable(o.id, 'Order ID')],
+      ['Account', `${accountLink(o.account_id)} ${goButton('Account payments', 'payments', { account: o.account_id }, 'link')}`],
+      ['Created', esc(date(o.created_at))],
+      o.expires_at && ['Quote expires', esc(date(o.expires_at))],
+    ])}</section>
+    ${(o.quotes || []).length ? `<section class="detail-section"><h4>Quotes</h4>${table([
+      ['Asset', q => `<strong>${esc(q.symbol)}</strong><div class="hint">${esc(q.chain_name)}</div>`],
+      ['Amount', q => `<span class="num">${esc(q.amount)}</span>`],
+      ['Rate', q => esc(usd(q.rate_usd))],
+      ['Address', q => copyable(q.address, 'Address', shortHash(q.address))],
+    ], o.quotes)}</section>` : ''}
+    ${transfersTable(o.transfers)}
+    ${payable ? `<div class="callout warn"><p>Use after verifying a late, underpaid, or otherwise flagged payment by hand. Credit is granted once.</p><div class="actions"><button type="button" class="primary" data-complete>Mark as paid and grant credit</button></div></div>` : ''}`, d => {
+    wireCopies(d);
     d.querySelector('[data-complete]')?.addEventListener('click', async e => {
       if (!(await confirmModal('Complete payment?', 'Grant this order\'s plan credit to the account now?', 'Grant credit'))) return;
       e.target.disabled = true;
@@ -1527,22 +2062,27 @@ async function paymentDetails(id) {
 }
 async function payroofSetup() {
   const s = await api(endpoint('payroof'));
-  const row = (label, value) => `<div class="kv"><span>${esc(label)}</span><strong>${value}</strong></div>`;
   const yes = v => v ? pill('configured', 'ok') : pill('missing', 'warn');
-  const chains = (s.chains || []).map(c => `<li><strong>${esc(c.name)}</strong> <code>${esc(c.id)}</code>, ${esc((c.assets || []).map(a => a.symbol).join(', '))}, ${count(c.confirmations)} confirmations</li>`).join('');
   modal('Crypto payments (Payroof)', `
     <p class="muted">Configure <code>payroof.project</code> and <code>payroof.token</code> in Settings, then register the webhook so confirmed transfers complete orders automatically.</p>
-    ${row('Status', s.enabled ? pill('enabled', 'ok') : pill('disabled', 'warn'))}
-    ${row('API', `<code>${esc(s.api_url)}</code>`)}
-    ${row('Project', s.project ? `<code>${esc(s.project)}</code>` : pill('missing', 'warn'))}
-    ${row('Project token', yes(s.token_configured))}
-    ${row('Webhook secret', yes(s.webhook_secret_configured))}
-    ${row('Webhook URL', `<code>${esc(s.webhook_url)}</code> ${s.webhook_registered ? pill('registered', 'ok') : ''}`)}
-    ${s.project_error ? `<p class="card error">${esc(s.project_error)}</p>` : ''}
+    ${facts([
+      ['Status', s.enabled ? pill('enabled', 'ok') : pill('disabled', 'warn')],
+      ['API', `<code>${esc(s.api_url)}</code>`],
+      ['Project', s.project ? `<code>${esc(s.project)}</code>` : pill('missing', 'warn')],
+      ['Project token', yes(s.token_configured)],
+      ['Webhook secret', yes(s.webhook_secret_configured)],
+      ['Webhook URL', `${copyable(s.webhook_url, 'Webhook URL')} ${s.webhook_registered ? pill('registered', 'ok') : pill('not registered', 'warn')}`],
+    ])}
+    ${s.project_error ? `<div class="callout danger"><p>${esc(s.project_error)}</p></div>` : ''}
     ${s.webhooks_error ? `<p class="hint">Webhooks: ${esc(s.webhooks_error)}</p>` : ''}
-    ${chains ? `<h3 class="section">Watched networks</h3><ul class="chain-list">${chains}</ul>` : ''}
+    ${(s.chains || []).length ? `<section class="detail-section"><h4>Watched networks</h4>${table([
+      ['Network', c => `<strong>${esc(c.name)}</strong><div class="hint"><code>${esc(c.id)}</code></div>`],
+      ['Assets', c => esc((c.assets || []).map(x => x.symbol).join(', ')), 'wrap'],
+      ['Confirmations', c => `<span class="num">${count(c.confirmations)}</span>`, 'end'],
+    ], s.chains)}</section>` : ''}
     <div class="actions section"><button type="button" class="primary" data-register${s.project && s.token_configured ? '' : ' disabled'}>Register webhook</button></div>
-    <p class="field-help">Registering subscribes <code>${esc(s.webhook_url)}</code> to seen and confirmed events and stores the returned signing secret. Payroof only delivers to public HTTPS URLs.</p>`, d => {
+    <p class="field-help">Registering subscribes the webhook URL to seen and confirmed events and stores the returned signing secret. Payroof only delivers to public HTTPS URLs.</p>`, d => {
+    wireCopies(d);
     d.querySelector('[data-register]').onclick = async e => {
       e.target.disabled = true;
       try {
@@ -1558,32 +2098,34 @@ async function payroofSetup() {
   }, 'wide');
 }
 
-/* Interaction wiring --------------------------------------------------------- */
+/* Interaction wiring --------------------------------------------------------------- */
 
 function wire(root) {
   root.querySelectorAll('[data-refresh]').forEach(b => b.onclick = load);
   root.querySelectorAll('[data-create]').forEach(b => b.onclick = keyForm);
   wireCharts(root);
+  wireShares(root);
   wireDocs(root);
   wireCopies(root);
-  // `#content` survives view renders, so replace its delegated handler instead
-  // of accumulating one listener on every refresh/navigation.
-  root.onclick = e => {
-    const button = e.target.closest('[data-request-details]');
-    if (!button || !root.contains(button)) return;
-    const request = requestIndex.get(button.dataset.requestDetails);
-    if (request) requestDetails(request);
-    else notice('Request details are no longer available. Refresh the list.', true);
-  };
   root.querySelectorAll('[data-list-form]').forEach(form => {
     form.addEventListener('submit', e => {
       e.preventDefault();
       Object.assign(listStates[form.dataset.listForm], Object.fromEntries(new FormData(form)), { offset: 0 });
+      syncHash();
       load();
     });
   });
   root.querySelectorAll('[data-list-clear]').forEach(button => button.onclick = () => {
-    Object.assign(listStates[button.dataset.listClear], { ...DEFAULT_LIST_STATE, limit: listStates[button.dataset.listClear].limit });
+    const name = button.dataset.listClear;
+    Object.assign(listStates[name], LIST_DEFAULTS[name], { limit: listStates[name].limit });
+    syncHash();
+    load();
+  });
+  root.querySelectorAll('[data-chip-remove]').forEach(button => button.onclick = () => {
+    const state = listStates[button.dataset.chipRemove];
+    state[button.dataset.chipField] = '';
+    state.offset = 0;
+    syncHash();
     load();
   });
   root.querySelectorAll('[data-list-size]').forEach(select => select.onchange = () => {
@@ -1614,26 +2156,10 @@ function wire(root) {
     }
   });
 
-  action('[data-block]', async b => {
-    await api(endpoint(`keys/${b.dataset.block}`), 'PATCH', { status: 'blocked' });
-    notice('Key blocked');
-    await load();
-  });
   action('[data-rotate]', async b => {
-    if (!(await confirmModal('Rotate key?', 'Replace this key? Applications using it will need the new key.', 'Rotate key'))) return;
-    secrets(await api(endpoint(`keys/${b.dataset.rotate}/rotate`), 'POST', {}));
-    await load();
+    if (await rotateKey(b.dataset.rotate)) await load();
   });
-  action('[data-revoke]', async b => {
-    if (!(await confirmModal('Revoke key?', 'Permanently revoke this key and its dashboard token? This cannot be undone.', 'Revoke key', true))) return;
-    await api(endpoint(`keys/${b.dataset.revoke}/revoke`), 'POST', {});
-    notice('Key revoked');
-    await load();
-  });
-  action('[data-edit-key]', async b => {
-    await editKeyForm(b);
-  });
-  action('[data-account]', async b => manageAccount(b.dataset.account));
+  action('[data-edit-key]', async b => editKeyForm(b.dataset.editKey, b.dataset.keyName));
   action('[data-plan]', async () => planForm());
   action('[data-edit-plan]', async b => planForm({
     code: b.dataset.editPlan,
@@ -1684,61 +2210,21 @@ function wire(root) {
     }
     notice('Settings saved');
   });
-  if (root.querySelector('#request-filter')) {
-    const form = root.querySelector('#request-filter');
-    let offset = 0;
-    let limit = 20;
-    let filters = {};
-    let sequence = 0;
-    // Tied to this view's load(): aborted when the user switches tabs or signs out.
-    const signal = loadController?.signal;
-    const refresh = async () => {
-      const seq = ++sequence;
-      const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-      for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value);
-      try {
-        const v = await get(endpoint(admin ? 'requests' : 'account/requests') + `?${params}`, signal);
-        const results = root.querySelector('#request-results');
-        if (seq !== sequence || !results || !form.isConnected) return;
-        results.innerHTML = requestTable(v.requests);
-        const total = Number(v.total || 0);
-        const shown = v.requests.length;
-        root.querySelector('#request-range').textContent = total === 0
-          ? 'No matching requests.'
-          : `Showing ${count(offset + 1)} to ${count(offset + shown)} of ${count(total)}`;
-        root.querySelector('[data-prev]').disabled = offset === 0;
-        root.querySelector('[data-next]').disabled = offset + shown >= total;
-      } catch (e) {
-        if (e.name !== 'AbortError' && seq === sequence) notice(e.message, true);
-      }
-    };
-    bindForm(form, async b => {
-      filters = Object.fromEntries(Object.entries(b).filter(([, value]) => value !== ''));
-      offset = 0;
-      await refresh();
-    });
-    root.querySelector('[data-clear]').onclick = () => {
-      form.reset();
-      filters = {};
-      offset = 0;
-      refresh();
-    };
-    root.querySelector('#request-size').onchange = e => {
-      limit = Number(e.target.value);
-      offset = 0;
-      refresh();
-    };
-    root.querySelector('[data-prev]').onclick = () => {
-      offset = Math.max(0, offset - limit);
-      refresh();
-    };
-    root.querySelector('[data-next]').onclick = () => {
-      offset += limit;
-      refresh();
-    };
-    refresh();
-  }
 }
+
+// Entity links and cross-page navigation, in views and dialogs alike.
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-open-account],[data-open-key],[data-go],[data-request-details]');
+  if (!el || el.disabled) return;
+  if (el.dataset.openAccount) manageAccount(el.dataset.openAccount);
+  else if (el.dataset.openKey) keyDetails(el.dataset.openKey);
+  else if (el.dataset.go) go(el.dataset.go, Object.fromEntries(new URLSearchParams(el.dataset.goParams || '')));
+  else if (el.dataset.requestDetails) {
+    const request = requestIndex.get(el.dataset.requestDetails);
+    if (request) requestDetails(request);
+    else notice('Request details are no longer available. Refresh the list.', true);
+  }
+});
 
 // Stripe returns to /workspace/?payment=success|cancelled#billing.
 const paymentResult = new URLSearchParams(location.search).get('payment');
@@ -1749,6 +2235,7 @@ if (paymentResult) {
     : 'Checkout cancelled. You have not been charged.', paymentResult !== 'success');
 }
 renderHeader();
-if (!admin && !workspace) landing();
+if (docsPage) docs();
+else if (!admin && !workspace) landing();
 else if (token) shell();
 else login();

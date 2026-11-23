@@ -53,8 +53,9 @@ pub(super) fn resolve<'a>(
         .ok_or_else(|| Error::model_not_found(requested))
 }
 
-/// The `{"object":"list"}` response for the caller.
-fn list(config: &Config, identity: Option<&Identity>) -> Value {
+/// The `{"object":"list"}` response for the caller: enabled catalog entries
+/// the caller's key may use, priced with its markup when pricing is shown.
+pub fn list(config: &Config, identity: Option<&Identity>) -> Value {
     let data: Vec<Value> = config
         .catalog()
         .iter()

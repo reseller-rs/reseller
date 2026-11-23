@@ -95,6 +95,7 @@ pub fn key_json(r: &SqliteRow) -> Value {
         "expires_at": r.get::<Option<i64>, _>("expires_at"),
         "created_at": r.get::<i64, _>("created_at"),
         "last_used_at": r.get::<Option<i64>, _>("last_used_at"),
+        "billed_usd": money::display(r.get("billed_micro")),
     })
 }
 

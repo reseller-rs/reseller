@@ -577,13 +577,25 @@ async fn cached_tokens_and_aggregates_agree_to_the_micro_dollar() {
     assert_eq!(overview["tokens"], 3300);
     assert_eq!(overview["upstream_cost_usd"], "0.0066");
     assert_eq!(overview["billed_cost_usd"], "0.00858");
-    let usage = reseller::stats::usage(&t.app, Some(t.account()), None, 7)
-        .await
-        .unwrap();
+    let usage = reseller::stats::usage(
+        &t.app,
+        reseller::stats::Audience::Operator,
+        Some(t.account()),
+        None,
+        7,
+    )
+    .await
+    .unwrap();
     let series = usage["series"].as_array().unwrap();
     assert_eq!(series.len(), 1);
     assert_eq!(series[0]["billed_cost_usd"], "0.00858");
     assert_eq!(series[0]["tokens"], 3300);
+    let key_billed: i64 = sqlx::query_scalar("SELECT billed_micro FROM api_keys WHERE id=?")
+        .bind(t.key["id"].as_str())
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(key_billed, 8580);
     // Free credit of 0.25 minus the billed total.
     assert_eq!(t.balance().await, "0.09142");
 }

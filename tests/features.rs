@@ -1332,3 +1332,203 @@ async fn new_accounts_get_the_default_or_configured_trial_credit() {
     let k = t.key().await;
     assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.75");
 }
+
+/// The overview counts only credit active accounts can spend as outstanding.
+/// Credit of suspended accounts and customer debt are reported apart, and
+/// usable keys exclude keys of suspended accounts.
+#[tokio::test]
+async fn overview_splits_credit_and_keys_by_account_status() {
+    let t = Test::new().await;
+    let active = t.key().await;
+    let suspended = t.key().await;
+    let (s, v) = t
+        .admin(
+            "PATCH",
+            &format!("accounts/{}", suspended["account_id"].as_str().unwrap()),
+            json!({"status": "suspended"}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    sqlx::query("UPDATE accounts SET debt_micro=250000 WHERE id=?")
+        .bind(active["account_id"].as_str())
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let (s, v) = t.admin("GET", "overview", json!({})).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["accounts"], 2);
+    assert_eq!(v["suspended_accounts"], 1);
+    assert_eq!(v["active_keys"], 1);
+    assert_eq!(v["outstanding_usd"], "0.1");
+    assert_eq!(v["suspended_credit_usd"], "0.1");
+    assert_eq!(v["debt_usd"], "0.25");
+}
+
+/// Key and account lists carry lifetime and 30-day spend and rank by them,
+/// request rows are labelled with the key and account, and customer views
+/// never show the provider cost.
+#[tokio::test]
+async fn dashboards_rank_spend_and_link_keys_accounts_and_requests() {
+    let t = Test::new().await;
+    let first = t.key().await;
+    let other = t.key().await;
+    let token = first["key"].as_str().unwrap();
+    let aid = first["account_id"].as_str().unwrap();
+    let (s, second) = t
+        .call(
+            "POST",
+            "/v1/keys",
+            Some(token),
+            json!({"name": "Batch jobs"}),
+        )
+        .await;
+    assert_eq!(s, 200, "{second}");
+    let (k1, k2) = (
+        first["id"].as_str().unwrap(),
+        second["id"].as_str().unwrap(),
+    );
+    let now = db::now();
+    for (kid, hour, billed, lifetime) in [
+        (k1, now - 40 * 86400, 900_000, 1_000_000),
+        (k2, now - 3600, 300_000, 300_000),
+    ] {
+        sqlx::query("INSERT INTO usage_buckets VALUES(?,?,?,'m',2,100,?,?)")
+            .bind(hour / 3600 * 3600)
+            .bind(kid)
+            .bind(aid)
+            .bind(billed / 2)
+            .bind(billed)
+            .execute(&t.app.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_keys SET billed_micro=? WHERE id=?")
+            .bind(lifetime)
+            .bind(kid)
+            .execute(&t.app.db)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip,status,\
+         upstream_micro,billed_micro,finished) VALUES('r1',?,?,?,'POST','/v1/chat/completions','llm','m','127.0.0.1',200,1000,1300,1)",
+    )
+    .bind(aid)
+    .bind(k2)
+    .bind(now)
+    .execute(&t.app.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE accounts SET contact='ops@example.com' WHERE id=?")
+        .bind(aid)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+
+    // Lifetime spend ranks the old key first, 30-day spend the new one.
+    let (_, v) = t.admin("GET", "keys?sort=spend&dir=desc", json!({})).await;
+    assert_eq!(v["keys"][0]["id"], k1);
+    assert_eq!(v["keys"][0]["billed_usd"], "1");
+    assert_eq!(v["keys"][0]["usage_30d_usd"], "0");
+    assert_eq!(v["keys"][0]["account_contact"], "ops@example.com");
+    let (_, v) = t.admin("GET", "keys?sort=usage&dir=desc", json!({})).await;
+    assert_eq!(v["keys"][0]["id"], k2);
+    assert_eq!(v["keys"][0]["usage_30d_usd"], "0.3");
+    let (_, v) = t
+        .admin("GET", &format!("keys?account={aid}"), json!({}))
+        .await;
+    assert_eq!(v["total"], 2);
+
+    let (_, v) = t
+        .admin("GET", "accounts?sort=spend&dir=desc", json!({}))
+        .await;
+    assert_eq!(v["accounts"][0]["id"], aid);
+    assert_eq!(v["accounts"][0]["billed_usd"], "1.3");
+    assert_eq!(v["accounts"][0]["usage_30d_usd"], "0.3");
+    assert_eq!(v["accounts"][0]["active_key_count"], 2);
+    assert_eq!(v["accounts"][1]["id"], other["account_id"]);
+    let (_, v) = t.admin("GET", &format!("accounts/{aid}"), json!({})).await;
+    assert_eq!(v["account"]["billed_usd"], "1.3");
+
+    // Request rows name their key and account for the operator.
+    let (_, v) = t
+        .admin("GET", &format!("requests?key={k2}"), json!({}))
+        .await;
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["requests"][0]["key_name"], "Batch jobs");
+    assert_eq!(v["requests"][0]["account_contact"], "ops@example.com");
+    assert_eq!(v["requests"][0]["upstream_usd"], "0.001");
+    let (_, v) = t.admin("GET", "usage", json!({})).await;
+    assert_eq!(v["series"][0]["upstream_cost_usd"], "0.15");
+
+    // Customers see billed amounts only.
+    let (_, v) = t
+        .call("GET", "/v1/account/requests", Some(token), json!({}))
+        .await;
+    assert_eq!(v["requests"][0]["key_name"], "Batch jobs");
+    assert_eq!(v["requests"][0]["billed_usd"], "0.0013");
+    assert!(v["requests"][0].get("upstream_usd").is_none(), "{v}");
+    let (_, v) = t
+        .call("GET", "/v1/account/usage", Some(token), json!({}))
+        .await;
+    assert_eq!(v["series"][0]["billed_cost_usd"], "0.3");
+    assert!(v["series"][0].get("upstream_cost_usd").is_none(), "{v}");
+
+    // A customer opens one of its keys, never another account's.
+    let (s, v) = t
+        .call("GET", &format!("/v1/keys/{k2}"), Some(token), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["key"]["billed_usd"], "0.3");
+    assert_eq!(v["usage"]["series"].as_array().unwrap().len(), 1);
+    let (s, _) = t
+        .call(
+            "GET",
+            &format!("/v1/keys/{}", other["id"].as_str().unwrap()),
+            Some(token),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, 404);
+
+    // Dashboard tokens, which cannot call /v1/models, still list the models.
+    let dashboard = first["dashboard_token"].as_str().unwrap();
+    let (s, v) = t
+        .call("GET", "/v1/account/models", Some(dashboard), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["object"], "list");
+    let (s, _) = t
+        .call("GET", "/v1/models", Some(dashboard), json!({}))
+        .await;
+    assert_eq!(s, 401);
+
+    // Payments filter by account.
+    for (id, account) in [("o1", aid), ("o2", other["account_id"].as_str().unwrap())] {
+        sqlx::query(
+            "INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,created_at) \
+             VALUES(?,?,'monthly','stripe',20000000,20000000,30,?)",
+        )
+        .bind(id)
+        .bind(account)
+        .bind(now)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    }
+    let (_, v) = t
+        .admin("GET", &format!("payments?account={aid}"), json!({}))
+        .await;
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["payments"][0]["id"], "o1");
+}
+
+/// The docs page is served by the dashboard shell.
+#[tokio::test]
+async fn docs_page_is_served() {
+    let t = Test::new().await;
+    for path in ["/docs", "/docs/"] {
+        let (s, _, body) = t.page(path).await;
+        assert_eq!(s, 200);
+        assert!(body.contains("/assets/app.js"));
+    }
+}

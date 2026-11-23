@@ -10,6 +10,7 @@ mod multipart;
 mod websocket;
 
 pub use inspect::Inspector;
+pub use models::list as model_list;
 pub use multipart::Multipart;
 
 use crate::{

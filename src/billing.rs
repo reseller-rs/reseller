@@ -141,7 +141,8 @@ pub async fn grant_snapshot(
     Ok(json!({"id": subscription, "plan_code": plan, "expires_at": expires}))
 }
 
-/// Account summary with balance, current subscription, and recent credit lots.
+/// Account summary with balance, lifetime billed spend, current subscription,
+/// and recent credit lots.
 pub async fn account(app: &App, aid: &str) -> Result<Value> {
     let mut conn = app.db.acquire().await?;
     let row = sqlx::query("SELECT * FROM accounts WHERE id=?")
@@ -150,6 +151,11 @@ pub async fn account(app: &App, aid: &str) -> Result<Value> {
         .await?
         .ok_or_else(|| Error::not_found("account_not_found", "Account not found"))?;
     let balance = db::balance(&mut conn, aid).await?;
+    let billed: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(billed_micro),0) FROM api_keys WHERE account_id=?")
+            .bind(aid)
+            .fetch_one(&mut *conn)
+            .await?;
     let credits: Vec<Value> =
         sqlx::query("SELECT * FROM credits WHERE account_id=? ORDER BY created_at DESC LIMIT 200")
             .bind(aid)
@@ -191,6 +197,7 @@ pub async fn account(app: &App, aid: &str) -> Result<Value> {
             "markup_pct": row.get::<Option<String>, _>("markup_pct"),
             "balance_usd": money::display(balance),
             "debt_usd": money::display(row.get("debt_micro")),
+            "billed_usd": money::display(billed),
             "created_at": row.get::<i64, _>("created_at"),
             "subscription": subscription,
         },

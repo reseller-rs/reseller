@@ -12,16 +12,28 @@ use sqlx::Row;
 const BUCKET_RETENTION_DAYS: i64 = 367;
 
 /// Platform-wide totals for the administrator overview.
+///
+/// Credit and debt are split by account status: suspended accounts cannot
+/// spend, so their unexpired credit is reported apart from the credit active
+/// customers can still draw on. `active_keys` counts keys that can call the
+/// proxy right now (active, unexpired, on an active account).
 pub async fn overview(app: &App) -> Result<Value> {
+    let now = now();
     let row = sqlx::query(
         "SELECT t.requests,t.tokens,t.upstream_micro,t.billed_micro,\
            (SELECT COUNT(*) FROM accounts) AS accounts,\
-           (SELECT COUNT(*) FROM api_keys WHERE status='active') AS active_keys,\
-           (SELECT COALESCE(SUM(remaining_micro),0) FROM credits \
-              WHERE expires_at IS NULL OR expires_at>?) AS outstanding_micro \
+           (SELECT COUNT(*) FROM accounts WHERE status='suspended') AS suspended_accounts,\
+           (SELECT COUNT(*) FROM api_keys k JOIN accounts a ON a.id=k.account_id \
+              WHERE k.status='active' AND a.status='active' \
+              AND (k.expires_at IS NULL OR k.expires_at>?1)) AS active_keys,\
+           (SELECT COALESCE(SUM(c.remaining_micro),0) FROM credits c JOIN accounts a ON a.id=c.account_id \
+              WHERE a.status='active' AND (c.expires_at IS NULL OR c.expires_at>?1)) AS outstanding_micro,\
+           (SELECT COALESCE(SUM(c.remaining_micro),0) FROM credits c JOIN accounts a ON a.id=c.account_id \
+              WHERE a.status='suspended' AND (c.expires_at IS NULL OR c.expires_at>?1)) AS suspended_micro,\
+           (SELECT COALESCE(SUM(debt_micro),0) FROM accounts) AS debt_micro \
          FROM totals t WHERE t.id=1",
     )
-    .bind(now())
+    .bind(now)
     .fetch_one(&app.db)
     .await?;
     let upstream: i64 = row.get("upstream_micro");
@@ -33,16 +45,29 @@ pub async fn overview(app: &App) -> Result<Value> {
         "billed_cost_usd": money::display(billed),
         "margin_usd": money::display(billed - upstream),
         "accounts": row.get::<i64, _>("accounts"),
+        "suspended_accounts": row.get::<i64, _>("suspended_accounts"),
         "active_keys": row.get::<i64, _>("active_keys"),
         "outstanding_usd": money::display(row.get("outstanding_micro")),
+        "suspended_credit_usd": money::display(row.get("suspended_micro")),
+        "debt_usd": money::display(row.get("debt_micro")),
     }))
+}
+
+/// Who reads a usage series. Customers see what they were billed, never the
+/// provider cost behind it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    Operator,
+    Customer,
 }
 
 /// Returns daily usage per model over the last `days`, clamped to 1 to 365.
 ///
-/// The result can be scoped to one account and/or one key.
+/// The result can be scoped to one account and/or one key. Only the
+/// [`Audience::Operator`] view carries `upstream_cost_usd`.
 pub async fn usage(
     app: &App,
+    audience: Audience,
     account: Option<&str>,
     key: Option<&str>,
     days: i64,
@@ -64,14 +89,17 @@ pub async fn usage(
     let series: Vec<Value> = rows
         .iter()
         .map(|r| {
-            json!({
+            let mut day = json!({
                 "day": r.get::<i64, _>("day"),
                 "model": r.get::<String, _>("model"),
                 "requests": r.get::<i64, _>("requests"),
                 "tokens": r.get::<i64, _>("tokens"),
-                "upstream_cost_usd": money::display(r.get("upstream_micro")),
                 "billed_cost_usd": money::display(r.get("billed_micro")),
-            })
+            });
+            if audience == Audience::Operator {
+                day["upstream_cost_usd"] = money::display(r.get("upstream_micro")).into();
+            }
+            day
         })
         .collect();
     Ok(json!({"series": series}))

@@ -8,9 +8,9 @@ use crate::{
     error::{Error, Result},
     identity,
     keys::{self, Requester},
-    payments,
+    payments, proxy,
     security::{self, pow},
-    stats,
+    stats::{self, Audience},
 };
 use axum::{body::Body, http::Request};
 use serde_json::{Value, json};
@@ -55,6 +55,13 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["keys"], "POST") => {
             keys::create(app, Requester::Customer(&me), ip, &object(req).await?).await
         }
+        (["keys", kid], "GET") => {
+            let row = owned_key(app, kid, Some(account)).await?;
+            Ok(json!({
+                "key": keys::key_json(&row),
+                "usage": stats::usage(app, Audience::Customer, Some(account), Some(kid), 30).await?,
+            }))
+        }
         (["keys", kid, "rotate"], "POST") => keys::rotate(app, kid, Some(account)).await,
         (["account"], "GET") => {
             let mut overview = billing::account(app, account).await?;
@@ -83,9 +90,13 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             if let Some(key) = key {
                 owned_key(app, key, Some(account)).await?;
             }
-            stats::usage(app, Some(account), key, number(&q, "days", 30, 1, 365)).await
+            let days = number(&q, "days", 30, 1, 365);
+            stats::usage(app, Audience::Customer, Some(account), key, days).await
         }
         (["account", "requests"], "GET") => requests(app, Some(account), &q, false).await,
+        // The model list of the signed-in key, also for dashboard tokens,
+        // which cannot call `/v1/models`.
+        (["account", "models"], "GET") => Ok(proxy::model_list(&*app.config().await, Some(&me))),
         _ => Err(Error::not_found("not_found", "Unknown customer endpoint")),
     }
 }

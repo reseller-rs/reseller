@@ -46,6 +46,8 @@ pub async fn router(app: App) -> Router {
         .route("/", get(page))
         .route("/workspace", get(page))
         .route("/workspace/", get(page))
+        .route("/docs", get(page))
+        .route("/docs/", get(page))
         .route("/admin", get(page))
         .route("/admin/", get(page))
         .route(
@@ -162,6 +164,7 @@ fn discovery() -> serde_json::Value {
             "stt": ["/v1/audio/transcriptions", "/v1/audio/translations"],
             "image": ["/v1/images", "/v1/images/generations", "/v1/images/edits", "/v1/images/variations"],
         },
+        "docs": "/docs/",
         "workspace": "/workspace/",
         "admin": "/admin/",
     })
