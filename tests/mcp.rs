@@ -185,7 +185,19 @@ impl Test {
         self.key["account_id"].as_str().unwrap()
     }
 
+    /// `/mcp` always needs a credential. Protocol tests pass `None` to mean "any
+    /// valid caller": the dashboard token is sent. Use [`Test::anonymous`] to send nothing.
     async fn raw(&self, token: Option<&str>, headers: &[(&str, &str)], body: Value) -> Rpc {
+        self.send(Some(token.unwrap_or(self.dashboard())), headers, body)
+            .await
+    }
+
+    /// A request with no credential at all.
+    async fn anonymous(&self, headers: &[(&str, &str)], body: Value) -> Rpc {
+        self.send(None, headers, body).await
+    }
+
+    async fn send(&self, token: Option<&str>, headers: &[(&str, &str)], body: Value) -> Rpc {
         let mut request = reqwest::Client::new()
             .post(format!("{}/mcp", self.url()))
             .json(&body);
@@ -369,7 +381,7 @@ async fn discover_advertises_versions_capabilities_and_identity() {
     assert!(result["ttlMs"].as_u64().unwrap() > 0);
     assert_server_info(result);
     let instructions = result["instructions"].as_str().unwrap();
-    for needle in ["Bearer", "create_account", "generate_text", "$0.10"] {
+    for needle in ["Bearer", "OAuth", "generate_text", "$0.10"] {
         assert!(instructions.contains(needle), "{needle}: {instructions}");
     }
     // Discovery and the tool list are identical for every caller.
@@ -803,6 +815,7 @@ async fn http_semantics() {
     );
     let r = client
         .post(format!("{}/mcp", t.url()))
+        .bearer_auth(t.dashboard())
         .body("{nope")
         .send()
         .await
@@ -905,10 +918,12 @@ async fn tools_list_is_complete_and_well_formed() {
             "list_plans",
             "redeem_code",
             "start_checkout",
-            "signup_challenge",
-            "create_account",
         ] {
             assert!(names.contains(&expected), "{expected} missing");
+        }
+        // Signup happens in the browser (OAuth consent page), not through tools.
+        for gone in ["signup_challenge", "create_account"] {
+            assert!(!names.contains(&gone), "{gone} should be gone");
         }
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
@@ -927,8 +942,7 @@ async fn tools_list_is_complete_and_well_formed() {
         };
         assert_eq!(auth("generate_text"), "api_key");
         assert_eq!(auth("account_overview"), "api_key_or_dashboard_token");
-        assert_eq!(auth("list_plans"), "none");
-        assert_eq!(auth("signup_challenge"), "none");
+        assert_eq!(auth("list_plans"), "api_key_or_dashboard_token");
         if let Some(previous) = &seen {
             assert_eq!(previous, &tools);
         }
@@ -962,15 +976,17 @@ async fn tools_need_the_right_credential() {
     let seen = Arc::default();
     t.mock(llm, recording(Arc::clone(&seen), chat_reply)).await;
 
-    let anonymous = t.tool(None, "generate_text", json!({"prompt":"hi"})).await;
-    assert_eq!(error_code(&anonymous), "authentication_required");
-    let text = text_of(&anonymous);
-    assert!(
-        text.contains("create_account") && text.contains("Bearer"),
-        "{text}"
-    );
-    let anonymous = t.tool(None, "account_overview", json!({})).await;
-    assert_eq!(error_code(&anonymous), "authentication_required");
+    // There is no anonymous mode: a request without a credential is a 401.
+    let call = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+        "params":{"name":"generate_text","arguments":{"prompt":"hi"},"_meta":meta()}});
+    let headers = [
+        ("mcp-protocol-version", MODERN),
+        ("mcp-method", "tools/call"),
+        ("mcp-name", "generate_text"),
+    ];
+    let anonymous = t.anonymous(&headers, call).await;
+    assert_eq!(anonymous.status, 401);
+    assert!(anonymous.headers.contains_key("www-authenticate"));
 
     let dashboard = t
         .tool(Some(t.dashboard()), "generate_text", json!({"prompt":"hi"}))
@@ -981,13 +997,13 @@ async fn tools_need_the_right_credential() {
     assert!(t.requests().await.is_empty());
     assert!(seen.lock().unwrap().is_empty());
 
-    // Account tools take either credential. Public tools need none.
+    // Account tools and list_plans take either credential.
     for token in [t.dashboard(), t.api_key()] {
         let r = t.tool(Some(token), "account_overview", json!({})).await;
         assert_eq!(r["isError"], false);
         assert_eq!(r["structuredContent"]["account"]["balance_usd"], "0.1");
     }
-    let plans = t.tool(None, "list_plans", json!({})).await;
+    let plans = t.tool(Some(t.dashboard()), "list_plans", json!({})).await;
     assert_eq!(plans["isError"], false);
     assert!(plans["structuredContent"]["plans"].is_array());
 }
@@ -1517,7 +1533,7 @@ async fn account_tools_reuse_the_http_handlers() {
     let text = text_of(&keys);
     assert!(!text.contains(t.api_key()) && !text.contains(t.dashboard()));
 
-    let plans = t.tool(None, "list_plans", json!({})).await;
+    let plans = t.tool(dash, "list_plans", json!({})).await;
     assert!(plans["structuredContent"]["payment_methods"].is_array());
     let invalid = t
         .tool(dash, "redeem_code", json!({"code":"nonsense"}))
@@ -1577,7 +1593,7 @@ async fn key_tools_follow_the_http_guards() {
     let child_id = child["id"].as_str().unwrap();
 
     let definitions = t.rpc(None, "tools/list", json!({})).await;
-    for name in ["create_key", "rotate_key", "create_account"] {
+    for name in ["create_key", "rotate_key"] {
         let tool = definitions.body["result"]["tools"]
             .as_array()
             .unwrap()
@@ -1638,48 +1654,43 @@ async fn solve_challenge(challenge: &Value) -> String {
     pow::encode(&challenge, pow::solve(&challenge).unwrap())
 }
 
+/// Signup is a browser/HTTP flow now: the MCP tools for it are gone, and the
+/// credentials HTTP signup returns work over MCP.
 #[tokio::test]
-async fn account_creation_through_tools() {
+async fn account_creation_is_over_http_and_not_a_tool() {
     let mut t = Test::with(|c| c.signup.pow_max_number = 300).await;
     t.mock(llm, recording(Arc::default(), chat_reply)).await;
-    let challenge = t.tool(None, "signup_challenge", json!({})).await;
-    assert_eq!(challenge["isError"], false, "{challenge}");
-    let challenge = challenge["structuredContent"].clone();
-    assert_eq!(challenge["algorithm"], "SHA-256");
+    for gone in ["signup_challenge", "create_account"] {
+        let r = t
+            .rpc(
+                Some(t.dashboard()),
+                "tools/call",
+                json!({"name":gone,"arguments":{}}),
+            )
+            .await;
+        assert_eq!(r.body["error"]["code"], -32602, "{gone}");
+    }
+    let http = reqwest::Client::new();
+    let challenge: Value = http
+        .get(format!("{}/v1/signup/challenge", t.url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(challenge["maxnumber"], 300);
-
-    let missing = t.tool(None, "create_account", json!({})).await;
-    assert_eq!(error_code(&missing), "pow_required");
     let altcha = solve_challenge(&challenge).await;
-    let created = t
-        .tool(
-            None,
-            "create_account",
-            json!({"altcha":altcha,"name":"agent","contact":"a@b.c"}),
-        )
-        .await;
-    assert_eq!(created["isError"], false, "{created}");
-    let account = &created["structuredContent"];
-    let key = account["key"].as_str().unwrap().to_owned();
-    assert!(
-        account["dashboard_token"]
-            .as_str()
-            .unwrap()
-            .starts_with("dash_")
-    );
-    assert!(account["notice"].as_str().unwrap().contains("only once"));
-
-    // Solutions are single use.
-    let replay = t
-        .tool(None, "create_account", json!({"altcha":altcha}))
-        .await;
-    assert_eq!(error_code(&replay), "pow_replayed");
-    let invalid = t
-        .tool(None, "create_account", json!({"altcha":"e30="}))
-        .await;
-    assert_eq!(error_code(&invalid), "pow_invalid");
-
-    // The new credentials work over MCP and HTTP.
+    let created: Value = http
+        .post(format!("{}/v1/signup", t.url()))
+        .json(&json!({"altcha":altcha,"name":"agent"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key = created["key"].as_str().unwrap().to_owned();
     let overview = t.tool(Some(&key), "account_overview", json!({})).await;
     assert_eq!(
         overview["structuredContent"]["account"]["balance_usd"],
@@ -1689,18 +1700,6 @@ async fn account_creation_through_tools() {
         .tool(Some(&key), "generate_text", json!({"prompt":"hi"}))
         .await;
     assert_eq!(text["isError"], false, "{text}");
-    let http = reqwest::Client::new()
-        .get(format!("{}/v1/account", t.url()))
-        .bearer_auth(account["dashboard_token"].as_str().unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(http.status(), 200);
-
-    // Signup guards apply: disabled signup is a tool error.
-    t.app.config_mut().await.signup.enabled = false;
-    let disabled = t.tool(None, "signup_challenge", json!({})).await;
-    assert_eq!(error_code(&disabled), "signup_disabled");
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,7 +1769,8 @@ async fn bridge_discovers_and_requires_per_request_meta() {
         "reseller-mcp-bridge"
     );
     let instructions = result["instructions"].as_str().unwrap();
-    assert!(instructions.contains("signup") && instructions.contains("Server instructions"));
+    // Signed out the server is not asked (it answers signed-in callers only).
+    assert!(instructions.contains("signup") && !instructions.contains("Server instructions"));
     // Modern requests need their `_meta`. Nothing is served before a handshake.
     for method in ["server/discover", "tools/list"] {
         assert_eq!(b.send_raw(method, json!({})).await["error"]["code"], -32602);
@@ -1823,7 +1823,8 @@ async fn bridge_legacy_initialize_still_works() {
     assert_eq!(result["serverInfo"]["name"], "reseller-mcp-bridge");
     assert!(result.get("resultType").is_none());
     let instructions = result["instructions"].as_str().unwrap();
-    assert!(instructions.contains("signup") && instructions.contains("Server instructions"));
+    // Signed out the server is not asked (it answers signed-in callers only).
+    assert!(instructions.contains("signup") && !instructions.contains("Server instructions"));
     assert_eq!(b.send_raw("ping", json!({})).await["result"], json!({}));
     // Legacy results have the 2025-11-25 shape.
     let list = b.send_raw("tools/list", json!({})).await;
@@ -1837,7 +1838,11 @@ async fn bridge_legacy_initialize_still_works() {
     assert_eq!(who["result"]["structuredContent"]["signed_in"], false);
     assert!(who["result"].get("resultType").is_none());
     // A remote tool result is stripped of the modern fields as well.
-    let plans = b
+    let signed = local(&t, Some(t.dashboard()));
+    signed
+        .send_raw("initialize", json!({"protocolVersion": LEGACY}))
+        .await;
+    let plans = signed
         .send_raw("tools/call", json!({"name":"list_plans","arguments":{}}))
         .await;
     assert_eq!(plans["result"]["isError"], false);
@@ -1892,8 +1897,9 @@ async fn bridge_lists_local_tools_and_hides_remote_signup() {
     let batch = b.bridge.handle(json!([])).await.unwrap();
     assert_eq!(batch["error"]["code"], -32600);
 
-    // Public tools work before signing in. Everything else asks to sign in.
-    assert_eq!(b.tool("list_plans", json!({})).await["isError"], false);
+    // Every remote tool needs a credential (the server has no anonymous mode).
+    let r = b.tool("list_plans", json!({})).await;
+    assert_eq!(error_code(&r), "not_signed_in");
     let r = b.tool("generate_text", json!({"prompt":"x"})).await;
     assert_eq!(error_code(&r), "not_signed_in");
     let who = b.tool("whoami", json!({})).await;
@@ -2152,7 +2158,8 @@ async fn bridge_reports_unreachable_and_rejecting_servers() {
     };
     assert!(Bridge::new(options("http://example.com")).is_err());
     assert!(Bridge::new(options("https://example.com/path")).is_err());
-    // Nothing listens here: tools/list still offers the local tools.
+    // Nothing listens here: tools/list still offers the local tools and, signed
+    // out, the server's tool catalogue, which this crate carries itself.
     let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", free.local_addr().unwrap());
     drop(free);
@@ -2161,8 +2168,18 @@ async fn bridge_reports_unreachable_and_rejecting_servers() {
         .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":meta()}}))
         .await
         .unwrap();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
-    // A partial list must not be cached.
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5 + 15);
+    // Signed in, an unreachable server leaves the list unconfirmed: not cacheable.
+    let signed_in = Bridge::new(Options {
+        token: Some(format!("sk-res-{}", "0".repeat(64))),
+        ..options(&url)
+    })
+    .unwrap();
+    let list = signed_in
+        .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":meta()}}))
+        .await
+        .unwrap();
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5 + 15);
     assert_eq!(list["result"]["ttlMs"], 0);
     let reply = bridge
         .handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"signup","arguments":{},"_meta":meta()}}))

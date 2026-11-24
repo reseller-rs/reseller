@@ -72,6 +72,58 @@ impl Limits {
         Ok(())
     }
 
+    /// Fails unless these limits are no looser than `parent`'s.
+    ///
+    /// Every limit the parent sets must also be set here, with a count no
+    /// higher and a window no shorter (a shorter window would allow more over
+    /// the parent's window). The allowlist must be a subset of a non-empty
+    /// parent allowlist.
+    pub fn within(&self, parent: &Limits) -> Result<()> {
+        let loose = |what: &str| {
+            Err(Error::bad(format!(
+                "Limit {what} is looser than the parent key's. A child key cannot exceed its parent"
+            ))
+            .with_code("limits_exceed_parent"))
+        };
+        match (parent.rpm, self.rpm) {
+            (Some(p), c) if c.is_none_or(|c| c > p) => return loose("rpm"),
+            _ => {}
+        }
+        match (parent.max_children, self.max_children) {
+            (Some(p), c) if c.is_none_or(|c| c > p) => return loose("max_children"),
+            _ => {}
+        }
+        for (name, p, c) in [
+            ("requests", &parent.requests, &self.requests),
+            ("tokens", &parent.tokens, &self.tokens),
+        ] {
+            if let Some(p) = p
+                && c.as_ref()
+                    .is_none_or(|c| c.max > p.max || c.window_hours < p.window_hours)
+            {
+                return loose(name);
+            }
+        }
+        if let Some(p) = &parent.spend
+            && match &self.spend {
+                Some(c) => {
+                    money::usd(&c.max_usd)? > money::usd(&p.max_usd)?
+                        || c.window_hours < p.window_hours
+                }
+                None => true,
+            }
+        {
+            return loose("spend");
+        }
+        if !parent.allowed_models.is_empty()
+            && (self.allowed_models.is_empty()
+                || self.allowed_models.iter().any(|m| !parent.allows(m)))
+        {
+            return loose("allowed_models");
+        }
+        Ok(())
+    }
+
     /// Whether `model` passes the allowlist.
     pub fn allows(&self, model: &str) -> bool {
         self.allowed_models.is_empty()
@@ -194,6 +246,9 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
         }
         _ => None,
     };
+    if let Requester::Customer(identity) = requester {
+        identity.require_active()?;
+    }
     let mut tx = db::write(&app.db).await?;
     let (identity, existing) = match requester {
         Requester::Customer(identity) => (Some(identity), Some(identity.account_id.clone())),
@@ -251,7 +306,12 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
             limits.validate()?;
             limits
         }
-        _ => config.keys.default_limits.clone(),
+        // A child key starts with its parent's limits. Limits the customer
+        // sends replace single fields and must not be looser than the parent's.
+        _ => match identity {
+            Some(parent) => child_limits(parent, body.get("limits"))?,
+            None => config.keys.default_limits.clone(),
+        },
     };
     let out = mint(
         &mut tx,
@@ -268,6 +328,25 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     .await?;
     tx.commit().await?;
     Ok(out)
+}
+
+/// Limits for a customer-created child key: the parent's, with any fields in
+/// `requested` replaced, and never looser than the parent's.
+fn child_limits(parent: &Identity, requested: Option<&Value>) -> Result<Limits> {
+    let Some(requested) = requested.filter(|v| !v.is_null()) else {
+        return Ok(parent.limits.clone());
+    };
+    let Some(requested) = requested.as_object() else {
+        return Err(Error::bad("limits must be an object"));
+    };
+    let mut merged = serde_json::to_value(&parent.limits)?;
+    for (field, value) in requested {
+        merged[field] = value.clone();
+    }
+    let limits: Limits = serde_json::from_value(merged)?;
+    limits.validate()?;
+    limits.within(&parent.limits)?;
+    Ok(limits)
 }
 
 /// Marks a proof-of-work solution as used, so replays fail.
@@ -521,12 +600,27 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
         },
     )
     .await?;
+    let new_id = out["id"].as_str().unwrap_or_default();
     sqlx::query("UPDATE api_keys SET markup_pct=?,expires_at=? WHERE id=?")
         .bind(row.get::<Option<String>, _>("markup_pct"))
         .bind(row.get::<Option<i64>, _>("expires_at"))
-        .bind(out["id"].as_str())
+        .bind(new_id)
         .execute(&mut *tx)
         .await?;
+    // Usage windows follow the key: move its history and connected apps to the
+    // new id so rotating neither resets limits nor disconnects apps.
+    for sql in [
+        "UPDATE usage_buckets SET key_id=? WHERE key_id=?",
+        "UPDATE requests SET key_id=? WHERE key_id=?",
+        "UPDATE oauth_grants SET key_id=? WHERE key_id=?",
+        "UPDATE oauth_codes SET key_id=? WHERE key_id=?",
+    ] {
+        sqlx::query(sql)
+            .bind(new_id)
+            .bind(kid)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(out)
 }

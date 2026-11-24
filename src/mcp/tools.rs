@@ -1,4 +1,4 @@
-//! Tool catalogue, argument validation, and the account/signup tools.
+//! Tool catalogue, argument validation, and the account tools.
 use super::{Ctx, Output, ToolError, generate, internal};
 use crate::{api, config::Config, error::Error, payments};
 use axum::{body::Body, http::Method};
@@ -7,8 +7,6 @@ use serde_json::{Map, Value, json};
 /// Credential a tool needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Auth {
-    /// Anonymous callers may use it.
-    None,
     /// API key or dashboard token.
     Any,
     /// API key only (the tool spends credit through the proxy).
@@ -18,14 +16,13 @@ enum Auth {
 impl Auth {
     fn label(self) -> &'static str {
         match self {
-            Self::None => "none",
             Self::Any => "api_key_or_dashboard_token",
             Self::Key => "api_key",
         }
     }
 }
 
-const TOOLS: [(&str, Auth); 17] = [
+const TOOLS: [(&str, Auth); 15] = [
     ("generate_text", Auth::Key),
     ("generate_speech", Auth::Key),
     ("transcribe_audio", Auth::Key),
@@ -38,11 +35,9 @@ const TOOLS: [(&str, Auth); 17] = [
     ("create_key", Auth::Any),
     ("rotate_key", Auth::Any),
     ("block_key", Auth::Any),
-    ("list_plans", Auth::None),
+    ("list_plans", Auth::Any),
     ("redeem_code", Auth::Any),
     ("start_checkout", Auth::Any),
-    ("signup_challenge", Auth::None),
-    ("create_account", Auth::None),
 ];
 
 fn auth_of(name: &str) -> Option<Auth> {
@@ -173,7 +168,6 @@ fn hints(read_only: bool, destructive: bool, idempotent: bool, open_world: bool)
 fn tool(name: &str, title: &str, description: &str, schema: Value, annotations: Value) -> Value {
     let auth = auth_of(name).expect("tool is registered");
     let requirement = match auth {
-        Auth::None => "No authentication needed.",
         Auth::Any => "Requires authentication: an API key or a dashboard token.",
         Auth::Key => "Requires an API key (sk-res-...). Dashboard tokens are rejected.",
     };
@@ -402,34 +396,6 @@ pub(super) fn definitions() -> Vec<Value> {
             ),
             hints(false, false, false, true),
         ),
-        tool(
-            "signup_challenge",
-            "Get signup challenge",
-            "Step 1 of creating an account: returns an ALTCHA proof-of-work challenge \
-             ({algorithm, challenge, maxnumber, salt, signature}). Find the integer `number` in 0..=maxnumber \
-             with hex(sha256(salt + decimal(number))) == challenge, then pass base64(JSON{algorithm, challenge, number, salt, signature}) \
-             as `altcha` to create_account. Each solution is single use and expires. \
-             Returns {\"required\": false} when no proof is needed.",
-            object(json!({}), &[]),
-            hints(true, false, false, false),
-        ),
-        tool(
-            "create_account",
-            "Create account",
-            &format!(
-                "Step 2 of creating an account: submit the solved challenge to receive a new account with \
-                 free trial credit, an API key and a dashboard token. {SECRET_WARNING}"
-            ),
-            object(
-                json!({
-                    "altcha": {"type": "string", "maxLength": 2048, "description": "Base64 solution payload. Omit when the challenge says it is not required."},
-                    "name": {"type": "string", "maxLength": 80},
-                    "contact": {"type": "string", "maxLength": 200, "description": "Optional contact such as an email address."},
-                }),
-                &[],
-            ),
-            hints(false, false, false, false),
-        ),
     ]
 }
 
@@ -447,16 +413,15 @@ pub(super) fn instructions(config: &Config) -> String {
     format!(
         "{name} is a metered AI API (text, speech, transcription, images) at {base}.\n\
          \n\
-         Authentication: send `Authorization: Bearer <token>`. An API key (sk-res-...) can use every tool; \
-         a dashboard token (dash_...) can manage the account but cannot generate content. \
-         Without a token, call signup_challenge, solve the proof of work, then create_account \
-         (or use the local `reseller mcp` bridge, which does this for you). Credentials are shown once: store them securely.\n\
+         Authentication: every request needs `Authorization: Bearer <token>`. MCP clients that support OAuth \
+         connect by URL and sign in through the browser. Otherwise use an API key (sk-res-...), which can use every \
+         tool, or a dashboard token (dash_...), which can manage the account but cannot generate content. \
+         Credentials are shown once: store them securely.\n\
          \n\
          Tools:\n\
          - API key: generate_text, generate_speech, transcribe_audio, generate_image, list_models.\n\
          - Any credential: account_overview, usage_summary, list_requests, list_keys, create_key, rotate_key, \
-         block_key, redeem_code, start_checkout.\n\
-         - Public: list_plans, signup_challenge, create_account.\n\
+         block_key, list_plans, redeem_code, start_checkout.\n\
          \n\
          Pricing: usage is billed in USD against prepaid credit. Every generation result reports its \
          billed cost, tokens and the remaining balance. {signup} Use list_plans and start_checkout to add credit; \
@@ -467,12 +432,17 @@ pub(super) fn instructions(config: &Config) -> String {
 
 fn require(ctx: &Ctx, name: &str) -> Result<(), ToolError> {
     match (auth_of(name), &ctx.identity) {
+        // The operator (administrator token) may generate and read public data.
+        (Some(Auth::Key), None) if ctx.operator => Ok(()),
+        (Some(Auth::Any), None) if ctx.operator && name == "list_plans" => Ok(()),
+        (Some(Auth::Any | Auth::Key), None) if ctx.operator => Err(ToolError::new(
+            "admin_token_not_customer",
+            "The administrator token has no customer account, so this tool is unavailable. \
+             Manage accounts through /admin, or connect with a customer API key.",
+        )),
         (Some(Auth::Any | Auth::Key), None) => Err(ToolError::new(
             "authentication_required",
-            "This tool needs credentials. To create an account call signup_challenge, solve the \
-             proof of work and call create_account. To use an existing account, configure the MCP \
-             client to send `Authorization: Bearer <API key or dashboard token>`. \
-             (The local `reseller mcp` bridge offers signup and login tools.)",
+            "This tool needs credentials: send `Authorization: Bearer <API key or dashboard token>`.",
         )),
         (Some(Auth::Key), Some(identity)) if identity.dashboard => Err(ToolError::new(
             "dashboard_token_not_allowed",
@@ -510,7 +480,7 @@ async fn customer(
         ),
         None => (None, Body::empty()),
     };
-    let req = internal(method, uri, ctx.bearer.as_deref(), content_type, body)?;
+    let req = internal(method, uri, ctx, content_type, body)?;
     Ok(api::customer(&ctx.app, req, &ctx.ip).await?)
 }
 
@@ -605,20 +575,6 @@ async fn account(ctx: &Ctx, name: &str, arguments: &Value) -> Result<Output, Too
                 body["method"] = method.into();
             }
             customer(ctx, Method::POST, "/v1/account/checkout", Some(&body)).await?
-        }
-        "signup_challenge" => {
-            Args::new(arguments, &[])?;
-            customer(ctx, Method::GET, "/v1/signup/challenge", None).await?
-        }
-        "create_account" => {
-            let a = Args::new(arguments, &["altcha", "name", "contact"])?;
-            let mut body = json!({});
-            for (key, max) in [("altcha", 2048), ("name", 80), ("contact", 200)] {
-                if let Some(v) = a.str(key, 0, max)? {
-                    body[key] = v.into();
-                }
-            }
-            customer(ctx, Method::POST, "/v1/signup", Some(&body)).await?
         }
         other => {
             return Err(ToolError::new(

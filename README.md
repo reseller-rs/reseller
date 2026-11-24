@@ -12,7 +12,7 @@ reseller is a self-hosted, OpenAI-compatible API reseller written in Rust. Point
 
 - **Proxy:** streaming JSON, SSE, audio, multipart uploads, and WebSocket (realtime) transport.
 - **Upstreams:** separate LLM, TTS, STT, and image upstreams with per-upstream timeouts, headers, model policies, and fallback chains.
-- **MCP for AI agents:** a remote `POST /mcp` endpoint and a local `reseller mcp` stdio bridge. Agents can sign up, generate content, and manage their account. See [docs/mcp.md](docs/mcp.md).
+- **MCP for AI agents:** a remote `POST /mcp` endpoint with OAuth 2.1 sign-in (add the URL in Claude, ChatGPT, Cursor, or VS Code) and a local `reseller mcp` stdio bridge. Agents can generate content and manage their account. See [docs/mcp.md](docs/mcp.md).
 - **Signup and abuse control:** proof-of-work signup (ALTCHA-compatible), per-IP and per-account limits, rotation limits, and an auth-failure lockout.
 - **Accounts and keys:** self-service accounts, shared balances, key rotation, model allowlists, and per-key usage limits.
 - **Accurate metering:** integer micro-USD accounting with cached-input, per-character, per-image, per-second, and flat per-request prices. Expiring credit lots, markup overrides, and debt tracking are included.
@@ -149,6 +149,7 @@ If no `ADMIN_TOKEN` is supplied, the first start generates one and prints it. Sa
 
 - Run `reseller token` to print a random administrator token.
 - Run `reseller reset-admin` to replace the stored token. Stop the server first.
+- The token also works as an operator credential: `curl https://HOST/v1/models -H "Authorization: Bearer $ADMIN_TOKEN"` and the same on `/v1/*` and `/mcp` generation tools. It is accepted even when `require_key` is on, sees the full model catalog, is never billed, has no limits, and its requests are logged without an account. On `/v1/keys`, `/v1/account`, and the account tools it is answered with `403 admin_token_not_customer` (use `/admin/api`), which does not count as an authentication failure.
 
 ## Configuration
 
@@ -174,9 +175,9 @@ Defaults appear in parentheses.
 | `[llm]`, `[tts]`, `[stt]`, `[image]` | Upstreams: `base_url` (`https://api.openai.com/v1`), `api_key`, `model`, `fallbacks` (max 10), `timeout_seconds` (0 uses `upstream_timeout_seconds`, max 3600), and `headers` (max 20; credential and framing headers are refused). `[tts]` also has `voice`. |
 | `[prices.<model>]` | Upstream prices in USD (see [Pricing and metering](#pricing-and-metering)) |
 | `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.10"`), `free_credit_expiry_days` (30; 0 means never; max 3650), `ip_limit_per_month` (2; 0 turns it off), `cooldown_seconds` (30; 0 turns it off), `global_hourly_limit` (100; 0 turns it off), `pow_max_number` (100000; 0 disables proof of work; max 10000000), `pow_ttl_seconds` (300; 10 to 86400), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
-| `[keys]` | `max_per_account` (10 active keys; must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours; 0 turns it off), `rotate_cooldown_seconds` (300; 0 turns it off; max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new key) |
+| `[keys]` | `max_per_account` (10 active keys; must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours; 0 turns it off), `rotate_cooldown_seconds` (300; 0 turns it off; max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new account's first key; child keys inherit their parent's limits) |
 | `[rate_limits]` | `management_per_minute` (120), `auth_failures_per_hour` (20), `max_concurrent_requests` (8), `checkouts_per_hour` (10), `redeem_failures_per_hour` (10), `challenges_per_minute` (10). 0 disables each one. |
-| `[mcp]` | `enabled` (`true`) and `max_media_bytes` (16 MiB; 1 byte to 256 MiB), the largest audio or image returned inline |
+| `[mcp]` | `enabled` (`true`), `oauth` (`true`; OAuth sign-in for `/mcp`, see [MCP](#mcp)), and `max_media_bytes` (16 MiB; 1 byte to 256 MiB), the largest audio or image returned inline |
 | `[stripe]` | `secret_key`, `webhook_secret` |
 | `[[models]]` | Public model catalog: `id`, `upstream`, `aliases`, `enabled`, `name`, `description`, `owned_by`, `created`, `context_length`, `input_modalities`, `output_modalities`, `show_pricing` |
 | `[payroof]` | Crypto payments: `deposits` (`true`), `deposit_eta_minutes` (`5`), `project`, `token`, `webhook_secret`, `stablecoins`, `native_coins`, `chains`, rate source, `quote_ttl_minutes`, and `underpayment_tolerance_pct` (`0.5`) |
@@ -316,7 +317,7 @@ Every key has two secrets. Each is shown only once.
 
 Both secrets are stored only as HMAC-SHA256 digests keyed with `key_pepper`. Redeem codes are hashed the same way.
 
-Send credentials as `Authorization: Bearer ...` or `x-api-key`. Tokens in query strings are not supported. The administrator token goes in `x-admin-token` or the bearer header, and it is compared in constant time. Blocked API keys keep workspace access. Revoked credentials do not.
+Send credentials as `Authorization: Bearer ...` or `x-api-key`. Tokens in query strings are not supported. The administrator token goes in `x-admin-token` or the bearer header, and it is compared in constant time. Blocked or expired API keys keep read-only workspace access (and their dashboard tokens too): they cannot create, rotate, or edit keys (`403 key_inactive`). Revoked credentials get no access.
 
 ### Signup with proof of work
 
@@ -360,7 +361,7 @@ Every `429` response carries a `Retry-After` header in seconds. The header is 60
 
 | Limit | Scope | Config | 429 `code` |
 |---|---|---|---|
-| Management requests (`/v1/signup`, `/v1/keys`, `/v1/account`, `/v1/plans`, `/mcp`, `/admin/api/*`) | Client IP, per minute | `rate_limits.management_per_minute` | `management_rate_limited` |
+| Management requests (`/v1/signup`, `/v1/keys`, `/v1/account`, `/v1/plans`, `/mcp`, `/oauth/*`, `/admin/api/*`) | Client IP, per minute | `rate_limits.management_per_minute` | `management_rate_limited` |
 | Signup challenges | Client IP, per minute | `rate_limits.challenges_per_minute` | `challenge_rate_limited` |
 | Invalid credentials | Client IP, per hour | `rate_limits.auth_failures_per_hour` | `too_many_auth_failures` |
 | Invalid redeem codes | Account, per hour | `rate_limits.redeem_failures_per_hour` | `redeem_rate_limited` |
@@ -391,7 +392,8 @@ When the budget is exhausted, **every request from that IP that carries a creden
 - `POST /mcp` refuses requests whose `Origin` header does not match `public_url`, `cors_origin`, or any origin when `cors_origin = "*"`. The response is `403 origin_not_allowed`. Requests without an `Origin` header (CLI and desktop agents) are accepted. This blocks DNS-rebinding attacks through a browser.
 - Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and a strict `Content-Security-Policy` with `frame-ancestors 'none'`.
 - `Strict-Transport-Security` is added when `public_url` starts with `https://`.
-- When `cors_origin` is set (`*` or one exact origin), CORS allows the `Authorization`, `Content-Type`, `x-api-key`, `x-admin-token`, `mcp-protocol-version`, `mcp-method`, and `mcp-name` headers.
+- `/.well-known/*`, `/oauth/token`, `/oauth/register`, and `/oauth/revoke` answer CORS for any origin (`Access-Control-Allow-Origin: *`, no credentials) whatever `cors_origin` is. The consent API (`/oauth/api/authorize`) accepts same-origin requests only. OAuth codes and tokens are stored as HMAC digests, and registration is limited to 30 clients per IP per hour.
+- When `cors_origin` is set (`*` or one exact origin), `WWW-Authenticate` is exposed on `/mcp`, and CORS allows the `Authorization`, `Content-Type`, `x-api-key`, `x-admin-token`, `mcp-protocol-version`, `mcp-method`, and `mcp-name` headers.
 - The customer UI uses session storage, removes login tokens from URL fragments, and never embeds credentials in page HTML.
 - Logs contain request metadata only. They never contain prompts, bodies, audio, auth headers, or query strings.
 
@@ -417,11 +419,11 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `GET` | `/v1/plans` | Public | Active plans and `payment_methods` |
 | `GET` | `/v1/signup/challenge` | Public | Proof-of-work challenge |
 | `POST` | `/v1/signup` | Public | Body `{"name"?, "contact"?, "altcha"}`. Creates an account and its first key. |
-| `POST` | `/v1/keys` | Key or token (not anonymous) | Body `{"name"}`. Creates a child key on the caller's account. Returns `401` when anonymous. |
+| `POST` | `/v1/keys` | Key or token (not anonymous) | Body `{"name", "limits"?}`. Creates a child key on the caller's account. The child inherits the caller's limits. Limits you send replace single fields and must be no looser than the parent's (a lower or equal count, a window at least as long, a subset of its model allowlist), otherwise `400 limits_exceed_parent`. Blocked or expired callers get `403 key_inactive`. Returns `401` when anonymous. |
 | `GET` | `/v1/keys?q=&status=&sort=&dir=` | Any | List the caller's keys with `billed_usd` (lifetime spend) and `usage_30d_usd`. `sort` is `created`, `name`, `status`, `last_used`, `spend`, or `usage`. |
 | `GET` | `/v1/keys/:id` | Any | One of the caller's keys with its 30-day usage series |
 | `PATCH` | `/v1/keys/:id` | Any | Rename or block (`{"name"?, "status":"blocked"}`). Customers cannot reactivate a key. |
-| `POST` | `/v1/keys/:id/rotate` | Any | Replace the key and keep its limits, pricing, and expiry. The old key is blocked. |
+| `POST` | `/v1/keys/:id/rotate` | Any | Replace the key and keep its limits, pricing, expiry, usage windows (so rotating does not reset limits), and connected OAuth apps. The old key is blocked. |
 | `GET` | `/v1/models` | Key | Model catalog, local and not metered |
 | `GET` | `/v1/models/:id` | Key | One catalog entry, or `404 model_not_found` |
 | `GET` | `/v1/account/models` | Any | The `/v1/models` list for the caller's key, also with a dashboard token |
@@ -432,6 +434,8 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `POST` | `/v1/account/checkout` | Any | Body `{"plan_code":"monthly","method":"stripe"}` or `"crypto"` |
 | `GET` | `/v1/account/payments` | Any | The caller's orders (latest 50) |
 | `GET` | `/v1/account/payments/:id` | Any | One order, with crypto quotes and transfers |
+| `GET` | `/v1/account/apps` | Any | Connected OAuth apps: `{"apps":[{id, client_id, client_name, client_uri, logo_uri, key_id, key_prefix, key_name, scope, created_at, last_used_at}]}` |
+| `DELETE` | `/v1/account/apps/:id` | Any | Revokes a connected app and its tokens. Returns `{"revoked":true,"id"}`. |
 | `POST` | `/webhooks/stripe` | Stripe signature | Raw Stripe event |
 | `POST` | `/webhooks/payroof` | Payroof signature | Payroof transfer event |
 
@@ -559,7 +563,7 @@ JSON requests apply model and voice policies. Chat requests stream usage reporti
 
 ### Proxy errors
 
-Failures use the OpenAI shape `{ "error": { "message": "...", "type": "...", "param": null, "code": "..." } }`. The `type` is `invalid_request_error` (400, 401, 404, 405, 409, 413, 415), `permission_error` (403), `insufficient_quota` (code `insufficient_quota`), `rate_limit_error` (other 429), or `server_error` (5xx). `param` is `"model"` for model errors. Non-JSON upstream error bodies become an error with code `upstream_error`.
+Failures use the OpenAI shape `{ "error": { "message": "...", "type": "...", "param": null, "code": "..." } }`. The `type` is `invalid_request_error` (400, 401, 404, 405, 409, 413, 415), `permission_error` (403), `insufficient_quota` (code `insufficient_quota`), `rate_limit_error` (other 429), or `server_error` (5xx). `param` is `"model"` for model errors. Upstream errors are rebuilt in this shape: a JSON error keeps only its `message`, `type`, `param`, and `code` (other fields such as upstream user ids or provider metadata are dropped), a non-JSON body gets a generic message with code `upstream_error`, and an upstream 401, 402, or 403 (a problem with the operator's upstream account, not the caller's key) becomes `502 upstream_error`.
 
 | Status | Codes |
 |---|---|
@@ -576,13 +580,15 @@ Failures use the OpenAI shape `{ "error": { "message": "...", "type": "...", "pa
 
 Agents can use the service through the Model Context Protocol. There are two ways to connect.
 
-- **Remote endpoint:** a stateless Streamable HTTP endpoint at `POST /mcp`. It supports protocol `2026-07-28` (current) and the legacy `2025-11-25` handshake. An `initialize` that asks for an older revision is answered with `2025-11-25`; requests that name an older revision in `MCP-Protocol-Version` are refused.
+- **Remote endpoint:** a stateless Streamable HTTP endpoint at `POST /mcp`. It supports protocol `2026-07-28` (current) and the legacy `2025-11-25` handshake. An `initialize` that asks for an older revision is answered with `2025-11-25`; requests that name an older revision in `MCP-Protocol-Version` are refused. Every request needs a credential: without one the answer is `401` with a `WWW-Authenticate` header that points OAuth clients to `/.well-known/oauth-protected-resource/mcp`.
 - **Local bridge:** `reseller mcp` runs next to the agent. It keeps credentials and the signup proof of work on the agent's machine.
+
+**Connect with OAuth.** Add `https://HOST/mcp` as a remote MCP server in Claude, ChatGPT, Cursor, or VS Code. The client registers itself (RFC 7591), and a browser page on this server asks you to sign in with an API key or dashboard token (or create an account) and to allow the connection. It uses PKCE `S256`, resource indicators, one-hour access tokens (`mcp_at_...`), and rotating refresh tokens that expire after 90 days idle. Tokens are bound to your key, stop working when the key does, and are valid on `/mcp` only. Customers revoke apps in the dashboard. `[mcp].oauth = false` turns this off. **Static bearer alternative:** send an API key or dashboard token as `Authorization: Bearer ...`. The administrator token works for generation tools only.
 
 Generation tools go through the same admission, limits, metering, and model policy as the HTTP API. Set `[mcp].enabled = false` to turn the endpoint off. It then answers `404 mcp_disabled`.
 
 ```sh
-# Remote, with an existing key
+# Remote with a static key (clients without OAuth support). OAuth clients just need the URL.
 claude mcp add --transport http reseller https://api.example.com/mcp \
   --header "Authorization: Bearer sk-res-..."
 

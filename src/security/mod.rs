@@ -91,3 +91,17 @@ pub async fn record_redeem_failure(app: &App, account: &str, ip: &str) {
         .record(&format!("redeem:{account}"), limit, HOUR);
     record_auth_failure(app, ip).await;
 }
+
+/// Charges one OAuth client registration to `ip`, or fails with a retry hint.
+/// Registration is public, so each address gets a small hourly budget.
+pub async fn oauth_register(app: &App, ip: &str) -> Result<()> {
+    app.limiter
+        .acquire(&format!("oauthreg:{ip}"), 30, HOUR)
+        .map_err(|wait| {
+            Error::too_many(
+                "oauth_registration_rate_limited",
+                "Too many client registrations. Try again later",
+            )
+            .retry_after(wait)
+        })
+}

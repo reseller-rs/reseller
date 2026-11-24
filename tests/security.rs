@@ -339,7 +339,9 @@ async fn customers_cannot_rotate_young_keys_but_administrators_can() {
     assert_eq!(admin.status, 200, "{}", admin.body);
 
     // Once old enough the customer may rotate. The new key starts a new cooldown.
+    // The admin-rotated key was blocked, so its credentials cannot manage keys.
     let new_id = admin.body["id"].as_str().unwrap();
+    let new_token = admin.body["dashboard_token"].as_str();
     sqlx::query("UPDATE api_keys SET created_at=created_at-400")
         .execute(&t.app.db)
         .await
@@ -348,16 +350,17 @@ async fn customers_cannot_rotate_young_keys_but_administrators_can() {
         .call(
             "POST",
             &format!("/v1/keys/{new_id}/rotate"),
-            token,
+            new_token,
             json!({}),
         )
         .await;
     assert_eq!(ok.status, 200, "{}", ok.body);
+    let ok_token = ok.body["dashboard_token"].as_str();
     let again = t
         .call(
             "POST",
             &format!("/v1/keys/{}/rotate", ok.body["id"].as_str().unwrap()),
-            token,
+            ok_token,
             json!({}),
         )
         .await;

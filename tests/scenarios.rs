@@ -936,7 +936,7 @@ async fn block_and_reactivate_cycle_is_enforced_across_accounts() {
         )
         .await
         .0,
-        400
+        403
     );
     assert_eq!(
         t.admin("PATCH", &format!("keys/{kid}"), json!({"status":"active"}))
@@ -1575,8 +1575,8 @@ async fn admin_token_rotation_only_affects_admin_access() {
     );
 }
 
-/// Default limits are snapshotted when keys are minted. Existing keys keep the
-/// limits they were created with.
+/// Default limits are snapshotted when accounts are opened. Existing keys keep
+/// the limits they were created with, and child keys inherit their parent's.
 #[tokio::test]
 async fn default_limits_apply_to_new_keys_only() {
     let t = Test::new().await;
@@ -1589,21 +1589,23 @@ async fn default_limits_apply_to_new_keys_only() {
         )
         .await;
     assert_eq!(s, 200);
-    let (s, fresh) = t
-        .customer(
-            "POST",
-            "keys",
-            old["dashboard_token"].as_str().unwrap(),
-            json!({"name":"fresh"}),
-        )
-        .await;
-    assert_eq!(s, 200, "{fresh}");
+    let fresh = t.key().await;
     assert_eq!(t.identity(&fresh).await.limits.rpm, Some(3));
     assert_eq!(
         t.identity(&fresh).await.limits.allowed_models,
         vec!["configured".to_owned()]
     );
     assert_eq!(t.identity(&old).await.limits.rpm, None);
+    let (s, child) = t
+        .customer(
+            "POST",
+            "keys",
+            old["dashboard_token"].as_str().unwrap(),
+            json!({"name":"child"}),
+        )
+        .await;
+    assert_eq!(s, 200, "{child}");
+    assert_eq!(t.identity(&child).await.limits.rpm, None);
     let task = mock_llm(&t, "0", 0).await;
     assert_eq!(
         t.customer(
@@ -1738,7 +1740,7 @@ async fn workspace_panel_full_journey() {
         .customer(
             "POST",
             &format!("keys/{}/rotate", second["id"].as_str().unwrap()),
-            &dash,
+            second["dashboard_token"].as_str().unwrap(),
             json!({}),
         )
         .await;
@@ -1801,8 +1803,21 @@ async fn workspace_panel_full_journey() {
         .0,
         401
     );
-    let (s, recovery) = t
+    // A blocked credential reads its workspace but cannot mint keys, so an
+    // administrator issues the replacement.
+    let (s, v) = t
         .customer("POST", "keys", &dash, json!({"name":"recovery"}))
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("key_inactive"))
+    );
+    let (s, recovery) = t
+        .admin(
+            "POST",
+            &format!("accounts/{aid}/keys"),
+            json!({"name":"recovery"}),
+        )
         .await;
     assert_eq!(s, 200, "{recovery}");
     assert_eq!(
@@ -2284,8 +2299,8 @@ async fn only_active_keys_can_be_rotated() {
     let (s, v) = t
         .customer("POST", &format!("keys/{kid}/rotate"), token, json!({}))
         .await;
-    assert_eq!(s, 400, "{v}");
-    assert_eq!(v["error"]["code"], "key_not_active");
+    assert_eq!(s, 403, "{v}");
+    assert_eq!(v["error"]["code"], "key_inactive");
     assert_eq!(
         t.admin("POST", &format!("keys/{kid}/rotate"), json!({}))
             .await
@@ -2308,7 +2323,7 @@ async fn only_active_keys_can_be_rotated() {
         t.customer("POST", &format!("keys/{kid}/rotate"), token, json!({}))
             .await
             .0,
-        400
+        403
     );
 }
 
@@ -2600,11 +2615,11 @@ async fn admin_cannot_grant_inactive_plan() {
     );
 }
 
-/// A blocked (for example, rotated-away) credential can still open the
-/// workspace and mint brand-new active keys. Only revocation removes that
-/// power. This documents the containment boundary of "block" vs "revoke".
+/// A blocked (for example, rotated-away) credential can still read the
+/// workspace but can no longer mint, rotate, or edit keys. Revocation removes
+/// workspace access too.
 #[tokio::test]
-async fn blocked_credential_can_still_mint_replacement_keys() {
+async fn blocked_credential_reads_the_workspace_but_cannot_mint_keys() {
     let t = Test::new().await;
     let k = t.key().await;
     let kid = k["id"].as_str().unwrap().to_owned();
@@ -2626,27 +2641,57 @@ async fn blocked_credential_can_still_mint_replacement_keys() {
         )
         .await;
     assert_eq!(s, 401, "{v}");
-    // The blocked credential still creates a fresh, usable key.
-    let (s, rescue) = t
-        .customer(
+    for token in [
+        k["key"].as_str().unwrap(),
+        k["dashboard_token"].as_str().unwrap(),
+    ] {
+        let attempts = [
+            ("POST", "keys".to_owned()),
+            ("POST", format!("keys/{kid}/rotate")),
+            ("PATCH", format!("keys/{kid}")),
+        ];
+        for (method, path) in attempts {
+            let (s, v) = t.customer(method, &path, token, json!({"name":"x"})).await;
+            assert_eq!(
+                (s, v["error"]["code"].as_str()),
+                (403, Some("key_inactive"))
+            );
+        }
+        assert_eq!(t.customer("GET", "keys", token, json!({})).await.0, 200);
+    }
+    // An expired key is treated the same way.
+    let (s, live) = t
+        .admin(
             "POST",
-            "keys",
-            k["key"].as_str().unwrap(),
-            json!({"name":"rescue"}),
+            &format!("accounts/{}/keys", k["account_id"].as_str().unwrap()),
+            json!({"name":"live"}),
         )
         .await;
-    assert_eq!(s, 200, "{rescue}");
+    assert_eq!(s, 200, "{live}");
     let task = mock_llm(&t, "0", 0).await;
+    sqlx::query("UPDATE api_keys SET expires_at=? WHERE id=?")
+        .bind(db::now() - 5)
+        .bind(live["id"].as_str().unwrap())
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let (s, v) = t
+        .customer("POST", "keys", live["key"].as_str().unwrap(), json!({}))
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("key_inactive"))
+    );
     assert_eq!(
         t.customer(
             "POST",
             "chat/completions",
-            rescue["key"].as_str().unwrap(),
+            live["key"].as_str().unwrap(),
             json!({"messages":[]})
         )
         .await
         .0,
-        200
+        401
     );
     // Revocation is the operation that actually cuts the credential off.
     let (s, _) = t
@@ -3291,4 +3336,186 @@ async fn request_history_totals_filters_and_scoping() {
         .await;
     assert_eq!(s, 200, "{v}");
     assert!(!v["groups"].as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: child limits, mislabelled bodies, and rotation continuity
+// ---------------------------------------------------------------------------
+
+/// A child key starts with its parent's limits and may only tighten them.
+#[tokio::test]
+async fn child_keys_inherit_and_cannot_loosen_parent_limits() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    let kid = k["id"].as_str().unwrap();
+    let (s, _) = t
+        .admin(
+            "PATCH",
+            &format!("keys/{kid}"),
+            json!({"limits":{"rpm":5,"requests":{"max":100,"window_hours":24},
+                "spend":{"max_usd":"2","window_hours":24},
+                "allowed_models":["configured","other"]}}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let token = k["key"].as_str().unwrap();
+    let create =
+        |limits: Value| t.customer("POST", "keys", token, json!({"name":"c","limits":limits}));
+
+    let (s, inherited) = t.customer("POST", "keys", token, json!({"name":"c"})).await;
+    assert_eq!(s, 200, "{inherited}");
+    assert_eq!(
+        t.identity(&inherited).await.limits,
+        t.identity(&k).await.limits
+    );
+
+    for bad in [
+        json!({"rpm":6}),
+        json!({"rpm":null}),
+        json!({"requests":{"max":101,"window_hours":24}}),
+        json!({"requests":{"max":10,"window_hours":1}}),
+        json!({"requests":null}),
+        json!({"spend":{"max_usd":"3","window_hours":24}}),
+        json!({"allowed_models":[]}),
+        json!({"allowed_models":["configured","third"]}),
+        json!({"rpm":50}),
+    ] {
+        let (s, v) = create(bad.clone()).await;
+        assert_eq!(s, 400, "{bad}: {v}");
+        assert_eq!(v["error"]["code"], "limits_exceed_parent", "{bad}");
+    }
+    let (s, v) = create(json!("nope")).await;
+    assert_eq!(s, 400, "{v}");
+
+    let (s, tighter) = create(json!({
+        "rpm":2,
+        "requests":{"max":10,"window_hours":48},
+        "spend":{"max_usd":"1","window_hours":24},
+        "allowed_models":["CONFIGURED"]
+    }))
+    .await;
+    assert_eq!(s, 200, "{tighter}");
+    let got = t.identity(&tighter).await.limits;
+    assert_eq!(got.rpm, Some(2));
+    assert_eq!(got.allowed_models, vec!["CONFIGURED".to_owned()]);
+}
+
+/// A JSON body labelled text/plain gets the same allowlist and billing as
+/// application/json, and a body that is not JSON is refused.
+#[tokio::test]
+async fn mislabelled_json_bodies_are_checked_and_billed() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    let aid = k["account_id"].as_str().unwrap();
+    let task = mock_llm(&t, "0.01", 30).await;
+    let (s, _) = t
+        .admin(
+            "PATCH",
+            &format!("keys/{}", k["id"].as_str().unwrap()),
+            json!({"limits":{"allowed_models":["configured"]}}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let post = |body: &'static str, content_type: Option<&'static str>| {
+        let router = reseller::web::router(t.app.clone());
+        let key = k["key"].as_str().unwrap().to_owned();
+        async move {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {key}"));
+            if let Some(ct) = content_type {
+                req = req.header("content-type", ct);
+            }
+            let mut req = req.body(Body::from(body)).unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:9000".parse::<SocketAddr>().unwrap()));
+            let r = router.await.oneshot(req).await.unwrap();
+            let status = r.status().as_u16();
+            let b = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
+            )
+        }
+    };
+    for ct in [Some("text/plain"), Some("application/octet-stream"), None] {
+        let (s, v) = post(r#"{"model":"other","messages":[]}"#, ct).await;
+        assert_eq!(s, 404, "{ct:?}: {v}");
+        assert_eq!(v["error"]["code"], "model_not_found");
+        let (s, v) = post("not json", ct).await;
+        assert_eq!(s, 400, "{ct:?}: {v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+    let before = balance(&t, aid).await;
+    let (s, v) = post(
+        r#"{"model":"configured","messages":[]}"#,
+        Some("text/plain"),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_ne!(balance(&t, aid).await, before);
+    task.abort();
+}
+
+/// Rotation keeps the usage window (limits are not reset) and connected apps.
+#[tokio::test]
+async fn rotation_carries_usage_windows_and_oauth_grants() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    let kid = k["id"].as_str().unwrap().to_owned();
+    let task = mock_llm(&t, "0", 5).await;
+    let (s, _) = t
+        .admin(
+            "PATCH",
+            &format!("keys/{kid}"),
+            json!({"limits":{"requests":{"max":2,"window_hours":24}}}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    for _ in 0..2 {
+        let (s, v) = t
+            .customer(
+                "POST",
+                "chat/completions",
+                k["key"].as_str().unwrap(),
+                json!({"messages":[]}),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+    }
+    sqlx::query("INSERT INTO oauth_clients(id,name,redirect_uris,created_at,created_ip) VALUES('c','app','[]',1,'x')")
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO oauth_grants(id,client_id,key_id,scope,resource,created_at) VALUES('g','c',?,'mcp','r',1)")
+        .bind(&kid)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let (s, new) = t
+        .customer(
+            "POST",
+            &format!("keys/{kid}/rotate"),
+            k["dashboard_token"].as_str().unwrap(),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, 200, "{new}");
+    let (s, v) = t
+        .customer(
+            "POST",
+            "chat/completions",
+            new["key"].as_str().unwrap(),
+            json!({"messages":[]}),
+        )
+        .await;
+    assert_eq!(s, 429, "{v}");
+    assert_eq!(v["error"]["code"], "request_limit_exceeded");
+    let bound: String = sqlx::query_scalar("SELECT key_id FROM oauth_grants WHERE id='g'")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(bound, new["id"].as_str().unwrap());
+    task.abort();
 }

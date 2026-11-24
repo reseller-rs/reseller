@@ -8,7 +8,7 @@ use crate::{
     error::{Error, Result},
     identity,
     keys::{self, Requester},
-    payments, proxy,
+    oauth, payments, proxy,
     security::{self, pow},
     stats::{self, Audience},
 };
@@ -45,11 +45,12 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         _ => {}
     }
 
-    let me = identity::required(app, req.headers()).await?;
+    let me = identity::required_request(app, req.headers(), req.extensions()).await?;
     let account = me.account_id.as_str();
     match (path.as_slice(), method.as_str()) {
         (["keys"], "GET") => list_keys(app, Some(account), &q).await,
         (["keys", kid], "PATCH") => {
+            me.require_active()?;
             patch_key(app, kid, Editor::Customer(account), &object(req).await?).await
         }
         (["keys"], "POST") => {
@@ -62,7 +63,10 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
                 "usage": stats::usage(app, Audience::Customer, Some(account), Some(kid), 30).await?,
             }))
         }
-        (["keys", kid, "rotate"], "POST") => keys::rotate(app, kid, Some(account)).await,
+        (["keys", kid, "rotate"], "POST") => {
+            me.require_active()?;
+            keys::rotate(app, kid, Some(account)).await
+        }
         (["account"], "GET") => {
             let mut overview = billing::account(app, account).await?;
             overview["top_up"] =
@@ -93,6 +97,9 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             let days = number(&q, "days", 30, 1, 365);
             stats::usage(app, Audience::Customer, Some(account), key, days).await
         }
+        // OAuth grants (connected MCP apps) on the account's keys.
+        (["account", "apps"], "GET") => oauth::list_apps(app, account).await,
+        (["account", "apps", id], "DELETE") => oauth::revoke_app(app, account, id).await,
         (["account", "requests"], "GET") => requests(app, Some(account), &q, false).await,
         // The model list of the signed-in key, also for dashboard tokens,
         // which cannot call `/v1/models`.

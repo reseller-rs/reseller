@@ -21,8 +21,23 @@
       <div class="actions" id="header-actions"></div>
     </div>
   </header>
-  <main id="main" tabindex="-1">
-    <div class="loading"><span class="spinner" aria-hidden="true"></span>Loading your workspace...</div>
+  <main id="main" tabindex="-1" aria-busy="true">
+    <!-- Neutral placeholder until the app paints a route-shaped one -->
+    <div class="skeleton" role="status"><span class="sr-only">Loading...</span><div class="skeleton-body" aria-hidden="true">
+      <div class="page-head"><div><span class="skel skel-title"></span><span class="skel skel-line md"></span></div></div>
+      <div class="stats">
+        <div class="card metric-card"><span class="skel skel-line sm"></span><span class="skel skel-metric"></span><span class="skel skel-line md"></span></div>
+        <div class="card metric-card"><span class="skel skel-line sm"></span><span class="skel skel-metric"></span><span class="skel skel-line md"></span></div>
+        <div class="card metric-card"><span class="skel skel-line sm"></span><span class="skel skel-metric"></span><span class="skel skel-line md"></span></div>
+        <div class="card metric-card"><span class="skel skel-line sm"></span><span class="skel skel-metric"></span><span class="skel skel-line md"></span></div>
+      </div>
+      <div class="skel-table">
+        <div class="skel-row head"><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span></div>
+        <div class="skel-row"><span class="skel skel-line md"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span></div>
+        <div class="skel-row"><span class="skel skel-line md"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span></div>
+        <div class="skel-row"><span class="skel skel-line md"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span><span class="skel skel-line sm"></span></div>
+      </div>
+    </div></div>
     <noscript><div class="card error">This workspace needs JavaScript. API endpoints remain available at <code>/v1</code>.</div></noscript>
   </main>
   <div id="notice" popover="manual" role="status" aria-live="polite" aria-atomic="true"></div>

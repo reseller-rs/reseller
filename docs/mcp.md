@@ -1,6 +1,6 @@
 # MCP: reseller for AI agents
 
-reseller speaks the [Model Context Protocol](https://modelcontextprotocol.io). An agent can create an account, generate text, speech, transcripts, and images, check its balance, and top up. A human does not need to write any HTTP client code.
+reseller speaks the [Model Context Protocol](https://modelcontextprotocol.io). An agent can generate text, speech, transcripts, and images, check its balance, and top up. A human does not need to write any HTTP client code.
 
 Every generation is billed to the account like a normal `/v1` request. Both connection methods use the same admission, limits, metering, model policy, and prices as the HTTP API.
 
@@ -8,6 +8,7 @@ Every generation is billed to the account like a normal `/v1` request. Both conn
 
 - [Choose a connection](#choose-a-connection)
 - [Remote endpoint](#remote-endpoint)
+- [Connect with OAuth](#connect-with-oauth)
 - [Local stdio bridge](#local-stdio-bridge-reseller-mcp)
 - [Tools](#tools)
 - [Signup and login walkthrough](#signup-and-login-walkthrough)
@@ -19,10 +20,10 @@ Every generation is billed to the account like a normal `/v1` request. Both conn
 | | Remote endpoint | Local stdio bridge |
 |---|---|---|
 | Command | None. The client calls `POST /mcp`. | `reseller mcp --url https://HOST` |
-| Credentials | You configure an `Authorization: Bearer` header. | Stored in a private local file. The agent never needs to see them. |
-| Signup | The agent must solve the proof of work itself and handle the secrets. | Built in. The `signup` tool solves the proof of work locally. |
+| Credentials | OAuth sign-in in the browser, or an `Authorization: Bearer` header you configure. | Stored in a private local file. The agent never needs to see them. |
+| Signup | In the browser, on the OAuth consent page. | Built in. The `signup` tool solves the proof of work locally. |
 | Generated media | Returned inline only | Returned inline and saved to disk |
-| Best for | An existing key, hosted or remote agents | Desktop and coding agents (the more secure option) |
+| Best for | Claude, ChatGPT, Cursor, VS Code, and hosted agents | Desktop and coding agents (the more secure option) |
 
 ## Remote endpoint
 
@@ -38,10 +39,28 @@ Every generation is billed to the account like a normal `/v1` request. Both conn
 |---|---|
 | `Authorization: Bearer sk-res-...` (API key) | All tools |
 | `Authorization: Bearer dash_...` (dashboard token) | Account tools only (see [Tools](#tools)) |
+| `Authorization: Bearer mcp_at_...` (OAuth access token) | All tools, like the API key it was authorized with. Valid on `/mcp` only. |
 | `x-api-key` header | Same as the bearer API key |
-| None | `server/discover`, `tools/list`, and the public tools (`list_plans`, `signup_challenge`, `create_account`) |
+| `Authorization: Bearer <administrator token>` | Operator: `generate_text`, `generate_speech`, `transcribe_audio`, `generate_image`, `list_models`, and `list_plans`. Nothing is billed, and requests are logged without an account. Account tools return the tool error `admin_token_not_customer`. Use `/admin` to manage accounts. |
+| None | Refused. There is no anonymous mode. |
 
-Without a credential, other tools return the tool error `authentication_required`.
+A request without a credential gets `401` with `WWW-Authenticate: Bearer resource_metadata="https://HOST/.well-known/oauth-protected-resource/mcp", scope="mcp"`, which tells an OAuth-capable client where to sign in. A rejected credential gets the same challenge plus `error="invalid_token"`. With `[mcp].oauth = false` the challenge has no `resource_metadata`.
+
+### Connect with OAuth
+
+Add `https://HOST/mcp` as a remote MCP server in Claude, ChatGPT, Cursor, or VS Code. No header or key is needed. The client discovers the authorization server, registers itself, and opens a browser page on this server. There you sign in with an API key or dashboard token, or create a new account, then allow or deny the connection. The client receives a one-hour access token and a refresh token (valid 90 days idle, rotated on each use). It refreshes silently.
+
+- The grant is bound to the key you signed in with. Tokens stop working as soon as that key is blocked, revoked, or expired, or the account is suspended. Customers list and revoke connected apps in the dashboard (`GET /v1/account/apps`, `DELETE /v1/account/apps/{id}`).
+- OAuth access tokens are accepted on `/mcp` only, never on `/v1/*` or the customer routes.
+- Standards: authorization code flow with PKCE `S256`, dynamic public-client registration (RFC 7591), authorization server metadata (RFC 8414), protected resource metadata (RFC 9728), resource indicators (RFC 8707), revocation (RFC 7009). Metadata lives at `/.well-known/oauth-protected-resource[/mcp]` and `/.well-known/oauth-authorization-server`. The only scope is `mcp`.
+- Redirect URIs may be `https`, `http` on `localhost`, `127.0.0.1`, or `[::1]`, or a private-use scheme such as `cursor://` and `vscode://`. Clients that cannot use OAuth send a static bearer token instead:
+
+```sh
+claude mcp add --transport http reseller https://HOST/mcp \
+  --header "Authorization: Bearer sk-res-..."
+```
+
+Set `[mcp].oauth = false` to turn the OAuth endpoints off. Static bearer tokens keep working.
 
 ### Protocol versions
 
@@ -221,7 +240,7 @@ The tool result gains a text line such as `Saved audio to <path>`.
 
 ### Bridge-only tools
 
-The bridge adds these local tools. It hides the remote `signup_challenge` and `create_account` tools, which `signup` replaces.
+The bridge adds these local tools. The remote server answers signed-in callers only, so before signup the bridge lists its own tools plus the server's tool catalogue, and calls fail with `not_signed_in` until `signup` or `login`.
 
 | Tool | Inputs | Result and effects |
 |---|---|---|
@@ -237,7 +256,6 @@ Authentication levels:
 
 | Level | Accepted credential |
 |---|---|
-| **none** | Public. No credential needed. |
 | **any** | API key or dashboard token |
 | **key** | API key only. A dashboard token gets `dashboard_token_not_allowed`. |
 
@@ -259,19 +277,19 @@ The content of a `generate_*` or `transcribe_audio` result is the result only, s
 | `create_key` | any | `name` (1 to 80 characters) | New key `{id, key, key_prefix, dashboard_token, ...}`, shown once | Creates a child key. Subject to `account_key_limit`, `key_creation_daily_limit`, `creation_rate_limited`, `ip_key_limit`, `creation_cooldown`, and `child_key_limit`. |
 | `rotate_key` | any | `key_id` | New credentials, shown once | **Blocks the old key.** Limited by `rotate_cooldown`, the daily budget, and the global hourly cap. |
 | `block_key` | any | `key_id` | Updated key | Blocks a key. Customers cannot unblock it. |
-| `list_plans` | none | None | Plans and enabled payment methods | Read-only |
+| `list_plans` | any | None | Plans and enabled payment methods | Read-only |
 | `redeem_code` | any | `code` | New balance or subscription | Consumes a single-use code. Returns `invalid_code` on failure. Rate limited by `redeem_rate_limited`. |
 | `start_checkout` | any | `plan` (plan code), `method?` (`stripe` or `crypto`) | Payment URL (card), or crypto payment instructions | Creates a pending order (rate limited by `checkout_rate_limited`). Credit arrives only after the payment is confirmed. |
-| `signup_challenge` | none | None | ALTCHA challenge `{algorithm, challenge, maxnumber, salt, signature}`, or `{"required": false}` | Rate limited by `challenge_rate_limited` |
-| `create_account` | none | `altcha?` (base64 solution, up to 2048 characters), `name?` (up to 80), `contact?` (up to 200) | New account: key, dashboard token, and limits, shown once | Creates an account with free trial credit. Subject to the signup guards. |
 
 Every tool rejects unknown arguments with `invalid_arguments`.
 
-The results of `create_account`, `create_key`, and `rotate_key` contain secrets.
+The results of `create_key` and `rotate_key` contain secrets.
 
-Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) and a `_meta["reseller/auth"]` entry. That entry is `none`, `api_key_or_dashboard_token`, or `api_key`.
+Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) and a `_meta["reseller/auth"]` entry. That entry is `api_key_or_dashboard_token` or `api_key`.
 
 ## Signup and login walkthrough
+
+Signing up through MCP tools is gone: with OAuth, signup happens on the browser consent page, and the bridge's `signup` tool uses `/v1/signup` directly.
 
 ### With the bridge (recommended)
 
@@ -281,16 +299,11 @@ Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempoten
 4. When credit runs out (`insufficient_quota`), the agent calls `list_plans` and `start_checkout`. Alternatively, the user redeems a code with `redeem_code`.
 5. To use an existing account, either set `RESELLER_TOKEN` before starting the bridge, or call `login`. Supply the credentials outside the transcript where possible.
 
-### With the remote endpoint and no credential
+### With the remote endpoint
 
-1. The agent calls `signup_challenge`. If the result is `{"required": false}`, skip to step 3.
-2. Find the integer `number` in `0..=maxnumber` such that `hex(sha256(salt + decimal(number))) == challenge`. Then base64-encode the JSON `{algorithm, challenge, number, salt, signature}`. Each solution is single use, and it expires after `signup.pow_ttl_seconds` (default 300 seconds).
-3. The agent calls `create_account` with `altcha`, and optionally `name` and `contact`. The result returns `key`, `dashboard_token`, `dashboard_url`, and `limits`.
-4. These secrets are shown **once**, and they now appear in the transcript. Store them securely, then configure the client with `Authorization: Bearer <key>`.
-
-Because this exposes secrets to the model provider, prefer the bridge for first-time signup.
-
-Self-service signup can be disabled. Then the response is `403 signup_disabled`, or `create_account` fails with that code. In that case, ask the operator for a key.
+1. Add `https://HOST/mcp` to the client. It opens the consent page in the browser.
+2. On the page, sign in with an existing key, or create an account (the page solves the proof of work). Self-service signup can be disabled (`403 signup_disabled`). In that case, ask the operator for a key.
+3. Allow the connection. The client now works with the account, and the trial credit applies.
 
 ## Error reference
 
@@ -333,14 +346,16 @@ A tool error has `isError: true`. The text reads `<message> (error code: <code>)
 | Code | Meaning and action |
 |---|---|
 | `invalid_arguments` | Bad or unknown arguments. Fix the call. |
-| `authentication_required` | No credential. Sign up or log in. |
+| `authentication_required` | No credential reached the tool. Reconnect with OAuth or send a bearer token. |
+| `admin_token_not_customer` | The administrator token has no customer account. Use `/admin`, or connect with a customer key. |
+| `invalid_token` (HTTP 401) | The OAuth access token is invalid, expired, or revoked. The client refreshes or signs in again. |
 | `dashboard_token_not_allowed` | The tool needs an API key. Use `create_key`, or use the API key. |
 | `invalid_api_key`, `key_revoked`, `key_blocked`, `key_expired`, `account_suspended` | Credential problems. Rotate or replace the key, or contact the operator. |
 | `insufficient_quota` (429) | Out of credit. Use `list_plans` and `start_checkout`, or `redeem_code`. |
 | `model_not_found` (404) | The model is unknown or the key's allowlist excludes it. Omit `model`, or use `list_models`. |
 | `rate_limit_exceeded`, `request_limit_exceeded`, `token_limit_exceeded`, `spend_limit_exceeded`, `concurrency_limit_exceeded` | Wait `retry_after_seconds` when it is given. |
 | `creation_cooldown`, `ip_key_limit`, and other key or signup guards | Wait, then retry. See the README rate-limit table. |
-| `pow_required`, `pow_invalid`, `pow_replayed` | The signup proof of work is missing, wrong or expired, or already used. Fetch a new challenge. |
+| `pow_required`, `pow_invalid`, `pow_replayed` | The signup proof of work is missing, wrong or expired, or already used (bridge `signup`). Fetch a new challenge. |
 | `upstream_error` | The provider returned a non-2xx response. The message includes its status, detail, and request ID. |
 | `invalid_upstream_response` | The provider's reply was not usable (invalid JSON, or no audio or images) |
 | `response_too_large`, `media_too_large` | Output or input exceeds `mcp.max_media_bytes`. The request may still have been billed. Check `list_requests`. |
@@ -361,7 +376,7 @@ A tool error has `isError: true`. The text reads `<message> (error code: <code>)
 
 ## Security notes
 
-- **Secrets are shown once.** `create_account`, `create_key`, and `rotate_key` return secrets that cannot be retrieved later. The bridge's `reveal_credentials` returns the stored secrets again on request.
+- **Secrets are shown once.** `create_key` and `rotate_key` return secrets that cannot be retrieved later. The bridge's `reveal_credentials` returns the stored secrets again on request.
 - **Bridge masking.** The bridge masks credentials for `signup`, `login`, and rotation of the stored key. A `create_key` call, or a rotation of a different key through the bridge, still returns the new secrets in the transcript. Store them right away.
 - **Never paste a dashboard token into a shared transcript, issue, or chat.** It manages the account (rotate, block, buy plans, redeem codes), even though it cannot call the proxy. Treat `sk-res-` keys the same way, because they spend your credit.
 - **Prefer environment variables or the credential file.** Avoid inline tokens in command lines and in committed config files.

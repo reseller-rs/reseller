@@ -164,6 +164,7 @@ mod tests {
             account_id: "a".into(),
             dashboard: false,
             prefix: "sk-res-ab".into(),
+            active: true,
             limits: Limits {
                 allowed_models: allowed.iter().map(|m| (*m).to_owned()).collect(),
                 ..Limits::default()

@@ -20,6 +20,7 @@ use crate::{
     config::Config,
     error::{Error, Result},
     identity::{self, Identity, Scope},
+    oauth,
 };
 use axum::{
     Json,
@@ -70,7 +71,13 @@ pub(crate) struct Ctx {
     pub ip: String,
     /// The presented credential, forwarded to internal requests only.
     pub bearer: Option<String>,
+    /// The customer identity. `None` for the operator (administrator token).
     pub identity: Option<Identity>,
+    /// Authenticated with an OAuth access token: internal requests carry the
+    /// identity itself, as that token is valid on `/mcp` only.
+    pub oauth: bool,
+    /// Authenticated with the administrator token.
+    pub operator: bool,
 }
 
 /// A failure reported to the model as a tool result with `isError: true`.
@@ -398,6 +405,44 @@ fn origin_allowed(config: &Config, origin: &str) -> bool {
             && normalize(&config.cors_origin).as_deref() == Some(origin.as_str()))
 }
 
+/// Who is calling: identity, forwarded bearer, OAuth flag, operator flag.
+type Caller = (Option<Identity>, Option<String>, bool, bool);
+
+async fn authenticate(
+    app: &App,
+    config: &Config,
+    headers: &HeaderMap,
+) -> std::result::Result<Caller, Error> {
+    let Some(token) = identity::token(headers) else {
+        return Err(Error::unauthorized(
+            "missing_api_key",
+            "Authentication required: send an OAuth access token, API key or dashboard token \
+             as `Authorization: Bearer <token>`",
+        ));
+    };
+    if identity::is_admin_token(config, token) {
+        // The operator: generation tools only, never billed.
+        return Ok((None, Some(token.to_owned()), false, true));
+    }
+    if config.mcp.oauth && token.starts_with(oauth::ACCESS_PREFIX) {
+        let identity = oauth::authenticate_access(app, config, token).await?;
+        return Ok((Some(identity), None, true, false));
+    }
+    let identity = identity::authenticate(app, headers, Scope::Manage).await?;
+    Ok((identity, Some(token.to_owned()), false, false))
+}
+
+/// Adds the OAuth discovery challenge (RFC 9728) to a 401 from `/mcp`.
+fn unauthorized(config: &Config, error: Error) -> Error {
+    if error.status != StatusCode::UNAUTHORIZED {
+        return error;
+    }
+    match oauth::challenge(config, error.code != "missing_api_key") {
+        Some(challenge) => error.with_challenge(challenge),
+        None => error,
+    }
+}
+
 /// Serves one `/mcp` request.
 pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response> {
     let config = app.config().await;
@@ -424,10 +469,12 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
             "Origin is not allowed to use this MCP endpoint",
         ));
     }
-    // Invalid credentials fail the whole request (and count against the
-    // per-IP auth-failure budget in `web::route`).
-    let identity = identity::authenticate(app, headers, Scope::Manage).await?;
-    let bearer = identity::token(headers).map(str::to_owned);
+    // Every request needs a credential. Invalid credentials fail the whole
+    // request (and count against the per-IP auth-failure budget in `web::route`).
+    let who = authenticate(app, &config, headers)
+        .await
+        .map_err(|e| unauthorized(&config, e))?;
+    let (identity, bearer, oauth, operator) = who;
     let headers = headers.clone();
 
     let limit = config.mcp.max_media_bytes.saturating_mul(4) / 3 + 256 * 1024;
@@ -478,6 +525,8 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Response>
         ip: ip.to_owned(),
         bearer,
         identity,
+        oauth,
+        operator,
     };
     let outcome = match route(&headers, method, &params) {
         Err(e) => Err(e),
@@ -578,17 +627,23 @@ async fn call_tool(ctx: &Ctx, params: &Value) -> std::result::Result<Value, RpcE
     })
 }
 
-/// Builds an internal request carrying the caller's credential.
+/// Builds an internal request carrying the caller's credential (or, for an
+/// OAuth access token, the already verified identity).
 pub(crate) fn internal(
     method: Method,
     uri: &str,
-    bearer: Option<&str>,
+    ctx: &Ctx,
     content_type: Option<&str>,
     body: Body,
 ) -> std::result::Result<Request<Body>, Error> {
     let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(token) = bearer {
+    if let Some(token) = &ctx.bearer {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if ctx.oauth
+        && let Some(identity) = &ctx.identity
+    {
+        builder = builder.extension(identity::Preauth(identity.clone()));
     }
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);

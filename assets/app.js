@@ -14,10 +14,11 @@ const brandName = brand.name || 'Reseller';
 const admin = location.pathname.startsWith('/admin');
 const workspace = location.pathname.startsWith('/workspace');
 const docsPage = location.pathname.startsWith('/docs');
+const oauthPage = location.pathname.startsWith('/oauth/authorize');
 const CUSTOMER_STORE = 'reseller.customer';
 const store = admin ? 'reseller.admin' : CUSTOMER_STORE;
 // The docs page reads the workspace session (same tab) to list the caller's models.
-let token = docsPage ? '' : sessionStorage.getItem(store) || '';
+let token = docsPage || oauthPage ? '' : sessionStorage.getItem(store) || '';
 let tab = 'overview';
 
 // The operator-issued workspace link carries the dashboard token as `#token=...`.
@@ -146,7 +147,9 @@ function renderHeader() {
   const el = document.querySelector('#header-actions');
   if (!el) return;
   const docs = `<a class="nav-link${docsPage ? ' current' : ''}" href="/docs/"${docsPage ? ' aria-current="page"' : ''}>Docs</a>`;
-  if (token && (workspace || admin)) {
+  if (oauthPage) {
+    el.innerHTML = docs;
+  } else if (token && (workspace || admin)) {
     el.innerHTML = `${docs}<button type="button" id="header-logout" class="ghost">Sign out</button>`;
     el.querySelector('#header-logout').onclick = signOut;
   } else {
@@ -209,7 +212,7 @@ function apiError(r, v) {
     if (!v?.error?.message && !ERROR_HINTS[code]) message = 'Too many requests. Please slow down.';
     if (wait > 0) message = `${message.replace(/[.!]?$/, '.')} Try again in ${wait >= 120 ? `${Math.ceil(wait / 60)} minutes` : `${wait} second${wait === 1 ? '' : 's'}`}.`;
   }
-  return Object.assign(new Error(message), { status: r.status, code, retryAfter: wait > 0 ? wait : null });
+  return Object.assign(new Error(message), { status: r.status, code, retryAfter: wait > 0 ? wait : null, redirect: typeof v?.redirect === 'string' ? v.redirect : '' });
 }
 
 /* Proof of work (ALTCHA v1): find n with sha256(salt + n) == challenge. Solved on
@@ -287,6 +290,55 @@ function loading(text = 'Loading...') {
   return `<div class="loading"><span class="spinner" aria-hidden="true"></span>${esc(text)}</div>`;
 }
 
+/* Skeletons ---------------------------------------------------------------------
+   Placeholder shapes that mirror the real layout (same cards, grids, and row
+   heights) so content replaces them without layout shift. They are inert for
+   assistive tech apart from one polite "Loading" status; the busy region carries
+   aria-busy while a request is in flight. */
+const skel = (cls = 'skel-line', n = 1) => `<span class="skel ${cls}"></span>`.repeat(n);
+const skeleton = (inner, label = 'Loading', cls = 'skeleton-body') =>
+  `<div class="skeleton" role="status"><span class="sr-only">${esc(label)}...</span><div class="${cls}" aria-hidden="true">${inner}</div></div>`;
+const skHead = (actions = false) => `<div class="page-head"><div>${skel('skel-title')}${skel('skel-line md')}</div>${actions ? skel('skel-btn') : ''}</div>`;
+const skStats = n => `<div class="stats">${Array.from({ length: n }, () => `<div class="card metric-card">${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line md')}</div>`).join('')}</div>`;
+const skBanner = () => `<div class="banner"><div>${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line md')}</div><div class="actions">${skel('skel-btn', 2)}</div></div>`;
+const skChart = () => `<div class="card"><div class="card-head">${skel('skel-title')}</div>${skel('skel-chart')}</div>`;
+const skToolbar = () => `<div class="toolbar">${skel('skel-input wide')}${skel('skel-input', 2)}${skel('skel-btn')}</div>`;
+const skTable = (rows = 6, cols = 5) => `<div class="skel-table"><div class="skel-row head cols-${cols}">${skel('skel-line sm', cols)}</div>${Array.from({ length: rows }, () => `<div class="skel-row cols-${cols}">${skel('skel-line md')}${skel('skel-line sm', cols - 1)}</div>`).join('')}</div>`;
+const skFacts = n => `<div class="skel-facts">${Array.from({ length: n }, () => `<div class="skel-fact">${skel('skel-line sm')}${skel('skel-line lg')}</div>`).join('')}</div>`;
+const skPlans = n => `<div class="plans">${Array.from({ length: n }, () => `<div class="card plan-card skel-plan">${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line lg')}${skel('skel-line md')}</div>`).join('')}</div>`;
+const skCard = body => `<div class="card">${body}</div>`;
+
+const SKELETON_VIEWS = {
+  overview: () => admin
+    ? `${skHead(true)}${skStats(4)}${skChart()}${skStats(3)}<div class="split-even">${skCard(skel('skel-line sm', 1) + skFacts(5))}${skCard(skel('skel-line sm', 1) + skFacts(5))}</div>`
+    : `${skBanner()}${skStats(4)}${skChart()}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(4, 5)}`)}`,
+  keys: () => `${skHead(true)}${skToolbar()}${skTable(7, 6)}`,
+  accounts: () => `${skHead()}${skToolbar()}${skTable(7, 6)}`,
+  payments: () => `${skHead(true)}${skToolbar()}${skTable(7, 6)}`,
+  requests: () => `${skHead(true)}${skToolbar()}${skTable(8, 6)}`,
+  usage: () => `${skHead()}${skStats(3)}${skChart()}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(4, 4)}`)}`,
+  billing: () => `${skBanner()}${skPlans(3)}${skTable(3, 5)}`,
+  connect: () => `${skHead(true)}${skCard(skFacts(3))}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(3, 5)}`)}${skCard(skel('skel-code'))}`,
+  plans: () => `${skHead(true)}${skTable(5, 6)}`,
+  codes: () => `${skHead(true)}${skTable(5, 5)}`,
+  settings: () => `${skHead()}${skCard(skel('skel-line lg', 2))}${skCard(skel('skel-block'))}`,
+};
+const viewSkeleton = name => skeleton((SKELETON_VIEWS[name] || SKELETON_VIEWS.keys)(), 'Loading');
+const tabsSkeleton = () => `<div class="tabs" aria-hidden="true">${skel('skel-tab', 5)}</div>`;
+const modalSkeleton = () => skeleton(`${skel('skel-title')}${skFacts(4)}${skel('skel-chart')}${skTable(3, 4)}`, 'Loading details');
+const plansSkeleton = () => skeleton(skPlans(3), 'Loading plans');
+const docsSkeleton = () => skeleton(`<div>${skel('skel-line', 1)}${skel('skel-line md', 1)}${skel('skel-line sm', 1)}${skel('skel-line md', 1)}${skel('skel-line', 1)}${skel('skel-line sm', 1)}</div><div class="skeleton-body wide">${skel('skel-title')}${skel('skel-line lg')}${skel('skel-block')}${skel('skel-line md')}${skTable(4, 4)}</div>`, 'Loading documentation', 'skel-docs');
+const landingSkeleton = () => skeleton(`<div>${skel('skel-eyebrow')}${skel('skel-hero', 2)}${skel('skel-line lg')}${skel('skel-line md')}<div class="actions section">${skel('skel-btn', 2)}</div></div>${skel('skel-block')}`, 'Loading', 'skel-landing');
+const consentSkeleton = () => skeleton(`<div class="card consent-card"><div class="skel-center">${skel('skel-circle', 2)}</div>${skel('skel-title')}${skel('skel-line md')}<div class="skel-facts">${skel('skel-line lg', 3)}${skel('skel-input')}${skel('skel-block')}</div></div>`, 'Loading authorization request', 'skel-consent');
+const shellSkeleton = () => `${tabsSkeleton()}<section id="content" aria-busy="true">${viewSkeleton('overview')}</section>`;
+// Painted before any data is known, so every route has a shaped placeholder at once.
+function bootSkeleton() {
+  if (docsPage) return docsSkeleton();
+  if (oauthPage) return consentSkeleton();
+  if (admin || workspace) return token ? shellSkeleton() : '';
+  return landingSkeleton();
+}
+
 function modal(title, content, setup, size) {
   const d = document.createElement('dialog');
   if (size) d.classList.add(size);
@@ -306,11 +358,12 @@ function modal(title, content, setup, size) {
 }
 // A dialog whose body loads asynchronously and can be refreshed in place.
 function liveModal(title, size, fetcher, render) {
-  const d = modal(title, `<div class="live-body">${loading()}</div>`, null, size);
+  const d = modal(title, `<div class="live-body" aria-busy="true">${modalSkeleton()}</div>`, null, size);
   const body = d.querySelector('.live-body');
   let seq = 0;
   const refresh = async () => {
     const mine = ++seq;
+    body.setAttribute('aria-busy', 'true');
     try {
       const data = await fetcher();
       if (mine !== seq || !body.isConnected) return;
@@ -321,6 +374,8 @@ function liveModal(title, size, fetcher, render) {
     } catch (e) {
       if (mine !== seq || !body.isConnected) return;
       body.innerHTML = `<div class="card error">${esc(e.message)}</div>`;
+    } finally {
+      if (mine === seq) body.removeAttribute('aria-busy');
     }
   };
   refresh();
@@ -573,7 +628,7 @@ function redeemForm() {
   });
 }
 
-function secrets(v) {
+function secrets(v, { embedded = false } = {}) {
   modal('Save your credentials', `
     <p class="muted">These are shown only once. Keep the dashboard token to manage your account even if you block your API key.</p>
     <div class="cred-row">
@@ -588,7 +643,7 @@ function secrets(v) {
     </div>
     <div class="actions section">
       <button type="button" data-copy-all class="primary">Copy both</button>
-      ${admin ? '' : '<button type="button" data-open class="ghost">Open workspace</button>'}
+      ${admin || embedded ? '' : '<button type="button" data-open class="ghost">Open workspace</button>'}
     </div>`, d => {
     const wire = (selector, text, label) => {
       const button = d.querySelector(selector);
@@ -1143,19 +1198,36 @@ console.log(reply.choices[0].message.content);` },
   ];
 }
 
+// OAuth: the client discovers everything from the URL and opens the consent page.
+function mcpOauth() {
+  const url = `${location.origin}/mcp`;
+  return `<div class="card">
+    <div class="card-head"><h3>Connect with OAuth</h3><span class="pill tone-ok">Recommended</span></div>
+    <p>Add this URL as a remote MCP server. Your client opens a ${esc(brandName)} page in the browser, you sign in and approve, and no key is pasted into the client.</p>
+    <p>${copyable(url, 'MCP endpoint')}</p>
+    <ul class="doc-list">
+      <li><strong>Claude</strong>: Settings, Connectors, Add custom connector.</li>
+      <li><strong>ChatGPT</strong>: Settings, Connectors, add a custom connector (developer mode).</li>
+      <li><strong>Cursor</strong>: Settings, MCP, add a server with this URL.</li>
+      <li><strong>VS Code</strong>: run <em>MCP: Add Server</em> and choose HTTP.</li>
+    </ul>
+    <p class="hint">Disconnect an app any time under Connect in your workspace.</p>
+  </div>`;
+}
+
 // `cliKey` is what the one-line command shows in place of the secret.
 function mcpPanel(cliKey) {
   const url = `${location.origin}/mcp`;
   return `<div class="docs-split">
     <div class="card">
-      <div class="card-head"><h3>Remote endpoint</h3><span class="hint">HTTP, POST only</span></div>
-      <p>Any MCP client that supports HTTP servers can connect with an API key. Endpoint: <code>${esc(url)}</code></p>
+      <div class="card-head"><h3>Static Bearer key</h3><span class="hint">For clients without OAuth</span></div>
+      <p>Send an API key with every request. Endpoint: <code>${esc(url)}</code></p>
       ${codeBlock(`claude mcp add --transport http reseller ${url} \\\n  --header "Authorization: Bearer ${cliKey}"`)}
       <p class="hint">Or add this to <code>.mcp.json</code>. Keep the key in an environment variable.</p>
       ${codeBlock(JSON.stringify({ mcpServers: { reseller: { type: 'http', url, headers: { Authorization: 'Bearer ${RESELLER_KEY}' } } } }, null, 2))}
     </div>
     <div class="card">
-      <div class="card-head"><h3>Local bridge</h3><span class="pill tone-ok">Recommended</span></div>
+      <div class="card-head"><h3>Local bridge</h3><span class="hint">stdio</span></div>
       <p>Runs next to your agent. Secrets and the signup proof of work stay on your machine, and generated media is saved to disk.</p>
       ${codeBlock(`cargo install reseller --locked\nclaude mcp add reseller -- reseller mcp --url ${location.origin}`)}
       <p class="hint">Or run <code>reseller mcp --url ${esc(location.origin)}</code> from any MCP client that launches stdio servers.</p>
@@ -1174,18 +1246,27 @@ const ENDPOINT_DOCS = [
   ['POST', '/v1/audio/translations', 'Speech to English text. Multipart file upload.'],
   ['POST', '/v1/images/generations', 'Image generation from a prompt.'],
   ['POST', '/v1/images/edits', 'Image edits. Multipart upload.'],
+  ['POST', '/v1/images/variations', 'Image variations. Multipart upload.'],
   ['GET', '/v1/realtime', 'Realtime API over WebSocket.'],
-  ['GET', '/v1/models', 'Models your key can use.'],
+  ['GET', '/v1/models', 'Models your key can use, in the OpenAI format.'],
+  ['GET', '/v1/models/<id>', 'One model.'],
 ];
 const ACCOUNT_DOCS = [
   ['GET', '/v1/account', 'Balance, debt, plan, credit lots, and top-up instructions.'],
-  ['GET', '/v1/account/usage?days=30', 'Daily usage per model. Add key=<id> for one key.'],
+  ['GET', '/v1/account/models', 'Models of the signed-in key. Also works with a dashboard token.'],
+  ['GET', '/v1/account/usage?days=30', 'Daily usage per model (1 to 365 days). Add key=<id> for one key.'],
   ['GET', '/v1/account/requests?limit=20', 'Request history. Filters: key, model, kind, status (2xx, 4xx, 5xx).'],
   ['GET', '/v1/keys', 'Your keys with lifetime and 30-day spend.'],
   ['POST', '/v1/keys', 'Create another key on the same balance. Body {"name"}.'],
+  ['GET', '/v1/keys/<id>', 'One key with its 30-day usage.'],
   ['PATCH', '/v1/keys/<id>', 'Rename or block a key.'],
   ['POST', '/v1/keys/<id>/rotate', 'Replace the secret. The old key stops working.'],
   ['POST', '/v1/account/redeem', 'Redeem a credit code. Body {"code"}.'],
+  ['GET', '/v1/plans', 'Public plan catalog and enabled payment methods. No credential needed.'],
+  ['POST', '/v1/account/checkout', 'Start a card or crypto purchase. Body {"plan_code", "method"}.'],
+  ['GET', '/v1/account/payments', 'Your orders. Add /<id> for one order.'],
+  ['GET', '/v1/account/apps', 'OAuth apps connected to your account.'],
+  ['DELETE', '/v1/account/apps/<id>', 'Disconnect an app. Its access stops at once.'],
 ];
 const ERROR_DOCS = [
   ['400', 'invalid_request_error', '-', 'The request body or parameters are invalid.'],
@@ -1204,15 +1285,32 @@ const MCP_TOOL_DOCS = [
   ['generate_speech', 'API key', 'Convert text to speech.'],
   ['transcribe_audio', 'API key', 'Transcribe audio to text.'],
   ['generate_image', 'API key', 'Generate images from a prompt.'],
-  ['account_overview', 'Key or token', 'Balance, debt, plan, and credit lots.'],
-  ['usage_summary', 'Key or token', 'Spending and tokens over the last N days.'],
-  ['list_requests', 'Key or token', 'Request history with billed cost.'],
-  ['list_keys', 'Key or token', 'Key names and prefixes, never secrets.'],
-  ['create_key', 'Key or token', 'Create another key on the account.'],
-  ['rotate_key', 'Key or token', 'Replace a key with a new secret.'],
-  ['redeem_code', 'Key or token', 'Redeem a single-use credit code.'],
-  ['start_checkout', 'Key or token', 'Start a card or crypto purchase.'],
+  ['list_models', 'API key', 'Models the key may use.'],
+  ['account_overview', 'API key or token', 'Balance, debt, plan, and credit lots.'],
+  ['usage_summary', 'API key or token', 'Spending and tokens over the last N days.'],
+  ['list_requests', 'API key or token', 'Request history with billed cost.'],
+  ['list_keys', 'API key or token', 'Key names and prefixes, never secrets.'],
+  ['create_key', 'API key or token', 'Create another key on the account.'],
+  ['rotate_key', 'API key or token', 'Replace a key with a new secret.'],
+  ['block_key', 'API key or token', 'Block a key.'],
+  ['redeem_code', 'API key or token', 'Redeem a single-use credit code.'],
+  ['start_checkout', 'API key or token', 'Start a card or crypto purchase.'],
+  ['list_plans', 'None', 'The public plan catalog.'],
+  ['signup_challenge', 'None', 'Get a proof-of-work challenge for a new account.'],
+  ['create_account', 'None', 'Create an account from a solved challenge.'],
 ];
+// Connected OAuth apps (MCP clients that were approved on the consent page).
+function appsCard(apps) {
+  const body = apps.error
+    ? `<div class="callout warn"><p>Connected apps could not be loaded: ${esc(apps.error)}</p></div>`
+    : table([
+      ['App', a => `<strong>${esc(a.client_name || 'Unnamed app')}</strong>`, 'wrap'],
+      ['Connected', a => when(a.created_at)],
+      ['Last used', a => when(a.last_used_at)],
+      ['', a => `<button type="button" class="small danger" data-revoke-app="${esc(a.id)}" data-app-name="${esc(a.client_name || 'this app')}">Disconnect</button>`, 'end'],
+    ], apps, { empty: ['No connected apps', 'Apps you approve through the sign-in page in your browser appear here.'] });
+  return `<div class="card"><div class="card-head"><h3>Connected apps</h3><span class="hint">${apps.error ? '' : esc(plural(apps.length, 'app'))}</span></div>${body}</div>`;
+}
 const methodTag = m => `<span class="method method-${esc(m.toLowerCase())}">${esc(m)}</span>`;
 const endpointTable = rows => table([
   ['Method', r => methodTag(r[0])],
@@ -1245,19 +1343,16 @@ const DOC_SECTIONS = [
   ['mcp', 'MCP for agents'],
 ];
 
+const quickStartCode = (base, model) => codeBlock(`export RESELLER_KEY="sk-res-..."\ncurl ${base}/chat/completions \\\n  -H "Authorization: Bearer $RESELLER_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello"}]}'`, 'Terminal');
+
 async function docs() {
   // Same-tab workspace session, if any, to show the caller's own models.
   const session = sessionStorage.getItem(CUSTOMER_STORE) || '';
-  let models = null;
-  if (session) {
-    try {
-      models = (await api('/v1/account/models', 'GET', undefined, { token: session })).data || [];
-    } catch {
-      models = null;
-    }
-  }
-  const m = exampleModels(models || []);
   const base = `${location.origin}/v1`;
+  const m = exampleModels();
+  const modelsSlot = session
+    ? skeleton(skTable(5, 4), 'Loading your models')
+    : `<div class="callout info"><strong>Your model list</strong><p>Sign in to the <a href="/workspace/">workspace</a> in this tab to see the models your key can use here, or call the endpoint below.</p></div>`;
   main.innerHTML = `
     <div class="docs-layout">
       <nav class="docs-nav" aria-label="Documentation">
@@ -1266,13 +1361,15 @@ async function docs() {
       </nav>
       <article class="docs-body">
         <header class="docs-hero">
-          <div class="eyebrow">${esc(brandName)} API</div>
-          <h1>Developer docs</h1>
-          <p class="lead">One OpenAI-compatible endpoint for text, speech, transcription, and images. Use any OpenAI SDK: change the base URL and the key, keep the rest of your code.</p>
+          <div class="docs-hero-top">
+            <div><div class="eyebrow">${esc(brandName)} API</div><h1>Developer docs</h1></div>
+            <div class="actions">${session ? '<a class="button primary small" href="/workspace/#keys">API keys</a>' : '<button type="button" class="primary small" data-create>Get an API key</button><a class="button ghost small" href="/workspace/">Sign in</a>'}</div>
+          </div>
+          <p class="lead">One OpenAI-compatible API for text, speech, transcription, and images. Change the base URL and key, keep your code.</p>
           <div class="docs-facts">
             <div><span class="label">Base URL</span>${copyable(base, 'Base URL')}</div>
-            <div><span class="label">MCP endpoint</span>${copyable(`${location.origin}/mcp`, 'MCP endpoint')}</div>
-            <div><span class="label">Auth header</span><code>Authorization: Bearer $RESELLER_KEY</code></div>
+            <div><span class="label">MCP</span>${copyable(`${location.origin}/mcp`, 'MCP endpoint')}</div>
+            <div><span class="label">Auth</span><code>Authorization: Bearer $RESELLER_KEY</code></div>
           </div>
         </header>
 
@@ -1283,17 +1380,17 @@ async function docs() {
             <li class="card"><span class="step-num">2</span><div><h3>Export it</h3><p>Store it as <code>RESELLER_KEY</code> in your shell or secret store.</p></div></li>
             <li class="card"><span class="step-num">3</span><div><h3>Call the API</h3><p>Point your SDK at the base URL and send a request.</p></div></li>
           </ol>
-          ${codeBlock(`export RESELLER_KEY="sk-res-..."\ncurl ${base}/chat/completions \\\n  -H "Authorization: Bearer $RESELLER_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": "${m.chat}", "messages": [{"role": "user", "content": "Hello"}]}'`, 'Terminal')}
-          <div class="actions start">${session ? '<a class="button primary" href="/workspace/#keys">Open API keys</a>' : '<button type="button" class="primary" data-create>Create an account</button><a class="button ghost" href="/workspace/">Sign in</a>'}</div>
+          <div id="doc-quick">${quickStartCode(base, m.chat)}</div>
         </section>
 
         <section id="authentication" class="doc-section">
           <h2>Authentication</h2>
-          <p>Every API call needs an API key (<code>sk-res-...</code>), sent as a bearer token. The <code>x-api-key</code> header works as well.</p>
+          <p>Every API call needs a credential, sent as a bearer token: <code>Authorization: Bearer sk-res-...</code>. The <code>x-api-key</code> header works as well.</p>
           ${facts([
-            ['API key', 'Calls the API and MCP generation tools. Shown once when created or rotated.'],
-            ['Dashboard token', 'Signs in to the workspace and manages the account. It cannot call the API.'],
+            ['API key', 'Starts with <code>sk-res-</code>. Calls the API and the MCP generation tools. Shown once when created or rotated.'],
+            ['Dashboard token', 'Starts with <code>dash_</code>. Signs in to the workspace and manages the account (keys, usage, billing, MCP account tools). It cannot call generation endpoints.'],
             ['Several keys', 'All keys of an account share one balance. Create one key per app to see spend per app.'],
+            ['Administrator token', 'The operator token is also accepted on <code>/v1</code> and <code>/mcp</code> as an unbilled operator credential. Nothing is charged to any account.'],
           ])}
           <p class="hint">Lost a key? Rotate it under API keys. The old secret stops working at once.</p>
         </section>
@@ -1301,7 +1398,7 @@ async function docs() {
         <section id="models" class="doc-section">
           <h2>Models</h2>
           <p>Send the model ID in the <code>model</code> field. <code>GET /v1/models</code> lists the models your key may use, in the OpenAI format.</p>
-          ${models ? modelCatalog(models) : `<div class="callout info"><strong>Your model list</strong><p>Sign in to the <a href="/workspace/">workspace</a> in this tab to see the models your key can use here, or call the endpoint below.</p></div>`}
+          <div id="doc-models">${modelsSlot}</div>
           ${codeBlock(`curl ${base}/models -H "Authorization: Bearer $RESELLER_KEY"`)}
         </section>
 
@@ -1314,8 +1411,8 @@ async function docs() {
 
         <section id="examples" class="doc-section">
           <h2>Examples</h2>
-          <p>Each example reads the key from <code>$RESELLER_KEY</code>${models ? ' and uses a model from your list' : ''}.</p>
-          ${snippetTabs(apiSnippets(m))}
+          <p>Each example reads the key from <code>$RESELLER_KEY</code><span id="doc-examples-note"></span>.</p>
+          <div id="doc-examples">${snippetTabs(apiSnippets(m))}</div>
         </section>
 
         <section id="billing" class="doc-section">
@@ -1348,9 +1445,14 @@ async function docs() {
 
         <section id="mcp" class="doc-section">
           <h2>MCP for agents</h2>
-          <p>Agents connect over the Model Context Protocol. Generation tools are billed like API calls.</p>
+          <p>Agents connect over the Model Context Protocol (Streamable HTTP, POST only). Generation tools are billed like API calls.</p>
+          <h3 class="docs-title" id="mcp-oauth">Connect with OAuth</h3>
+          <p>Most clients only need the URL. Paste <code>${esc(location.origin)}/mcp</code> into Claude, ChatGPT, Cursor, or VS Code as a remote MCP server. The client opens a consent page in your browser. Sign in with an API key or dashboard token, or create an account, and choose Allow. Connected apps are listed in the workspace under Connect, where you can revoke them.</p>
+          ${mcpOauth()}
+          <h3 class="docs-title" id="mcp-static">Static Bearer key and local bridge</h3>
           ${mcpPanel('$RESELLER_KEY')}
-          <h3 class="docs-title">Tools</h3>
+          <div class="callout info"><strong>Operator credential</strong><p>The administrator token also works on <code>/v1</code> and <code>/mcp</code> as an unbilled operator credential. Use it for testing and support, not for customers.</p></div>
+          <h3 class="docs-title" id="mcp-tools">Tools</h3>
           ${table([['Tool', r => `<code>${esc(r[0])}</code>`], ['Credential', r => esc(r[1])], ['Description', r => esc(r[2]), 'wrap']], MCP_TOOL_DOCS)}
         </section>
       </article>
@@ -1363,11 +1465,29 @@ async function docs() {
   const observer = new IntersectionObserver(entries => {
     for (const entry of entries) {
       if (!entry.isIntersecting) continue;
-      links.forEach((a, id) => a.toggleAttribute('aria-current', id === entry.target.id));
+      links.forEach((a, id) => id === entry.target.id ? a.setAttribute('aria-current', 'location') : a.removeAttribute('aria-current'));
     }
   }, { rootMargin: '-15% 0px -70% 0px' });
   main.querySelectorAll('.doc-section').forEach(s => observer.observe(s));
   if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
+  if (!session) return;
+  // The model list arrives after the page: fill its slots in place.
+  const slot = main.querySelector('#doc-models');
+  slot.setAttribute('aria-busy', 'true');
+  try {
+    const models = (await api('/v1/account/models', 'GET', undefined, { token: session })).data || [];
+    const ex = exampleModels(models);
+    slot.innerHTML = modelCatalog(models);
+    main.querySelector('#doc-examples').innerHTML = snippetTabs(apiSnippets(ex));
+    main.querySelector('#doc-examples-note').textContent = ' and uses a model from your list';
+    main.querySelector('#doc-quick').innerHTML = quickStartCode(base, ex.chat);
+    wireDocs(main);
+    wireCopies(main);
+  } catch {
+    slot.innerHTML = `<div class="callout info"><strong>Your model list</strong><p>Your workspace session expired. <a href="/workspace/">Sign in again</a> to list your models here.</p></div>`;
+  } finally {
+    slot.removeAttribute('aria-busy');
+  }
 }
 
 /* Landing and sign-in ------------------------------------------------------------ */
@@ -1383,7 +1503,7 @@ async function landing() {
           <button type="button" class="primary" id="create">Get an API key</button>
           <a class="button ghost" href="/docs/">Read the docs</a>
         </div>
-        <p class="section"><small>OpenAI-compatible, usage-based billing, live statistics</small></p>
+        <ul class="chips" aria-label="Highlights"><li>OpenAI-compatible</li><li>Prepaid, pay as you go</li><li>MCP ready</li><li>Per-request history</li></ul>
       </div>
       <div class="terminal">
         <div class="bar">QUICK START / cURL</div>
@@ -1406,7 +1526,7 @@ async function landing() {
       <ol class="start-steps">
         <li class="card"><span class="step-num">1</span><div><h3>Create a key</h3><p>Choose Get an API key. A short proof of work runs in your browser. No card needed.</p></div></li>
         <li class="card"><span class="step-num">2</span><div><h3>Call the API</h3><p>Point any OpenAI SDK at <code>${esc(location.origin)}/v1</code> and send the key as a bearer token.</p></div></li>
-        <li class="card"><span class="step-num">3</span><div><h3>Connect an agent</h3><p>Add <code>${esc(location.origin)}/mcp</code> to an MCP client, or run the local bridge.</p></div></li>
+        <li class="card"><span class="step-num">3</span><div><h3>Connect an agent</h3><p>Paste <code>${esc(location.origin)}/mcp</code> into Claude, ChatGPT, Cursor, or VS Code and approve in your browser.</p></div></li>
       </ol>
       <div class="card">
         <div class="card-head"><h3>Call the API</h3><a class="button ghost small" href="/docs/#examples">All examples</a></div>
@@ -1418,7 +1538,7 @@ async function landing() {
         <div><div class="eyebrow">ROOM TO BUILD</div><h2>Choose your credit plan</h2></div>
         <span class="muted">Simple, prepaid access.</span>
       </div>
-      <div class="plans section" id="plans">${loading('Loading plans...')}</div>
+      <div class="section" id="plans" aria-busy="true">${plansSkeleton()}</div>
     </section>
     <section class="steps section">
       <div class="card step"><div class="eyebrow">01 / CONNECT ONCE</div><p>Use your existing OpenAI SDK. Change the base URL and API key.</p></div>
@@ -1427,14 +1547,17 @@ async function landing() {
     </section>`;
   document.querySelector('#create').onclick = keyForm;
   wireDocs(main);
+  const slot = document.querySelector('#plans');
   try {
     const v = await api('/v1/plans');
     const best = bestCode(v.plans);
-    document.querySelector('#plans').innerHTML = v.plans.length
-      ? v.plans.map(p => planCard(p, best)).join('')
+    slot.innerHTML = v.plans.length
+      ? `<div class="plans">${v.plans.map(p => planCard(p, best)).join('')}</div>`
       : emptyState('No plans yet', 'An operator has not published any plans.');
   } catch (e) {
-    notice(e.message, true);
+    slot.innerHTML = `<div class="card error"><strong>Plans could not be loaded</strong><p>${esc(e.message)}</p></div>`;
+  } finally {
+    slot.removeAttribute('aria-busy');
   }
 }
 
@@ -1514,7 +1637,7 @@ async function shell() {
     <div class="tabs" role="tablist" aria-label="${admin ? 'Console sections' : 'Workspace sections'}">
       ${TABS.map(t => `<button type="button" role="tab" id="tab-${t}" data-tab="${t}" aria-controls="content" aria-selected="${t === tab}" tabindex="${t === tab ? 0 : -1}">${esc(TAB_LABELS[t])}</button>`).join('')}
     </div>
-    <section id="content" role="tabpanel">${loading()}</section>`;
+    <section id="content" role="tabpanel" aria-busy="true" data-view="${tab}">${viewSkeleton(tab)}</section>`;
   const tabButtons = [...main.querySelectorAll('[data-tab]')];
   selectTab();
   tabButtons.forEach((b, i) => {
@@ -1549,7 +1672,9 @@ async function load() {
   const content = document.querySelector('#content');
   if (!content) return; // signed out or navigated away
   content.setAttribute('aria-busy', 'true');
-  if (!content.children.length || content.dataset.view !== tab) content.innerHTML = loading();
+  // Switching views swaps in a skeleton shaped like the next view. Refreshing the
+  // same view keeps its content (dimmed) so nothing jumps.
+  if (!content.children.length || content.dataset.view !== tab) content.innerHTML = viewSkeleton(tab);
   content.dataset.view = tab;
   try {
     const html = await views[tab](controller.signal);
@@ -1558,6 +1683,7 @@ async function load() {
     wire(content);
   } catch (e) {
     if (e.name === 'AbortError' || gen !== generation) return;
+    delete content.dataset.view;
     content.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p><div class="actions"><button type="button" data-refresh class="ghost">Try again</button></div></div>`;
     wire(content);
   } finally {
@@ -1644,9 +1770,11 @@ const views = {
   },
   async connect(signal) {
     let prefix = token.startsWith('sk-res-') ? token.slice(0, 15) : '';
-    const [keys, models] = await Promise.all([
+    const [keys, models, apps] = await Promise.all([
       prefix ? Promise.resolve([]) : get('/v1/keys?limit=50', signal).then(v => v.keys || []).catch(e => { if (e.name === 'AbortError') throw e; return []; }),
       get('/v1/account/models', signal).then(v => v.data || []).catch(e => { if (e.name === 'AbortError') throw e; return []; }),
+      // Older servers have no connected-apps route: hide the section instead of failing the page.
+      get('/v1/account/apps', signal).then(v => v.apps || []).catch(e => { if (e.name === 'AbortError') throw e; return e.status === 404 ? null : { error: e.message }; }),
     ]);
     if (!prefix) prefix = (keys.find(x => x.status === 'active') || keys[0] || {}).key_prefix || '';
     const m = exampleModels(models);
@@ -1668,6 +1796,10 @@ const views = {
         ${snippetTabs(apiSnippets(m))}
       </div>
       <h3 class="docs-title">Connect an agent over MCP</h3>
+      ${mcpOauth()}
+      <div class="section-gap"></div>
+      ${apps ? appsCard(apps) : ''}
+      <h3 class="docs-title">Other ways to connect</h3>
       ${mcpPanel('$RESELLER_KEY')}`;
   },
   async keys(signal) {
@@ -1700,7 +1832,7 @@ const views = {
     const scope = admin && state.account
       ? `<div class="filter-chips">${filterChip('keys', 'account', 'Account', esc(accountLabel(state.account, v.keys[0]?.account_contact)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`)}</div>`
       : '';
-    return `${pageHead('API keys', `${esc(count(v.total))} ${admin ? 'keys' : 'keys on this account'}. Open a key for its usage, limits, and requests.`, admin ? '' : '<button type="button" class="primary" data-create>Create key</button>')}
+    return `${pageHead('API keys', `${esc(plural(v.total, 'key'))}${admin ? '' : ' on this account'}. Open a key for its usage, limits, and requests.`, admin ? '' : '<button type="button" class="primary" data-create>Create key</button>')}
       ${toolbar}${scope}${table(columns, v.keys, { group, empty: ['No keys match', 'Change the filters or create a key.'] })}${listPager('keys', state, Number(v.total || 0), v.keys.length)}`;
   },
   async accounts(signal) {
@@ -1713,7 +1845,7 @@ const views = {
       groups: [['status', 'Group by status'], ['plan', 'Group by plan']],
     });
     const group = state.group === 'status' ? { value: r => r.status } : state.group === 'plan' ? { value: r => r.plan_code || 'No active plan' } : null;
-    return `${pageHead('Accounts', `${esc(count(v.total))} customer accounts. Open one to manage credit, keys, and status.`)}
+    return `${pageHead('Accounts', `${esc(plural(v.total, 'customer account'))}. Open one to manage credit, keys, and status.`)}
       ${toolbar}${table([
         ['Account', r => `${accountLink(r.id, r.contact)}<div class="hint"><code>${esc(shortId(r.id))}</code></div>`, 'wrap'],
         ['Status', r => pill(r.status)],
@@ -1772,7 +1904,7 @@ const views = {
     });
     const group = state.group ? { value: r => state.group === 'plan' ? r.plan_code : state.group === 'account' ? r.account_id : state.group === 'method' ? methodLabel(r.method) : r.status } : null;
     const scope = state.account ? `<div class="filter-chips">${filterChip('payments', 'account', 'Account', esc(shortId(state.account)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`)}</div>` : '';
-    return `${pageHead('Payments', `${esc(count(v.total))} card and crypto orders.`, '<button type="button" class="ghost" data-payroof>Crypto payments setup</button>')}
+    return `${pageHead('Payments', `${esc(plural(v.total, 'card or crypto order'))}.`, '<button type="button" class="ghost" data-payroof>Crypto payments setup</button>')}
       ${toolbar}${scope}${table([
         ['Created', r => when(r.created_at)],
         ['Order', r => `<code title="${esc(r.id)}">${esc(shortId(r.id))}</code>`],
@@ -2098,6 +2230,271 @@ async function payroofSetup() {
   }, 'wide');
 }
 
+/* OAuth consent ------------------------------------------------------------------
+   /oauth/authorize?... is opened by an MCP client. The page shows who is asking,
+   lets the user prove which account to use (stored session, pasted credential, or
+   a brand-new account), and posts the decision. The server answers with the URL to
+   send the browser back to. */
+
+const maskSecret = t => `${t.slice(0, t.startsWith('dash_') ? 9 : 15)}...`;
+// Redirects come from the server, but never navigate to script-capable schemes.
+function safeRedirect(url) {
+  try {
+    const u = new URL(url, location.origin);
+    return ['javascript:', 'data:', 'vbscript:', 'file:', 'blob:'].includes(u.protocol) ? '' : u.href;
+  } catch {
+    return '';
+  }
+}
+const httpsUrl = v => {
+  try {
+    const u = new URL(v);
+    return u.protocol === 'https:' ? u : null;
+  } catch {
+    return null;
+  }
+};
+
+function consentFrame(inner) {
+  main.innerHTML = `<div class="consent"><section class="card consent-card" aria-labelledby="consent-title">${inner}</section></div>`;
+  main.removeAttribute('aria-busy');
+  const heading = main.querySelector('#consent-title');
+  heading?.setAttribute('tabindex', '-1');
+  heading?.focus({ preventScroll: true });
+}
+function consentMessage({ ok = false, title, text, redirect = '', returnLabel = 'Return to app' }) {
+  consentFrame(`<div class="consent-state" role="${ok ? 'status' : 'alert'}">
+      <div class="badge${ok ? '' : ' bad'}" aria-hidden="true">${ok ? '&#10003;' : '!'}</div>
+      <h1 id="consent-title">${esc(title)}</h1>
+      <p>${esc(text)}</p>
+      <div class="actions">${redirect
+        ? `<button type="button" class="primary" data-return>${esc(returnLabel)}</button>`
+        : `<a class="button ghost" href="/">Back to ${esc(brandName)}</a>`}</div>
+    </div>`);
+  main.querySelector('[data-return]')?.addEventListener('click', () => location.assign(redirect));
+}
+
+async function oauthConsent() {
+  const query = location.search.replace(/^\?/, '');
+  main.setAttribute('aria-busy', 'true');
+  main.innerHTML = consentSkeleton();
+  let info;
+  try {
+    if (!query) throw new Error('This page opens from an app that wants to connect. Start the connection from your MCP client, such as Claude, ChatGPT, Cursor, or VS Code.');
+    info = await api(`/oauth/api/authorize?${query}`);
+  } catch (e) {
+    consentMessage({ title: 'This request cannot be completed', text: e.message, redirect: safeRedirect(e.redirect) });
+    return;
+  }
+
+  const client = info.client || {};
+  const clientName = client.client_name || client.client_id || 'An application';
+  const clientSite = httpsUrl(client.client_uri);
+  const logo = httpsUrl(client.logo_uri);
+  const brandLogo = document.querySelector('.mark')?.getAttribute('src') || '';
+  const host = info.redirect_host || (() => { try { return new URL(info.redirect_uri).host; } catch { return ''; } })();
+  const stored = sessionStorage.getItem(CUSTOMER_STORE) || '';
+  let modes = [...(stored ? [['session', 'Continue as you'] ] : []), ['paste', 'API key or token'], ['create', 'New account']];
+  let mode = modes[0][0];
+  let created = null;
+  let busy = false;
+
+  consentFrame(`<form class="consent-form" novalidate>
+      <div class="consent-logos" aria-hidden="true">
+        <span class="consent-logo">${brandLogo ? `<img src="${esc(brandLogo)}" alt="" width="52" height="52">` : esc([...brandName][0] || '')}</span>
+        <span class="consent-link"></span>
+        <span class="consent-logo" id="client-logo">${logo ? `<img src="${esc(logo.href)}" alt="" width="52" height="52" referrerpolicy="no-referrer">` : esc([...clientName][0].toUpperCase())}</span>
+      </div>
+      <h1 class="consent-title" id="consent-title"><strong>${esc(clientName)}</strong> wants to connect to your ${esc(brandName)} account</h1>
+      <p class="consent-sub">${host ? `You return to <code>${esc(host)}</code> afterwards.` : ''}${clientSite ? ` App site: <a href="${esc(clientSite.href)}" target="_blank" rel="noopener noreferrer">${esc(clientSite.host)}</a>` : ''}</p>
+      <div class="consent-section">
+        <h2 id="perm-title">This app will be able to</h2>
+        <ul class="auth-points consent-perms" aria-labelledby="perm-title">
+          <li>Generate text, speech, images, and transcripts, billed to your balance</li>
+          <li>View your balance, usage, and keys</li>
+        </ul>
+        <p class="hint">You can disconnect it at any time from your workspace.</p>
+      </div>
+      <div class="consent-section">
+        <h2 id="auth-title">Authorize with</h2>
+        <div class="seg" role="tablist" aria-labelledby="auth-title"></div>
+        <div class="consent-panel" data-panel="session" role="tabpanel" hidden>
+          <div class="consent-identity"><span class="avatar" aria-hidden="true">${esc([...brandName][0] || '')}</span><div><strong id="session-name">Your signed-in account</strong><span class="hint">${esc(stored ? maskSecret(stored) : '')}</span></div></div>
+        </div>
+        <div class="consent-panel" data-panel="paste" role="tabpanel" hidden>
+          <label for="consent-credential">API key or dashboard token</label>
+          <div class="pw-field">
+            <input id="consent-credential" name="credential" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="sk-res-... or dash_..." aria-describedby="credential-help">
+            <button type="button" class="ghost" data-toggle-secret aria-pressed="false" aria-controls="consent-credential">Show</button>
+          </div>
+          <p class="field-help" id="credential-help">Sent only to ${esc(brandName)} to confirm your account. It is never shared with the app.</p>
+        </div>
+        <div class="consent-panel" data-panel="create" role="tabpanel" hidden>
+          <div data-create-form>
+            <label for="consent-name">Key name</label>
+            <input id="consent-name" name="name" maxlength="80" value="${esc(clientName.slice(0, 80))}" autocomplete="off">
+            <label for="consent-contact">Contact (optional)</label>
+            <input id="consent-contact" name="contact" type="email" placeholder="you@example.com" autocomplete="email">
+            <p class="field-help">New accounts receive evaluation credit. No card needed.</p>
+            <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span>Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
+            <div class="actions"><button type="button" class="ghost" data-make-account>Create account</button></div>
+          </div>
+          <div data-created hidden>
+            <div class="callout info"><strong>Account created</strong><p>Save your credentials, then choose Allow to finish connecting.</p><div class="actions"><button type="button" class="small" data-show-secrets>Show credentials</button></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="consent-error" role="alert" hidden></div>
+      <div class="consent-buttons">
+        <button type="button" class="ghost" data-deny>Deny</button>
+        <button type="submit" class="primary" data-allow>Allow</button>
+      </div>
+      <p class="consent-foot">Only approve apps you trust.</p>
+    </form>`);
+
+  const form = main.querySelector('form');
+  const errorBox = form.querySelector('.consent-error');
+  const allow = form.querySelector('[data-allow]');
+  const deny = form.querySelector('[data-deny]');
+  const input = form.querySelector('#consent-credential');
+  const tablist = form.querySelector('.seg');
+  form.querySelector('#client-logo img')?.addEventListener('error', e => { e.target.replaceWith(clientName[0].toUpperCase()); });
+
+  const credential = () => mode === 'session' ? stored : mode === 'paste' ? input.value.trim() : created?.key || '';
+  const showError = message => {
+    errorBox.textContent = message;
+    errorBox.hidden = !message;
+  };
+  const refresh = () => {
+    allow.disabled = busy || !credential();
+    deny.disabled = busy;
+  };
+  const paintTabs = () => {
+    tablist.innerHTML = modes.map(([id, label]) => `<button type="button" role="tab" id="mode-${id}" data-mode="${id}" aria-selected="${id === mode}" aria-controls="panel-${id}" tabindex="${id === mode ? 0 : -1}">${esc(label)}</button>`).join('');
+    form.querySelectorAll('[data-panel]').forEach(p => {
+      p.id = `panel-${p.dataset.panel}`;
+      p.setAttribute('aria-labelledby', `mode-${p.dataset.panel}`);
+      p.hidden = p.dataset.panel !== mode;
+    });
+    tablist.querySelectorAll('[data-mode]').forEach((b, i, all) => {
+      b.onclick = () => setMode(b.dataset.mode);
+      b.onkeydown = e => {
+        const target = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: all.length - 1 }[e.key];
+        if (target === undefined) return;
+        e.preventDefault();
+        const next = all[(target + all.length) % all.length];
+        next.focus();
+        next.click();
+      };
+    });
+  };
+  function setMode(next) {
+    mode = next;
+    showError('');
+    paintTabs();
+    refresh();
+  }
+  paintTabs();
+  refresh();
+  input.addEventListener('input', () => { showError(''); refresh(); });
+  form.querySelector('[data-toggle-secret]').onclick = e => {
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    e.currentTarget.textContent = show ? 'Hide' : 'Show';
+    e.currentTarget.setAttribute('aria-pressed', String(show));
+    input.focus();
+  };
+
+  // A stored session is checked in the background: show who it is, or drop it when stale.
+  if (stored) {
+    api('/v1/account', 'GET', undefined, { token: stored }).then(v => {
+      const name = form.querySelector('#session-name');
+      if (name) name.textContent = `Continue as ${v.account?.contact || shortId(v.account?.id)}`;
+    }).catch(e => {
+      if (e.status !== 401 && e.status !== 403) return;
+      modes = modes.filter(([id]) => id !== 'session');
+      if (mode === 'session') mode = 'paste';
+      paintTabs();
+      refresh();
+      showError('Your saved session has expired. Paste a key or create an account.');
+    });
+  }
+
+  // New account: reuse the in-browser signup, then authorize with the key it returns.
+  const makeButton = form.querySelector('[data-make-account]');
+  makeButton.onclick = async () => {
+    const pow = form.querySelector('.pow');
+    const bar = pow.querySelector('progress');
+    showError('');
+    makeButton.disabled = true;
+    busy = true;
+    refresh();
+    pow.hidden = false;
+    try {
+      created = await signup({ name: form.querySelector('#consent-name').value.trim() || clientName.slice(0, 80), contact: form.querySelector('#consent-contact').value.trim() }, p => { bar.value = Math.round(p * 100); });
+      form.querySelector('[data-create-form]').hidden = true;
+      form.querySelector('[data-created]').hidden = false;
+      secrets(created, { embedded: true });
+    } catch (e) {
+      showError(e.message);
+    } finally {
+      pow.hidden = true;
+      makeButton.disabled = false;
+      busy = false;
+      refresh();
+    }
+  };
+  form.querySelector('[data-show-secrets]').onclick = () => created && secrets(created, { embedded: true });
+
+  const finish = (decision, redirect) => {
+    const target = safeRedirect(redirect);
+    if (decision === 'allow') {
+      consentMessage({ ok: true, title: `${clientName} is connected`, text: `You can close this tab and return to ${clientName}.`, redirect: target, returnLabel: `Return to ${clientName}` });
+    } else {
+      consentMessage({ ok: true, title: 'Access denied', text: `${clientName} was not given access. You can close this tab.`, redirect: target, returnLabel: `Return to ${clientName}` });
+    }
+    if (target) location.assign(target);
+  };
+  const decide = async decision => {
+    if (busy) return;
+    showError('');
+    busy = true;
+    const label = (decision === 'allow' ? allow : deny);
+    const original = label.textContent;
+    label.textContent = decision === 'allow' ? 'Authorizing...' : 'Denying...';
+    allow.disabled = deny.disabled = true;
+    form.setAttribute('aria-busy', 'true');
+    try {
+      const v = await api('/oauth/api/authorize', 'POST', { query, decision, credential: credential() });
+      finish(decision, v.redirect);
+    } catch (e) {
+      if (decision === 'deny' && info.redirect_uri) {
+        // Denying needs no account. Fall back to the standard OAuth error redirect.
+        try {
+          const u = new URL(info.redirect_uri);
+          u.searchParams.set('error', 'access_denied');
+          const state = new URLSearchParams(query).get('state');
+          if (state) u.searchParams.set('state', state);
+          finish('deny', u.href);
+          return;
+        } catch { /* fall through to the error message */ }
+      }
+      label.textContent = original;
+      showError(e.message);
+      if (mode === 'paste' && e.status === 401) input.focus();
+    } finally {
+      busy = false;
+      form.removeAttribute('aria-busy');
+      if (form.isConnected) refresh();
+    }
+  };
+  form.addEventListener('submit', e => {
+    e.preventDefault();
+    if (credential()) decide('allow');
+  });
+  deny.onclick = () => decide('deny');
+}
+
 /* Interaction wiring --------------------------------------------------------------- */
 
 function wire(root) {
@@ -2199,6 +2596,14 @@ function wire(root) {
   action('[data-order]', async b => cryptoOrder(await api(`/v1/account/payments/${encodeURIComponent(b.dataset.order)}`)));
   action('[data-payment]', async b => paymentDetails(b.dataset.payment));
   action('[data-payroof]', async () => payroofSetup());
+  action('[data-revoke-app]', async b => {
+    if (!(await confirmModal('Disconnect app?', `${b.dataset.appName} will lose access to your account right away. You can connect it again later.`, 'Disconnect', true))) return;
+    // The body may be empty, so read the status instead of requiring JSON.
+    const r = await fetch(`/v1/account/apps/${encodeURIComponent(b.dataset.revokeApp)}`, { method: 'DELETE', headers: { authorization: `Bearer ${token}` } });
+    if (!r.ok) throw apiError(r, await r.json().catch(() => null));
+    notice('App disconnected');
+    await load();
+  });
 
   root.querySelectorAll('[data-redeem]').forEach(b => b.onclick = redeemForm);
   if (root.querySelector('#settings')) bindForm(root.querySelector('#settings'), async b => {
@@ -2235,7 +2640,14 @@ if (paymentResult) {
     : 'Checkout cancelled. You have not been charged.', paymentResult !== 'success');
 }
 renderHeader();
-if (docsPage) docs();
-else if (!admin && !workspace) landing();
-else if (token) shell();
-else login();
+const boot = oauthPage ? oauthConsent
+  : docsPage ? docs
+  : !admin && !workspace ? landing
+  : token ? shell
+  : login;
+const first = bootSkeleton();
+if (first) main.innerHTML = first;
+main.setAttribute('aria-busy', 'true');
+Promise.resolve(boot()).catch(e => {
+  main.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p></div>`;
+}).finally(() => main.removeAttribute('aria-busy'));

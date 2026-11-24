@@ -88,11 +88,14 @@ const BILLING_META: &str = "reseller/billing";
 
 /// Billed cost, tokens and remaining balance for a finished request.
 async fn billing(ctx: &Ctx, request_id: Option<&str>) -> Result<Value, ToolError> {
-    let account = ctx
-        .identity
-        .as_ref()
-        .map(|i| i.account_id.as_str())
-        .unwrap_or_default();
+    // The operator has no account: nothing is billed and there is no balance.
+    let Some(account) = ctx.identity.as_ref().map(|i| i.account_id.as_str()) else {
+        let mut out = json!({"operator": true, "billed_usd": "0"});
+        if let Some(id) = request_id {
+            out["request_id"] = id.into();
+        }
+        return Ok(out);
+    };
     let mut conn = ctx.app.db.acquire().await?;
     let mut out = json!({});
     if let Some(id) = request_id {
@@ -125,7 +128,7 @@ fn post_json(ctx: &Ctx, path: &str, body: &Value) -> Result<Request<Body>, ToolE
     Ok(internal(
         Method::POST,
         path,
-        ctx.bearer.as_deref(),
+        ctx,
         Some("application/json"),
         Body::from(serde_json::to_vec(body).map_err(Error::internal)?),
     )?)
@@ -434,7 +437,7 @@ pub(super) async fn transcribe(ctx: &Ctx, arguments: &Value) -> Result<Output, T
     let req = internal(
         Method::POST,
         "/v1/audio/transcriptions",
-        ctx.bearer.as_deref(),
+        ctx,
         Some(&format!("multipart/form-data; boundary={boundary}")),
         Body::from(body),
     )?;
@@ -582,13 +585,7 @@ pub(super) async fn image(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolEr
 
 pub(super) async fn models(ctx: &Ctx, arguments: &Value) -> Result<Output, ToolError> {
     Args::new(arguments, &[])?;
-    let req = internal(
-        Method::GET,
-        "/v1/models",
-        ctx.bearer.as_deref(),
-        None,
-        Body::empty(),
-    )?;
+    let req = internal(Method::GET, "/v1/models", ctx, None, Body::empty())?;
     let reply = send(ctx, req, json_cap(media_limit(ctx).await)).await?;
     let value = parse_json(&reply)?;
     let models: Vec<Value> = value["data"]

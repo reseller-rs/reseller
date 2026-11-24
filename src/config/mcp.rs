@@ -9,6 +9,10 @@ pub const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
 pub struct Mcp {
     /// Whether the MCP endpoint is served.
     pub enabled: bool,
+    /// Whether the OAuth 2.1 authorization server (dynamic client registration,
+    /// consent, tokens) for `/mcp` is served. When off, `/mcp` accepts only API
+    /// keys and dashboard tokens and its 401 carries no `resource_metadata`.
+    pub oauth: bool,
     /// Largest audio/image payload MCP tools return inline.
     pub max_media_bytes: usize,
 }
@@ -17,6 +21,7 @@ impl Default for Mcp {
     fn default() -> Self {
         Self {
             enabled: true,
+            oauth: true,
             max_media_bytes: 16 * 1024 * 1024,
         }
     }

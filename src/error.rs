@@ -23,6 +23,8 @@ pub struct Error {
     pub retry_after: Option<u64>,
     /// Methods the path accepts (`Allow` header of 405 responses).
     pub allow: Option<&'static str>,
+    /// Replaces the `WWW-Authenticate` header of a 401 response.
+    pub challenge: Option<String>,
 }
 
 /// Result alias whose error type defaults to [`Error`].
@@ -38,6 +40,7 @@ impl Error {
             param: None,
             retry_after: None,
             allow: None,
+            challenge: None,
         }
     }
 
@@ -59,6 +62,13 @@ impl Error {
     #[must_use]
     pub fn with_allow(mut self, allow: &'static str) -> Self {
         self.allow = Some(allow);
+        self
+    }
+
+    /// Sets the `WWW-Authenticate` header of a 401 response.
+    #[must_use]
+    pub fn with_challenge(mut self, challenge: String) -> Self {
+        self.challenge = Some(challenge);
         self
     }
 
@@ -192,7 +202,16 @@ impl IntoResponse for Error {
         if self.status == StatusCode::UNAUTHORIZED {
             // RFC 6750 section 3: a request without credentials carries no
             // error attribute. Rejected credentials are `invalid_token`.
-            let challenge = if self.code == "missing_api_key" {
+            let custom = self
+                .challenge
+                .as_deref()
+                .and_then(|c| HeaderValue::from_str(c).ok());
+            let challenge = if let Some(custom) = custom {
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, custom);
+                return response;
+            } else if self.code == "missing_api_key" {
                 "Bearer realm=\"reseller\""
             } else {
                 "Bearer realm=\"reseller\", error=\"invalid_token\""

@@ -40,10 +40,6 @@ use tokio::{
     task::{AbortHandle, JoinSet},
 };
 
-/// Remote tools replaced by the local `signup` tool.
-const HIDDEN_REMOTE_TOOLS: [&str; 2] = ["signup_challenge", "create_account"];
-/// Remote tools that work without credentials.
-const PUBLIC_REMOTE_TOOLS: [&str; 1] = ["list_plans"];
 const MASK: &str = "<stored locally, use reveal_credentials>";
 const MAX_REMOTE_RESPONSE: u64 = 512 * 1024 * 1024;
 
@@ -575,8 +571,19 @@ impl Bridge {
         }
     }
 
+    /// The least-privileged stored credential, used to read the remote
+    /// server's listings.
+    fn listing_bearer(&self) -> Option<String> {
+        self.effective()
+            .ok()
+            .flatten()
+            .and_then(|c| Self::bearer_for(&c, "list_plans"))
+    }
+
     /// Instructions for the model. The flag tells whether the remote
     /// server's part could be fetched (otherwise results must not be cached).
+    /// The remote server answers signed-in callers only, so without
+    /// credentials the instructions are the local ones.
     async fn instructions(&self) -> (String, bool) {
         let mut instructions = format!(
             "This is the local reseller bridge for {}. Use `signup` to create an account (the proof of \
@@ -586,7 +593,10 @@ impl Bridge {
             self.origin,
             self.output_dir.display()
         );
-        let fresh = match self.rpc(None, "server/discover", json!({})).await {
+        let Some(bearer) = self.listing_bearer() else {
+            return (instructions, true);
+        };
+        let fresh = match self.rpc(Some(&bearer), "server/discover", json!({})).await {
             Ok(result) => {
                 if let Some(text) = result["instructions"].as_str() {
                     instructions.push_str("\n\nServer instructions:\n");
@@ -602,28 +612,27 @@ impl Bridge {
         (instructions, fresh)
     }
 
-    /// Local tools plus the remote ones. The flag tells whether the remote
-    /// list could be fetched.
+    /// Local tools plus the remote ones. The flag tells whether the list may
+    /// be cached. The server answers signed-in callers only, so signed out
+    /// (or when the server cannot be reached) this crate's own tool
+    /// catalogue stands in for the remote list. It is the same catalogue the
+    /// server serves, so it can be cached.
     async fn list_tools(&self) -> (Vec<Value>, bool) {
         let mut tools = local_tools();
-        let fresh = match self.rpc(None, "tools/list", json!({})).await {
+        let Some(bearer) = self.listing_bearer() else {
+            tools.extend(super::tools::definitions());
+            return (tools, true);
+        };
+        let fresh = match self.rpc(Some(&bearer), "tools/list", json!({})).await {
             Ok(result) => {
                 if let Some(remote) = result["tools"].as_array() {
-                    tools.extend(
-                        remote
-                            .iter()
-                            .filter(|t| {
-                                !t["name"]
-                                    .as_str()
-                                    .is_some_and(|n| HIDDEN_REMOTE_TOOLS.contains(&n))
-                            })
-                            .cloned(),
-                    );
+                    tools.extend(remote.iter().cloned());
                 }
                 true
             }
             Err(e) => {
                 tracing::warn!("remote tools/list failed: {}", e.message);
+                tools.extend(super::tools::definitions());
                 false
             }
         };
@@ -643,14 +652,14 @@ impl Bridge {
         if let Some(output) = local {
             return output.map(|o| Some(tool_result(o)));
         }
-        if HIDDEN_REMOTE_TOOLS.contains(&name) {
+        if !super::tools::exists(name) {
             return Ok(None);
         }
         let credentials = self
             .effective()
             .map_err(|e| ToolError::new("credentials_unreadable", format!("{e:#}")))?;
         let bearer = credentials.as_ref().and_then(|c| Self::bearer_for(c, name));
-        if bearer.is_none() && !PUBLIC_REMOTE_TOOLS.contains(&name) {
+        if bearer.is_none() {
             return Err(ToolError::new(
                 "not_signed_in",
                 "Not signed in. Call the signup tool to create an account, or the login tool \

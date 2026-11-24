@@ -250,6 +250,13 @@ public_url = "http://localhost:56787"
 # Serve the Model Context Protocol server. Default: true.
 # enabled = true
 
+# Serve the OAuth 2.1 authorization server for /mcp (dynamic client
+# registration, browser consent page, tokens). MCP clients such as Claude,
+# ChatGPT, Cursor and VS Code then connect by URL alone. Without it, /mcp
+# accepts only API keys and dashboard tokens as static bearer tokens.
+# Default: true.
+# oauth = true
+
 # Largest audio or image payload that MCP tools return inline. Must be between
 # 1 byte and 256 MiB (268435456). Default: 16 MiB (16777216).
 # max_media_bytes = 16777216

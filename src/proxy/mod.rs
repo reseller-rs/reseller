@@ -249,7 +249,8 @@ impl UploadCounter {
 /// Proxies one `/v1/*` request.
 pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response<Body>> {
     let config = app.config().await;
-    let identity = identity::authenticate(&app, req.headers(), Scope::Proxy).await?;
+    let identity =
+        identity::authenticate_request(&app, req.headers(), req.extensions(), Scope::Proxy).await?;
     let path = req.uri().path().to_owned();
     if path == "/v1/models" || path.starts_with("/v1/models/") {
         return models::serve(&app, identity.as_ref(), &path).await;
@@ -531,27 +532,33 @@ impl Exchange {
             }
         }
 
-        // An error page that is not JSON (for example an HTML 502 from a
-        // gateway) is replaced by an error in the API's shape.
-        let replacement = (!status.is_success()
-            && (status.is_client_error() || status.is_server_error())
-            && !is_json(&content_type))
-        .then(|| {
-            Error::new(
-                status,
-                "upstream_error",
-                format!(
-                    "The upstream provider returned an error (HTTP {})",
-                    status.as_u16()
-                ),
-            )
-        });
+        // Upstream errors are rebuilt in the API's shape: an error page that
+        // is not JSON (for example an HTML 502 from a gateway) gets a generic
+        // message, and a JSON error keeps only message, type, param and code,
+        // so upstream account details (user ids, provider metadata) never
+        // reach the customer.
+        let failed = !status.is_success() && (status.is_client_error() || status.is_server_error());
+        let head_result = response_head(&response, &meter, identity.as_ref(), balance, fallback);
+        let mut response = Some(response);
+        let (out_status, replacement) = if failed {
+            let raw = if is_json(&content_type)
+                && let Some(response) = response.take()
+            {
+                read_capped(response, deadline, UPSTREAM_ERROR_LIMIT).await
+            } else {
+                None
+            };
+            let (out_status, body) = upstream_error(status, raw.as_deref());
+            (out_status, Some(body))
+        } else {
+            (status, None)
+        };
         let (out_tx, mut out_rx) = mpsc::channel::<std::io::Result<Bytes>>(RELAY_BUFFER);
-        let mut gone = match response_head(&response, &meter, identity.as_ref(), balance, fallback)
-        {
+        let gone = match head_result {
             Ok(mut headers) => {
                 if replacement.is_some() {
                     headers.remove(header::CONTENT_ENCODING);
+                    headers.remove(header::CONTENT_LENGTH);
                     headers.insert(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("application/json"),
@@ -563,7 +570,7 @@ impl Exchange {
                     }
                 };
                 let mut out = Response::new(Body::from_stream(stream));
-                *out.status_mut() = status;
+                *out.status_mut() = out_status;
                 *out.headers_mut() = headers;
                 head.send(Ok(out)).is_err()
             }
@@ -577,14 +584,18 @@ impl Exchange {
             }
         };
 
-        if let Some(error) = replacement {
-            let body = Bytes::from(error.body().to_string());
+        if let Some(body) = replacement {
+            let body = Bytes::from(body.to_string());
             meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
             meter.bytes_out = body.len() as i64;
             let _ = out_tx.send(Ok(body)).await;
             settle(meter).await;
             return;
         }
+        let Some(response) = response else {
+            return;
+        };
+        let mut gone = gone;
         let mut source = response.bytes_stream();
         loop {
             let chunk = match tokio::time::timeout_at(deadline, source.next()).await {
@@ -635,6 +646,85 @@ async fn settle(meter: Meter) {
 }
 
 /// Response headers returned to the client.
+/// Largest upstream error body read for rewriting.
+const UPSTREAM_ERROR_LIMIT: usize = 64 * 1024;
+
+/// Reads at most `limit` bytes of a response body before `deadline`.
+/// Returns `None` when the body is larger, fails, or times out.
+async fn read_capped(
+    response: reqwest::Response,
+    deadline: tokio::time::Instant,
+    limit: usize,
+) -> Option<Bytes> {
+    let mut source = response.bytes_stream();
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, source.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                if out.len() + chunk.len() > limit {
+                    return None;
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Some(Bytes::from(out)),
+            Ok(Some(Err(_))) | Err(_) => return None,
+        }
+    }
+}
+
+/// Rebuilds an upstream error as `{"error":{"message","type","param","code"}}`.
+///
+/// Upstream 401, 402 and 403 concern the operator's upstream account, not
+/// the caller's key, so they become 502 with a generic message.
+fn upstream_error(status: StatusCode, raw: Option<&[u8]>) -> (StatusCode, Value) {
+    let generic = || {
+        format!(
+            "The upstream provider returned an error (HTTP {})",
+            status.as_u16()
+        )
+    };
+    if matches!(status.as_u16(), 401..=403) {
+        let error = Error::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "The upstream provider rejected the request. Please try again later",
+        );
+        return (StatusCode::BAD_GATEWAY, error.body());
+    }
+    let parsed: Option<Value> = raw.and_then(|b| serde_json::from_slice(b).ok());
+    let error = parsed.as_ref().map(|v| v.get("error").unwrap_or(v));
+    let text = |key: &str| {
+        error
+            .and_then(|e| e.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(1000).collect::<String>())
+    };
+    let message = text("message")
+        .or_else(|| error.and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(generic);
+    let kind = text("type").unwrap_or_else(|| {
+        if status.is_server_error() {
+            "server_error"
+        } else if status == StatusCode::TOO_MANY_REQUESTS {
+            "rate_limit_error"
+        } else {
+            "invalid_request_error"
+        }
+        .to_owned()
+    });
+    let code = match error.and_then(|e| e.get("code")) {
+        Some(Value::String(c)) if !c.is_empty() => Value::String(c.chars().take(100).collect()),
+        _ => Value::String("upstream_error".into()),
+    };
+    let param = text("param").map_or(Value::Null, Value::String);
+    let body = serde_json::json!({
+        "error": {"message": message, "type": kind, "param": param, "code": code}
+    });
+    (status, body)
+}
+
 fn response_head(
     response: &reqwest::Response,
     meter: &Meter,
@@ -690,11 +780,21 @@ async fn prepare(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if is_json(content_type) {
+    // Everything except multipart uploads and speech-to-text is read as JSON,
+    // whatever the Content-Type says, so a mislabelled body cannot skip the
+    // model policy, allowlist, or billing. Only an empty body passes through.
+    if is_json(content_type) || (kind != Kind::Stt && multipart::boundary(content_type).is_none()) {
         let bytes = to_bytes(body, config.max_json_body_bytes)
             .await
             .map_err(|_| Error::too_large("JSON body exceeds limit"))?;
         counter.bytes.store(bytes.len() as i64, Ordering::Relaxed);
+        if bytes.is_empty() && !is_json(content_type) {
+            return Ok(Prepared {
+                model: String::new(),
+                payload: Payload::Stream(Some(reqwest::Body::from(bytes))),
+                checked: false,
+            });
+        }
         let mut value: Value = serde_json::from_slice(&bytes)?;
         if !value.is_object() {
             return Err(Error::bad("JSON body must be an object"));
@@ -848,4 +948,56 @@ fn observe_models(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_errors_keep_only_the_openai_fields() {
+        let raw = br#"{"error":{"message":"x is not a valid model ID","code":400,"metadata":{"provider_name":"P"}},"user_id":"user_123"}"#;
+        let (status, body) = upstream_error(StatusCode::BAD_REQUEST, Some(raw));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            serde_json::json!({"error": {
+                "message": "x is not a valid model ID",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "upstream_error",
+            }})
+        );
+        assert!(!body.to_string().contains("user_"));
+    }
+
+    #[test]
+    fn upstream_openai_errors_pass_their_fields() {
+        let raw = br#"{"error":{"message":"bad","type":"invalid_request_error","param":"messages","code":"invalid_value"}}"#;
+        let (_, body) = upstream_error(StatusCode::BAD_REQUEST, Some(raw));
+        assert_eq!(body["error"]["param"], "messages");
+        assert_eq!(body["error"]["code"], "invalid_value");
+    }
+
+    #[test]
+    fn upstream_account_failures_become_bad_gateway() {
+        for code in [401, 402, 403] {
+            let status = StatusCode::from_u16(code).unwrap();
+            let (out, body) = upstream_error(
+                status,
+                Some(br#"{"error":{"message":"No auth credentials found"}}"#),
+            );
+            assert_eq!(out, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["error"]["code"], "upstream_error");
+            assert!(!body.to_string().contains("credentials"));
+        }
+    }
+
+    #[test]
+    fn non_json_upstream_errors_get_a_generic_message() {
+        let (out, body) = upstream_error(StatusCode::SERVICE_UNAVAILABLE, None);
+        assert_eq!(out, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "server_error");
+        assert!(body["error"]["message"].as_str().unwrap().contains("503"));
+    }
 }

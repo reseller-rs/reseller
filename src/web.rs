@@ -3,7 +3,7 @@
 use crate::{
     App, api,
     error::{Error, Result},
-    identity, mcp, payments, proxy, security, stats, theme,
+    identity, mcp, oauth, payments, proxy, security, stats, theme,
 };
 use axum::{
     Json, Router,
@@ -14,7 +14,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{any, get},
 };
 use serde_json::json;
 use std::{convert::Infallible, net::IpAddr, net::SocketAddr, time::Duration};
@@ -40,6 +40,7 @@ pub async fn router(app: App) -> Router {
             config.public_url.starts_with("https://"),
         )
     };
+    let app_state = app.clone();
     let mut router = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -48,6 +49,7 @@ pub async fn router(app: App) -> Router {
         .route("/workspace/", get(page))
         .route("/docs", get(page))
         .route("/docs/", get(page))
+        .route("/oauth/authorize", get(page))
         .route("/admin", get(page))
         .route("/admin/", get(page))
         .route(
@@ -99,8 +101,21 @@ pub async fn router(app: App) -> Router {
     if https {
         headers.push((header::STRICT_TRANSPORT_SECURITY, "max-age=31536000"));
     }
+    // The OAuth discovery and token endpoints allow any origin (browser-based
+    // MCP clients), independently of `cors_origin`, so they sit outside its layer.
+    let mut public = Router::new()
+        .route("/.well-known/{*rest}", any(oauth_public))
+        .route("/oauth/token", any(oauth_public))
+        .route("/oauth/register", any(oauth_public))
+        .route("/oauth/revoke", any(oauth_public))
+        .with_state(app_state)
+        .layer(public_cors());
     for (name, value) in headers {
         router = router.layer(SetResponseHeaderLayer::overriding(
+            name.clone(),
+            HeaderValue::from_static(value),
+        ));
+        public = public.layer(SetResponseHeaderLayer::overriding(
             name,
             HeaderValue::from_static(value),
         ));
@@ -108,7 +123,31 @@ pub async fn router(app: App) -> Router {
     if !cors_origin.is_empty() {
         router = router.layer(cors(&cors_origin));
     }
-    router
+    router.merge(public)
+}
+
+/// Any origin, no credentials: the metadata, registration, token and
+/// revocation endpoints carry no cookies and need no ambient authority.
+fn public_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::from(Any))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("mcp-protocol-version"),
+        ])
+        .max_age(Duration::from_secs(600))
+}
+
+async fn oauth_public(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    let trust_proxy = app.config().await.trust_proxy;
+    let ip = client_ip(peer, req.headers(), trust_proxy).to_string();
+    crate::oauth::serve_public(&app, req, &ip).await
 }
 
 fn cors(origin: &str) -> CorsLayer {
@@ -134,6 +173,7 @@ fn cors(origin: &str) -> CorsLayer {
             HeaderName::from_static("x-key-prefix"),
             HeaderName::from_static("x-account-balance-usd"),
             HeaderName::from_static("x-model-fallback"),
+            header::WWW_AUTHENTICATE,
         ])
 }
 
@@ -292,9 +332,16 @@ async fn route(app: App, peer: SocketAddr, req: Request<Body>) -> Result<Respons
         };
         return Ok(Json(handled).into_response());
     }
-    let management = ["/v1/keys", "/v1/account", "/v1/plans", "/v1/signup", "/mcp"]
-        .into_iter()
-        .any(is_api)
+    let management = [
+        "/v1/keys",
+        "/v1/account",
+        "/v1/plans",
+        "/v1/signup",
+        "/mcp",
+        "/oauth/api",
+    ]
+    .into_iter()
+    .any(is_api)
         || path.starts_with("/admin/api/");
     // Signup challenges have their own, tighter per-IP budget.
     if management && path != "/v1/signup/challenge" {
@@ -331,6 +378,13 @@ async fn serve(
     }
     if path == "/mcp" {
         return mcp::handle(app, req, ip).await;
+    }
+    if path == "/oauth/api/authorize" {
+        return match *method {
+            Method::GET => oauth::authorize_info(app, req).await,
+            Method::POST => oauth::authorize_decide(app, req, ip).await,
+            _ => Err(Error::method_not_allowed("GET, POST", "Use GET or POST")),
+        };
     }
     if path.starts_with("/admin/api/") {
         return Ok(Json(api::admin(app, req, ip).await?).into_response());

@@ -21,7 +21,10 @@ CREATE TABLE api_keys (
  name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','blocked','revoked')),
  limits TEXT NOT NULL CHECK(json_valid(limits)), markup_pct TEXT, expires_at INTEGER,
  created_at INTEGER NOT NULL, created_ip TEXT NOT NULL, bypass_ip INTEGER NOT NULL DEFAULT 0,
- last_used_at INTEGER
+ last_used_at INTEGER,
+ -- Lifetime billed spend in micro-USD, added by the meter on every billed amount. It survives
+ -- usage bucket and request log retention. An account's lifetime spend is the sum over its keys.
+ billed_micro INTEGER NOT NULL DEFAULT 0 CHECK(billed_micro>=0)
 ) STRICT;
 CREATE INDEX keys_account ON api_keys(account_id);
 CREATE INDEX keys_ip_time ON api_keys(created_ip,created_at);
@@ -140,3 +143,34 @@ CREATE TABLE payment_events (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL) S
 -- Solved proof-of-work challenges, so each one counts only once until it expires.
 CREATE TABLE pow_spent (challenge TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
 CREATE INDEX pow_spent_expires ON pow_spent(expires_at);
+-- OAuth 2.1 for the remote MCP endpoint. Clients register dynamically (public clients, RFC 7591).
+CREATE TABLE oauth_clients (
+ id TEXT PRIMARY KEY, name TEXT NOT NULL, client_uri TEXT, logo_uri TEXT,
+ redirect_uris TEXT NOT NULL CHECK(json_valid(redirect_uris)),
+ created_at INTEGER NOT NULL, created_ip TEXT NOT NULL
+) STRICT;
+CREATE INDEX oauth_clients_created ON oauth_clients(created_at);
+-- A user's authorization of one client for one API key. Deleting a grant revokes its tokens.
+CREATE TABLE oauth_grants (
+ id TEXT PRIMARY KEY, client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+ key_id TEXT NOT NULL REFERENCES api_keys(id), scope TEXT NOT NULL, resource TEXT NOT NULL,
+ created_at INTEGER NOT NULL, last_used_at INTEGER
+) STRICT;
+CREATE INDEX oauth_grants_key ON oauth_grants(key_id);
+CREATE INDEX oauth_grants_client ON oauth_grants(client_id);
+-- Single-use authorization codes (HMAC digests only), removed when exchanged.
+CREATE TABLE oauth_codes (
+ code_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+ key_id TEXT NOT NULL REFERENCES api_keys(id), redirect_uri TEXT NOT NULL, code_challenge TEXT NOT NULL,
+ resource TEXT NOT NULL, scope TEXT NOT NULL, expires_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX oauth_codes_expires ON oauth_codes(expires_at);
+-- Access and refresh tokens (HMAC digests only). used=1 marks a rotated refresh token:
+-- presenting it again revokes the whole grant.
+CREATE TABLE oauth_tokens (
+ hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL CHECK(kind IN ('access','refresh')), expires_at INTEGER NOT NULL,
+ used INTEGER NOT NULL DEFAULT 0 CHECK(used IN (0,1))
+) STRICT;
+CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);
+CREATE INDEX oauth_tokens_expires ON oauth_tokens(expires_at);

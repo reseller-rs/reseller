@@ -8,6 +8,7 @@
 //! - [`api`]: customer (`/v1/keys`, `/v1/account`) and administrator APIs.
 //! - [`identity`] / [`keys`]: authentication and API key lifecycle.
 //! - [`mcp`]: Model Context Protocol server (`/mcp`) and stdio bridge.
+//! - [`oauth`]: OAuth 2.1 authorization server for `/mcp`.
 //! - [`security`]: rate limiting and proof-of-work signup challenges.
 //! - [`billing`] / [`money`]: credit ledger, plans, redeem codes, and micro-USD.
 //! - [`payments`]: plan checkout orders via Stripe (cards) and Payroof (crypto).
@@ -24,6 +25,7 @@ pub mod keys;
 pub mod mcp;
 pub mod meter;
 pub mod money;
+pub mod oauth;
 pub mod payments;
 pub mod proxy;
 pub mod security;
