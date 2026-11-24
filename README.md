@@ -621,6 +621,8 @@ All routes live under `/admin/api`. They require the administrator token, sent a
 | `GET` | `/plans` | List plans |
 | `POST` | `/plans` | Upsert a plan: `code`, `name`, `price_usd`, `credit_usd`, `duration_days`, optional `active` and `description` |
 | `DELETE` | `/plans/:code` | Delete only while unreferenced. Otherwise deactivate. |
+
+A new database starts with three plans: `monthly` ($20 for $20 of credit, 30 days), `halfyear` ($96 for $100, 182 days), and `year` ($144 for $150, 365 days). Plans are one-time purchases that never renew. Their credit expires when the plan ends. The pricing table shows each plan's price per month and any bonus credit (credit above the price). Keep the bonus below `markup_pct`, otherwise a fully used plan costs more upstream than it earns.
 | `GET` | `/codes` | List redeem codes |
 | `POST` | `/codes` | Create one code, or an array of up to 100. Each item takes `credit_usd` or `plan_code`, plus optional `expires_at` and `note`. |
 | `PATCH` | `/codes/:id` | Update `expires_at` or `note` (unredeemed codes only) |

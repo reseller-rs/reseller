@@ -83,10 +83,41 @@ const ms = v => {
 };
 const shortId = id => id ? `${String(id).slice(0, 8)}...` : '-';
 const percent = (part, whole) => whole > 0 ? `${((part / whole) * 100).toFixed(1)}%` : '-';
-// Best value: most credit per dollar, then the lowest price per day.
-const bestCode = plans => plans.slice().sort((a, b) =>
-  (Number(b.credit_usd) / Number(b.price_usd)) - (Number(a.credit_usd) / Number(a.price_usd))
-  || (Number(a.price_usd) / a.duration_days) - (Number(b.price_usd) / b.duration_days))[0]?.code;
+/* Plan maths ---------------------------------------------------------------------
+   Everything shown about a plan is derived from the API values (price, credit,
+   duration), so operators can change the catalog without touching this file. */
+const MONTH_DAYS = 30.4;
+// Whole dollars drop the cents ($12), other amounts keep two ($16.67).
+const usdShort = n => {
+  const r = Math.round(Number(n) * 100) / 100;
+  return `$${Number.isInteger(r) ? r.toLocaleString() : r.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+function planInfo(p) {
+  const price = Number(p.price_usd), credit = Number(p.credit_usd || 0);
+  const months = Math.max(1, Math.round(Number(p.duration_days) / MONTH_DAYS));
+  return {
+    price, credit, months, days: Number(p.duration_days),
+    perMonth: price / months,
+    creditPerMonth: credit / months,
+    bonus: credit > price ? credit - price : 0,
+    ratio: price > 0 ? credit / price : 0,
+  };
+}
+const billedLine = i => i.price <= 0 ? 'No charge' : `${usdShort(i.price)} one-time · ${i.months === 1 ? '1 month' : `${i.months} months`}`;
+const perMonthLabel = i => i.price <= 0 ? 'Free' : usdShort(i.perMonth);
+// Best value: most credit per dollar paid, ties go to the longest plan. Shown only
+// when plans actually differ. "Most flexible" marks the one-month plan.
+function planBadges(plans) {
+  const badges = new Map();
+  if (plans.length < 2) return badges;
+  const key = p => Math.round(planInfo(p).ratio * 1e6);
+  const ranked = plans.slice().sort((a, b) => key(b) - key(a) || b.duration_days - a.duration_days);
+  if (key(ranked[0]) > key(ranked[ranked.length - 1])) badges.set(ranked[0].code, 'Best value');
+  const monthly = plans.find(p => planInfo(p).months === 1 && !badges.has(p.code));
+  if (monthly) badges.set(monthly.code, 'Most flexible');
+  return badges;
+}
+const bestCode = plans => [...planBadges(plans)].find(([, label]) => label === 'Best value')?.[0];
 const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', confirmed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', late: 'warn', pending: 'info', redeemed: 'info', seen: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger', 'used up': 'muted' }));
 const METHOD_LABELS = { stripe: 'Card', crypto: 'Crypto' };
 const methodLabel = m => METHOD_LABELS[m] || m;
@@ -305,7 +336,7 @@ const skChart = () => `<div class="card"><div class="card-head">${skel('skel-tit
 const skToolbar = () => `<div class="toolbar">${skel('skel-input wide')}${skel('skel-input', 2)}${skel('skel-btn')}</div>`;
 const skTable = (rows = 6, cols = 5) => `<div class="skel-table"><div class="skel-row head cols-${cols}">${skel('skel-line sm', cols)}</div>${Array.from({ length: rows }, () => `<div class="skel-row cols-${cols}">${skel('skel-line md')}${skel('skel-line sm', cols - 1)}</div>`).join('')}</div>`;
 const skFacts = n => `<div class="skel-facts">${Array.from({ length: n }, () => `<div class="skel-fact">${skel('skel-line sm')}${skel('skel-line lg')}</div>`).join('')}</div>`;
-const skPlans = n => `<div class="plans">${Array.from({ length: n }, () => `<div class="card plan-card skel-plan">${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line lg')}${skel('skel-line md')}</div>`).join('')}</div>`;
+const skPlans = n => `<div class="plans pricing" data-count="${n}">${Array.from({ length: n }, () => `<div class="card plan-card skel-plan"><div class="plan-top">${skel('skel-line sm')}</div>${skel('skel-metric')}${skel('skel-line md')}<div class="skel-feats">${skel('skel-line lg', 3)}</div>${skel('skel-line lg')}${skel('skel-btn wide')}</div>`).join('')}</div><div class="assurance skel-assure">${skel('skel-line md', 3)}</div>`;
 const skCard = body => `<div class="card">${body}</div>`;
 
 const SKELETON_VIEWS = {
@@ -484,16 +515,117 @@ function confirmModal(title, message, confirmLabel = 'Confirm', danger = false) 
   });
 }
 
-function planCard(p, best, cta) {
-  const featured = p.code === best;
-  return `<article class="card plan-card${featured ? ' featured' : ''}">
-    ${featured ? '<span class="plan-flag">Best value</span>' : ''}
-    <div class="plan-name">${esc(p.name)}</div>
-    <div class="plan-price">${esc(usd(p.price_usd))}<small> / ${count(p.duration_days)} days</small></div>
-    ${p.credit_usd ? `<div class="plan-credit"><span>API credit</span><strong>${esc(usd(p.credit_usd))}</strong></div>` : ''}
+const CHECK = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="M3 8.5l3.2 3.2L13 4.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+function planCard(p, badges, cta) {
+  const i = planInfo(p);
+  const badge = badges.get(p.code);
+  const featured = badge === 'Best value';
+  return `<article class="card plan-card${featured ? ' featured' : ''}" aria-label="${esc(p.name)} plan">
+    <div class="plan-top"><h3 class="plan-name">${esc(p.name)}</h3>${badge ? `<span class="plan-flag${featured ? '' : ' soft'}">${esc(badge)}</span>` : ''}</div>
+    <div class="plan-price"><span class="plan-amount">${esc(perMonthLabel(i))}</span>${i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
+    <div class="plan-billed">${esc(billedLine(i))}</div>
+    ${i.credit ? `<ul class="plan-features">
+      <li>${CHECK}<span><strong>${esc(usdShort(i.credit))} API credit</strong>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}</span></li>
+      <li>${CHECK}<span>&asymp; ${esc(usdShort(i.creditPerMonth))} of usage per month</span></li>
+      <li>${CHECK}<span>Credit valid for ${esc(plural(i.days, 'day'))}</span></li>
+    </ul>` : '<ul class="plan-features"></ul>'}
     <p class="plan-desc">${esc(p.description || 'Prepaid API credit.')}</p>
-    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/">Choose plan</a>`}</div>
+    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/#billing">Choose plan</a>`}</div>
   </article>`;
+}
+const methodNames = methods => [methods.includes('stripe') && 'card', methods.includes('crypto') && 'crypto'].filter(Boolean);
+// Plan grid, reassurance row, and a short FAQ. `cta(plan)` renders each button.
+function pricingSection(plans, methods = [], cta) {
+  if (!plans.length) return emptyState('No plans yet', 'An operator has not published any plans.');
+  const badges = planBadges(plans);
+  const paid = methodNames(methods);
+  const assurances = [
+    'Credit stays valid until the plan ends',
+    paid.length ? `Pay by ${paid.join(' or ')}` : 'Redeem a credit code from the operator',
+    'One-time purchase, no auto-renewal',
+    'Usage-based: each request is deducted from credit',
+  ];
+  const terms = plans.map(p => `${p.name}: ${plural(p.duration_days, 'day')}`).join('; ');
+  const faq = [
+    ['What is API credit?', `Credit is a prepaid USD balance. Each request is priced from its usage (tokens, characters, audio seconds, or images) and deducted from it. Every key on your account shares the balance.`],
+    ['What happens when my credit runs out?', 'Requests stop with a 429 insufficient_quota error that explains how to top up. Buy another plan, redeem a credit code, or add funds, and calls work again right away.'],
+    ['When does my credit expire?', `Plan credit expires when its plan ends (${terms}). Credit that expires soonest is spent first, so nothing is lost while you still have time left.`],
+    ['Can I pay as I go?', methods.includes('crypto')
+      ? 'Yes. Open Billing in your workspace and send stablecoins to your personal deposit address. Any amount is credited 1:1 in USD, with no plan needed.'
+      : 'Plans are prepaid packages. Ask the operator for a credit code to add a custom amount.'],
+  ];
+  return `<div class="plans pricing" data-count="${plans.length}">${plans.map(p => planCard(p, badges, cta?.(p))).join('')}</div>
+    <ul class="assurance">${assurances.map(a => `<li>${CHECK}${esc(a)}</li>`).join('')}</ul>
+    <div class="faq" role="list">${faq.map(([q, a]) => `<details role="listitem"><summary>${esc(q)}</summary><p>${esc(a)}</p></details>`).join('')}</div>`;
+}
+
+/* Checkout ---------------------------------------------------------------------
+   Choose plan -> Pay -> Credit added, in one dialog. Card payments hand off to
+   Stripe. Crypto orders stay in the dialog and update while it is open. */
+let planCatalog = { plans: [], methods: [] };
+const STEPS = ['Choose plan', 'Pay', 'Credit added'];
+const stepper = current => `<ol class="stepper" aria-label="Checkout progress">${STEPS.map((label, n) => `<li class="${n < current ? 'done' : n === current ? 'current' : ''}"${n === current ? ' aria-current="step"' : ''}><span class="step-dot">${n < current ? CHECK : n + 1}</span><span class="step-label">${esc(label)}</span></li>`).join('')}</ol>`;
+const expiryText = (i, paidAt) => paidAt
+  ? `Valid until ${day(paidAt + i.days * DAY, { dateStyle: 'medium' })}`
+  : `${plural(i.days, 'day')} from payment, until ${day(nowSeconds() + i.days * DAY, { dateStyle: 'medium' })}`;
+function orderSummary(p, { paidAt } = {}) {
+  const i = planInfo(p);
+  return `<aside class="card order-summary" aria-label="Order summary">
+    <div class="label">Order summary</div>
+    <div class="order-plan"><strong>${esc(p.name || p.code)}</strong><span class="hint">${esc(perMonthLabel(i))}${i.price > 0 ? ' per month' : ''}</span></div>
+    ${facts([
+      ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">${esc(i.months === 1 ? 'for 1 month' : `for ${i.months} months`)}, one-time</span>`],
+      i.credit ? ['API credit', `<strong>${esc(usdShort(i.credit))}</strong>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}`] : null,
+      ['Credit validity', esc(expiryText(i, paidAt))],
+    ])}
+  </aside>`;
+}
+const METHOD_INFO = {
+  stripe: ['Card', 'Pay securely on the Stripe checkout page.'],
+  crypto: ['Crypto', 'USDC, USDT, and native coins on supported networks.'],
+};
+function checkout(plan, methods) {
+  if (!methods.length) return notice('Online payments are not enabled. Use a credit code.', true);
+  const i = planInfo(plan);
+  modal(`Checkout: ${plan.name}`, `<div data-pay>
+    ${stepper(1)}
+    <form class="checkout-grid">
+      <div>
+        <fieldset class="method-choice"><legend>Payment method</legend>
+          ${methods.map((m, n) => `<label class="method"><input type="radio" name="method" value="${esc(m)}"${n === 0 ? ' checked' : ''}><span class="method-body"><strong>${esc(METHOD_INFO[m]?.[0] || m)}</strong><span class="hint">${esc(METHOD_INFO[m]?.[1] || '')}</span></span></label>`).join('')}
+        </fieldset>
+        <p class="field-help">Plans are one-time purchases and do not renew. Credit is added to the balance shared by all your keys.</p>
+      </div>
+      ${orderSummary(plan)}
+      <div class="actions checkout-actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary" data-submit>Continue to payment</button></div>
+    </form>
+  </div>`, d => {
+    const box = d.querySelector('[data-pay]');
+    const form = box.querySelector('form');
+    const submit = form.querySelector('[data-submit]');
+    const label = () => {
+      const m = form.elements.method.value;
+      submit.textContent = m === 'stripe' ? `Pay ${usdShort(i.price)} by card` : `Show crypto payment details`;
+    };
+    label();
+    form.addEventListener('change', label);
+    form.querySelector('[data-cancel]').onclick = () => d.close();
+    bindForm(form, async b => {
+      const v = await api('/v1/account/checkout', 'POST', { plan_code: plan.code, method: b.method });
+      if (v.method === 'crypto') {
+        d.querySelector('h2').textContent = 'Pay with crypto';
+        runOrder(d, v);
+        if (tab === 'billing') load();
+        return;
+      }
+      const url = new URL(v.url);
+      if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com') throw new Error('Unexpected checkout URL');
+      submit.textContent = 'Redirecting to Stripe...';
+      submit.disabled = true;
+      location.href = url.href;
+      await new Promise(() => {});
+    });
+  }, 'wide');
 }
 
 /* Charts ----------------------------------------------------------------------- */
@@ -1356,20 +1488,22 @@ async function docs() {
   main.innerHTML = `
     <div class="docs-layout">
       <nav class="docs-nav" aria-label="Documentation">
-        <div class="eyebrow">Documentation</div>
-        <ol>${DOC_SECTIONS.map(([id, label]) => `<li><a href="#${id}" data-doc-link="${id}">${esc(label)}</a></li>`).join('')}</ol>
+        <button type="button" class="docs-nav-toggle" aria-expanded="false" aria-controls="docs-toc"><span>On this page</span><strong data-toc-current>${esc(DOC_SECTIONS[0][1])}</strong></button>
+        <div class="eyebrow">On this page</div>
+        <ol id="docs-toc">${DOC_SECTIONS.map(([id, label]) => `<li><a href="#${id}" data-doc-link="${id}">${esc(label)}</a></li>`).join('')}</ol>
       </nav>
       <article class="docs-body">
         <header class="docs-hero">
-          <div class="docs-hero-top">
-            <div><div class="eyebrow">${esc(brandName)} API</div><h1>Developer docs</h1></div>
-            <div class="actions">${session ? '<a class="button primary small" href="/workspace/#keys">API keys</a>' : '<button type="button" class="primary small" data-create>Get an API key</button><a class="button ghost small" href="/workspace/">Sign in</a>'}</div>
+          <div class="docs-hero-main">
+            <div class="eyebrow">${esc(brandName)} API</div>
+            <h1>Developer docs</h1>
+            <p class="lead">One OpenAI-compatible API for text, speech, transcription, and images. Change the base URL and key, keep your code.</p>
+            <div class="actions">${session ? '<a class="button primary" href="/workspace/#keys">API keys</a>' : '<button type="button" class="primary" data-create>Get an API key</button><a class="button ghost" href="/workspace/">Sign in</a>'}<a class="button ghost" href="#quick-start">Quick start</a></div>
           </div>
-          <p class="lead">One OpenAI-compatible API for text, speech, transcription, and images. Change the base URL and key, keep your code.</p>
-          <div class="docs-facts">
-            <div><span class="label">Base URL</span>${copyable(base, 'Base URL')}</div>
-            <div><span class="label">MCP</span>${copyable(`${location.origin}/mcp`, 'MCP endpoint')}</div>
-            <div><span class="label">Auth</span><code>Authorization: Bearer $RESELLER_KEY</code></div>
+          <div class="connect-card" role="group" aria-label="Connection details">
+            <div class="connect-row"><span class="label">Base URL</span>${copyable(base, 'Base URL')}</div>
+            <div class="connect-row"><span class="label">MCP URL</span>${copyable(`${location.origin}/mcp`, 'MCP endpoint')}</div>
+            <div class="connect-row"><span class="label">Auth header</span>${copyable('Authorization: Bearer $RESELLER_KEY', 'Auth header')}</div>
           </div>
         </header>
 
@@ -1462,10 +1596,22 @@ async function docs() {
   main.querySelector('[data-create]')?.addEventListener('click', keyForm);
   // Highlight the section in view.
   const links = new Map([...main.querySelectorAll('[data-doc-link]')].map(a => [a.dataset.docLink, a]));
+  const toc = main.querySelector('.docs-nav');
+  const toggle = toc.querySelector('.docs-nav-toggle');
+  toggle.onclick = () => {
+    const open = toc.classList.toggle('open');
+    toggle.setAttribute('aria-expanded', String(open));
+  };
+  toc.addEventListener('click', e => {
+    if (!e.target.closest('a')) return;
+    toc.classList.remove('open');
+    toggle.setAttribute('aria-expanded', 'false');
+  });
   const observer = new IntersectionObserver(entries => {
     for (const entry of entries) {
       if (!entry.isIntersecting) continue;
       links.forEach((a, id) => id === entry.target.id ? a.setAttribute('aria-current', 'location') : a.removeAttribute('aria-current'));
+      toc.querySelector('[data-toc-current]').textContent = links.get(entry.target.id)?.textContent || '';
     }
   }, { rootMargin: '-15% 0px -70% 0px' });
   main.querySelectorAll('.doc-section').forEach(s => observer.observe(s));
@@ -1550,10 +1696,7 @@ async function landing() {
   const slot = document.querySelector('#plans');
   try {
     const v = await api('/v1/plans');
-    const best = bestCode(v.plans);
-    slot.innerHTML = v.plans.length
-      ? `<div class="plans">${v.plans.map(p => planCard(p, best)).join('')}</div>`
-      : emptyState('No plans yet', 'An operator has not published any plans.');
+    slot.innerHTML = pricingSection(v.plans, v.payment_methods || []);
   } catch (e) {
     slot.innerHTML = `<div class="card error"><strong>Plans could not be loaded</strong><p>${esc(e.message)}</p></div>`;
   } finally {
@@ -1966,11 +2109,11 @@ const views = {
   async billing(signal) {
     const [v, p, orders] = await Promise.all([get('/v1/account', signal), get('/v1/plans', signal), get('/v1/account/payments', signal)]);
     const a = v.account;
-    const best = bestCode(p.plans);
     const methods = p.payment_methods || [];
+    planCatalog = { plans: p.plans, methods };
     const topUp = v.top_up;
     const cta = plan => methods.length
-      ? `<div class="pay-buttons">${methods.map((m, i) => `<button type="button" class="${i === 0 ? 'primary' : 'ghost'}" data-buy="${esc(plan.code)}" data-method="${esc(m)}">${m === 'stripe' ? 'Pay by card' : 'Pay with crypto'}</button>`).join('')}</div>`
+      ? `<button type="button" class="${planBadges(p.plans).get(plan.code) === 'Best value' ? 'primary' : ''}" data-checkout="${esc(plan.code)}">Choose ${esc(plan.name)}</button>`
       : '<span class="hint">Online payments are not enabled. Use a credit code.</span>';
     return `<div class="banner">
         <div><div class="label">Available balance</div><div class="metric">${esc(usd(a.balance_usd))}</div><div class="hint">${isPositive(a.debt_usd) ? `Debt ${esc(usd(a.debt_usd))} is repaid from the next top-up.` : `Spent so far: ${esc(usd(a.billed_usd))}`}</div></div>
@@ -1982,10 +2125,8 @@ const views = {
         ${facts(topUp.addresses.map(x => [x.chain_name, copyable(x.address, `${x.chain_name} address`)]))}
       </div>` : ''}
       <section class="billing-catalog">
-        <div class="catalog-head"><div><h3>Prepaid plans</h3><p>Non-renewing packages. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto checkout accepts USDC, USDT, and native coins on supported networks.' : ''}</p></div></div>
-        <div class="plans plan-catalog">${p.plans.length
-          ? p.plans.map(plan => planCard(plan, best, cta(plan))).join('')
-          : emptyState('No plans available', 'Ask the operator for a redeem code instead.')}</div>
+        <div class="catalog-head"><h3>Prepaid plans</h3><p>Non-renewing packages. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto checkout accepts USDC, USDT, and native coins on supported networks.' : ''}</p></div>
+        ${pricingSection(p.plans, methods, cta)}
       </section>
       ${orders.payments.length ? `<h3 class="section">Your payments</h3>
       ${table([
@@ -2107,51 +2248,91 @@ function transfersTable(transfers) {
     ['Note', r => r.note ? pill(r.note.replace(/_/g, ' '), 'warn') : ''],
   ], transfers)}</section>`;
 }
+const planOfOrder = o => {
+  const known = planCatalog.plans.find(p => p.code === o.plan_code);
+  return { code: o.plan_code, name: known?.name || o.plan_code, price_usd: o.price_usd, credit_usd: o.credit_usd, duration_days: o.duration_days };
+};
+// pending, confirming, paid, expired, or failed.
+const orderState = o => o.status === 'paid' ? 'paid'
+  : o.status === 'expired' ? 'expired'
+  : o.status === 'failed' || o.status === 'cancelled' ? 'failed'
+  : isPositive(o.received_usd) || (o.transfers || []).some(t => t.status === 'seen' || t.status === 'confirmed') ? 'confirming'
+  : 'pending';
+const ORDER_STATES = {
+  pending: ['Waiting for your transfer', 'Send one of the amounts below. This page updates by itself.'],
+  confirming: ['Payment detected', 'Waiting for network confirmations. You can close this window, credit is added automatically.'],
+  paid: ['Payment confirmed', 'Your credit is ready to use.'],
+  expired: ['This quote expired', 'Quotes are valid for a limited time. Start a new payment to get fresh amounts.'],
+  failed: ['Payment not completed', 'This order was cancelled or failed. Contact the operator if you already sent funds.'],
+};
+const STATE_ICONS = { paid: CHECK, expired: '!', failed: '&times;', pending: '<span class="spinner" aria-hidden="true"></span>', confirming: '<span class="spinner" aria-hidden="true"></span>' };
 function cryptoView(o) {
-  const open = o.status === 'pending';
-  return `<div class="tiles">
-      ${metric('Order total', usd(o.price_usd), `${esc(o.plan_code)} plan`)}
-      ${metric('Confirmed', usd(o.received_usd), o.status === 'paid' ? 'Credit added' : 'Updates automatically')}
-      ${metric('Status', pill(o.status), open && o.expires_at ? `Quote valid until ${esc(date(o.expires_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}` : '', { html: true })}
+  const state = orderState(o);
+  const plan = planOfOrder(o);
+  const [title, text] = ORDER_STATES[state];
+  const step = state === 'paid' ? 3 : 1;
+  const i = planInfo(plan);
+  const tone = { paid: 'ok', expired: 'warn', failed: 'danger' }[state] || 'info';
+  return `${stepper(step)}
+    <div class="pay-state tone-${tone}" role="status">
+      <span class="pay-state-icon" aria-hidden="true">${STATE_ICONS[state]}</span>
+      <div><strong>${esc(title)}</strong><p>${esc(state === 'paid' ? `${usdShort(i.credit || i.price)} of API credit was added. ${expiryText(i, o.paid_at)}.` : text)}${state === 'pending' && o.expires_at ? ` Quote valid until ${esc(date(o.expires_at))}.` : ''}</p></div>
+      ${pill(state === 'expired' ? 'expired' : state === 'confirming' ? 'confirming' : o.status)}
     </div>
-    ${open ? `<p class="muted">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Credit is added after network confirmations. Partial payments in several assets add up. Stablecoins count 1:1 in USD, native coins at the quoted rate.</p>
-    ${table([
-      ['Asset', q => `<strong>${esc(q.symbol)}</strong><div class="hint">${esc(q.chain_name)}</div>`],
-      ['Amount', q => `${copyable(q.amount, 'Amount', `${q.amount} ${q.symbol}`)}${q.rate_usd !== '1' ? `<div class="hint">at ${esc(usd(q.rate_usd))} per ${esc(q.symbol)}</div>` : ''}`, 'wrap'],
-      ['Deposit address', q => copyable(q.address, 'Address'), 'wrap'],
-    ], o.quotes || [])}` : ''}
+    <div class="checkout-grid pay-grid">
+      <div>
+        ${state === 'pending' || state === 'confirming' ? `<p class="muted pay-note">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Partial payments in several assets add up. Stablecoins count 1:1 in USD, native coins at the quoted rate.</p>
+        <div class="quotes">${(o.quotes || []).map(q => `<div class="quote">
+          <div class="quote-head"><strong>${esc(q.symbol)}</strong><span class="hint">${esc(q.chain_name)}</span></div>
+          <div class="label">Send exactly <span class="hint">(click to copy)</span></div>${copyable(q.amount, `${q.symbol} amount`, `${q.amount} ${q.symbol}`)}${q.rate_usd !== '1' ? `<div class="hint">at ${esc(usd(q.rate_usd))} per ${esc(q.symbol)}</div>` : ''}
+          <div class="label">To address <span class="hint">(click to copy)</span></div>${copyable(q.address, `${q.chain_name} address`)}
+        </div>`).join('')}</div>` : ''}
+        ${state === 'paid' ? `<div class="actions pay-done"><button type="button" class="primary" data-pay-done>Done</button></div>` : ''}
+        ${state === 'expired' ? `<div class="actions pay-done"><button type="button" class="primary" data-pay-again>Start a new payment</button></div>` : ''}
+      </div>
+      ${orderSummary(plan, { paidAt: o.paid_at })}
+    </div>
     ${transfersTable(o.transfers)}`;
 }
-function cryptoOrder(initial) {
+// Shows a crypto order in a dialog and keeps it fresh until it settles.
+function runOrder(d, initial) {
+  const box = d.querySelector('[data-pay]');
   let order = initial;
   let timer;
-  modal('Pay with crypto', '<div data-crypto></div>', d => {
-    const box = d.querySelector('[data-crypto]');
-    const draw = () => {
-      box.innerHTML = cryptoView(order);
-      wireCopies(box);
-    };
-    const poll = async () => {
-      if (!d.open) return;
-      try {
-        const next = await api(`/v1/account/payments/${encodeURIComponent(order.id)}`);
-        const changed = next.status !== order.status || next.received_usd !== order.received_usd || (next.transfers || []).length !== (order.transfers || []).length;
-        order = next;
-        if (changed) draw();
-        if (order.status === 'paid') {
-          notice('Payment confirmed, credit added');
-          if (tab === 'billing') load();
-          return;
-        }
-      } catch {
-        // Transient errors: keep polling.
+  const draw = () => {
+    box.innerHTML = cryptoView(order);
+    wireCopies(box);
+    box.querySelector('[data-pay-done]')?.addEventListener('click', () => d.close());
+    box.querySelector('[data-pay-again]')?.addEventListener('click', () => {
+      const plan = planCatalog.plans.find(p => p.code === order.plan_code);
+      d.close();
+      if (plan) checkout(plan, planCatalog.methods);
+    });
+  };
+  const poll = async () => {
+    if (!d.open) return;
+    try {
+      const next = await api(`/v1/account/payments/${encodeURIComponent(order.id)}`);
+      const changed = next.status !== order.status || next.received_usd !== order.received_usd || (next.transfers || []).length !== (order.transfers || []).length
+        || (next.transfers || []).map(t => t.status).join() !== (order.transfers || []).map(t => t.status).join();
+      order = next;
+      if (changed) draw();
+      if (order.status === 'paid') {
+        notice('Payment confirmed, credit added');
+        if (tab === 'billing') load();
+        return;
       }
-      if (order.status === 'pending') timer = setTimeout(poll, 10_000);
-    };
-    draw();
-    if (order.status === 'pending') timer = setTimeout(poll, 10_000);
-    d.addEventListener('close', () => clearTimeout(timer));
-  }, 'wide');
+    } catch {
+      // Transient errors: keep polling.
+    }
+    if (order.status === 'pending') timer = setTimeout(poll, 8_000);
+  };
+  draw();
+  if (order.status === 'pending') timer = setTimeout(poll, 8_000);
+  d.addEventListener('close', () => clearTimeout(timer));
+}
+function cryptoOrder(initial) {
+  modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'wide');
 }
 async function paymentDetails(id) {
   const o = await api(endpoint(`payments/${encodeURIComponent(id)}`));
@@ -2582,16 +2763,9 @@ function wire(root) {
     await load();
   });
   action('[data-code]', async () => codeForm());
-  action('[data-buy]', async b => {
-    const v = await api('/v1/account/checkout', 'POST', { plan_code: b.dataset.buy, method: b.dataset.method });
-    if (v.method === 'crypto') {
-      cryptoOrder(v);
-      await load();
-      return;
-    }
-    const url = new URL(v.url);
-    if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com') throw new Error('Unexpected checkout URL');
-    location.href = url.href;
+  action('[data-checkout]', async b => {
+    const plan = planCatalog.plans.find(p => p.code === b.dataset.checkout);
+    if (plan) checkout(plan, planCatalog.methods);
   });
   action('[data-order]', async b => cryptoOrder(await api(`/v1/account/payments/${encodeURIComponent(b.dataset.order)}`)));
   action('[data-payment]', async b => paymentDetails(b.dataset.payment));

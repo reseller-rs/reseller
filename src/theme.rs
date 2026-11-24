@@ -166,10 +166,41 @@ pub async fn page(app: &App) -> Html<String> {
     let custom = theme_file(app, Path::new("index.html"), MAX_TEMPLATE_BYTES)
         .await
         .and_then(|bytes| String::from_utf8(bytes).ok());
-    Html(render(
+    let mut html = render(
         custom.as_deref().unwrap_or(BUILTIN_TEMPLATE),
         &config.branding,
-    ))
+    );
+    // A custom favicon gets the conventional companions from the theme
+    // directory: a PNG fallback and the iOS home-screen icon.
+    let mut extra = String::new();
+    if config.branding.favicon_url.starts_with("/theme/") {
+        if theme_exists(app, "favicon-32.png").await {
+            extra.push_str(
+                "\n  <link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/theme/favicon-32.png\">",
+            );
+        }
+        if theme_exists(app, "apple-touch-icon.png").await {
+            extra.push_str(
+                "\n  <link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"/theme/apple-touch-icon.png\">",
+            );
+        }
+    }
+    if !extra.is_empty()
+        && let Some(at) = html.find("</head>")
+    {
+        html.insert_str(at, &format!("{}\n", extra.trim_start_matches('\n')));
+    }
+    Html(html)
+}
+
+/// Whether the theme directory holds a regular file `name`.
+async fn theme_exists(app: &App, name: &str) -> bool {
+    match &app.theme_dir {
+        Some(dir) => tokio::fs::metadata(dir.join(name))
+            .await
+            .is_ok_and(|m| m.is_file()),
+        None => false,
+    }
 }
 
 /// `/assets/theme.css`: branding variables, custom CSS, then `theme.css`

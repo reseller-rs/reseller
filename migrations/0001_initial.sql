@@ -44,7 +44,7 @@ CREATE TABLE plans (
  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), description TEXT NOT NULL DEFAULT ''
 ) STRICT;
 -- Built-in plans: price and credit in micro-USD (20000000 = 20 USD).
-INSERT INTO plans VALUES ('monthly','Monthly',20000000,20000000,30,1,'Thirty days of API credit'),('extended','Extended',100000000,100000000,180,1,'Six months of API credit'),('year','Yearly',160000000,160000000,360,1,'360 days of API credit');
+INSERT INTO plans VALUES ('monthly','Monthly',20000000,20000000,30,1,'Try it for a month, with no commitment.'),('halfyear','6 months',96000000,100000000,182,1,'Commit for six months and get bonus credit.'),('year','12 months',144000000,150000000,365,1,'Lowest monthly price, with the biggest credit bonus.');
 -- Plan subscriptions. expires_at is when the plan period ends.
 CREATE TABLE subscriptions (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), plan_code TEXT NOT NULL REFERENCES plans(code),

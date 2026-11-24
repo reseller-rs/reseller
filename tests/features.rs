@@ -890,6 +890,35 @@ async fn theme_directory_serves_files_and_overrides_template_safely() {
     );
 }
 
+#[tokio::test]
+async fn theme_favicon_gets_png_and_touch_icon_companions() {
+    let mut t = Test::new().await;
+    let theme = t.dir.path().join("theme");
+    std::fs::create_dir_all(&theme).unwrap();
+    std::fs::write(theme.join("favicon.svg"), "<svg/>").unwrap();
+    t.app = t.app.clone().with_theme_dir(Some(theme.clone()));
+    t.app.config_mut().await.branding.favicon_url = "/theme/favicon.svg".into();
+
+    let (_, _, html) = t.page("/").await;
+    assert!(html.contains(r#"href="/theme/favicon.svg""#));
+    assert!(
+        !html.contains("apple-touch-icon"),
+        "only existing files are linked"
+    );
+    assert!(!html.contains("/theme/favicon-32.png"));
+
+    std::fs::write(theme.join("favicon-32.png"), "png").unwrap();
+    std::fs::write(theme.join("apple-touch-icon.png"), "png").unwrap();
+    let (_, _, html) = t.page("/").await;
+    assert!(html.contains(
+        r#"<link rel="icon" type="image/png" sizes="32x32" href="/theme/favicon-32.png">"#
+    ));
+    assert!(html.contains(
+        r#"<link rel="apple-touch-icon" sizes="180x180" href="/theme/apple-touch-icon.png">"#
+    ));
+    assert!(html.find("apple-touch-icon").unwrap() < html.find("</head>").unwrap());
+}
+
 // ---------------------------------------------------------------------------
 // Settings and accounting fixes
 // ---------------------------------------------------------------------------

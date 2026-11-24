@@ -436,11 +436,11 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["account"]["balance_usd"], "10");
 
-    // 2) Yearly plan (seeded as $160 of credit over 360 days).
+    // 2) Yearly plan (seeded as $150 of credit over 365 days).
     let code = issue_plan_code(&t, "year").await;
     let (s, v) = redeem(&t, &token, &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "170");
+    assert_eq!(v["account"]["balance_usd"], "160");
     assert_eq!(v["account"]["subscription"]["plan_code"], "year");
 
     // 3) A $5 plan expiring after 30 days.
@@ -455,9 +455,9 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
     let code = issue_plan_code(&t, "trial5").await;
     let (s, v) = redeem(&t, &token, &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "175");
+    assert_eq!(v["account"]["balance_usd"], "165");
 
-    // Each grant carries its own window. The yearly plan is 360 days, not 365.
+    // Each grant carries its own window. The yearly plan is 365 days, the trial plan 30.
     let year_exp: i64 = sqlx::query_scalar("SELECT expires_at FROM credits WHERE note='year'")
         .fetch_one(&t.app.db)
         .await
@@ -466,7 +466,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
         .fetch_one(&t.app.db)
         .await
         .unwrap();
-    assert!((db::now() + 360 * 86400 - 5..=db::now() + 360 * 86400).contains(&year_exp));
+    assert!((db::now() + 365 * 86400 - 5..=db::now() + 365 * 86400).contains(&year_exp));
     assert!((db::now() + 30 * 86400 - 5..=db::now() + 30 * 86400).contains(&trial_exp));
 
     // 4) Admin deletes the Yearly plan while the subscription is live: refused.
@@ -486,14 +486,14 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"year","name":"Yearly","price_usd":"160","credit_usd":"160","duration_days":360,"active":false}),
+            json!({"code":"year","name":"Yearly","price_usd":"144","credit_usd":"150","duration_days":365,"active":false}),
         )
         .await;
     assert_eq!(s, 200);
-    assert_eq!(balance(&t, &aid).await, "175");
+    assert_eq!(balance(&t, &aid).await, "165");
     let (s, v) = t.customer("GET", "account", &token, json!({})).await;
     assert_eq!(s, 200);
-    assert_eq!(v["account"]["balance_usd"], "175");
+    assert_eq!(v["account"]["balance_usd"], "165");
     assert_eq!(v["account"]["subscription"]["plan_code"], "year");
     assert_eq!(
         v["account"]["subscription"]["expires_at"].as_i64().unwrap(),
@@ -507,7 +507,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
     let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
     billing::debit(&mut tx, &aid, 3_000_000).await.unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(balance(&t, &aid).await, "172");
+    assert_eq!(balance(&t, &aid).await, "162");
     let trial_left: i64 =
         sqlx::query_scalar("SELECT remaining_micro FROM credits WHERE note='trial5'")
             .fetch_one(&t.app.db)
@@ -518,7 +518,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
             .fetch_one(&t.app.db)
             .await
             .unwrap();
-    assert_eq!((trial_left, year_left), (2_000_000, 160_000_000));
+    assert_eq!((trial_left, year_left), (2_000_000, 150_000_000));
 
     // 6) One month later the $5 lot's remainder expires out of the spendable
     // balance. The yearly window and the perpetual $10 are untouched, and the
@@ -534,7 +534,7 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
         .execute(&t.app.db)
         .await
         .unwrap();
-    assert_eq!(balance(&t, &aid).await, "170");
+    assert_eq!(balance(&t, &aid).await, "160");
     let v = billing::account(&t.app, &aid).await.unwrap();
     let expired = v["credits"]
         .as_array()
@@ -2057,10 +2057,10 @@ async fn live_http_settles_buffered_json_responses() {
     upstream.abort();
 }
 
-/// The fresh-schema seed ships a Yearly plan at $160 for 360 days, and the
+/// The fresh-schema seed ships a 12 months plan at $144 (with $150 credit) for 365 days, and the
 /// plan redeems into a credit lot with the matching expiry window.
 #[tokio::test]
-async fn year_plan_is_seeded_at_160_usd_for_360_days() {
+async fn year_plan_is_seeded_at_144_usd_for_365_days() {
     let t = Test::new().await;
     let plans = t.call("GET", "/v1/plans", None, json!({})).await.1;
     let year = plans["plans"]
@@ -2069,19 +2069,19 @@ async fn year_plan_is_seeded_at_160_usd_for_360_days() {
         .iter()
         .find(|p| p["code"] == "year")
         .expect("year plan is seeded");
-    assert_eq!(year["name"], "Yearly");
-    assert_eq!(year["price_usd"], "160");
-    assert_eq!(year["credit_usd"], "160");
-    assert_eq!(year["duration_days"], 360);
+    assert_eq!(year["name"], "12 months");
+    assert_eq!(year["price_usd"], "144");
+    assert_eq!(year["credit_usd"], "150");
+    assert_eq!(year["duration_days"], 365);
     assert_eq!(year["active"], true);
 
     let code = issue_plan_code(&t, "year").await;
     let k = t.key().await;
     let (s, v) = redeem(&t, k["dashboard_token"].as_str().unwrap(), &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "160.1");
+    assert_eq!(v["account"]["balance_usd"], "150.1");
     let days = (v["account"]["subscription"]["expires_at"].as_i64().unwrap() - db::now()) / 86400;
-    assert!((359..=360).contains(&days), "year plan expiry: {days} days");
+    assert!((364..=365).contains(&days), "year plan expiry: {days} days");
 }
 
 // ---------------------------------------------------------------------------
