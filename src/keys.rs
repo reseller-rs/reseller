@@ -296,9 +296,12 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     if let Some(proof) = &proof {
         spend_proof(&mut tx, proof).await?;
     }
-    let account = match existing {
-        Some(account) => account,
-        None => open_trial_account(&mut tx, &config, ip, body).await?,
+    let (account, trial) = match existing {
+        Some(account) => (account, None),
+        None => {
+            let (account, granted) = open_trial_account(&mut tx, &config, ip, body).await?;
+            (account, Some(granted))
+        }
     };
     let limits = match body.get("limits") {
         Some(v) if admin => {
@@ -327,6 +330,10 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     )
     .await?;
     tx.commit().await?;
+    let mut out = out;
+    if let Some(granted) = trial {
+        out["trial_credit_usd"] = json!(money::display(granted));
+    }
     Ok(out)
 }
 
@@ -502,13 +509,35 @@ async fn check_creation_guards(
     Ok(())
 }
 
+/// The trial credit for the next signup from an IP that already opened
+/// `earlier` accounts this month: `base` halved once per earlier account.
+pub fn halved_trial(base: i64, earlier: i64) -> i64 {
+    u32::try_from(earlier)
+        .ok()
+        .and_then(|n| base.checked_shr(n))
+        .unwrap_or(0)
+}
+
 /// Opens a new account and grants the configured trial credit, if any.
+/// Returns the account id and the granted micro-USD.
 async fn open_trial_account(
     conn: &mut SqliteConnection,
     config: &Config,
     ip: &str,
     body: &Value,
-) -> Result<String> {
+) -> Result<(String, i64)> {
+    let mut amount = money::usd(&config.signup.free_credit_usd)?;
+    if config.signup.free_credit_halving && amount > 0 {
+        let month = chrono::Utc::now().format("%Y-%m-01 00:00:00").to_string();
+        let earlier: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM accounts WHERE created_ip=? AND created_at>=unixepoch(?)",
+        )
+        .bind(ip)
+        .bind(month)
+        .fetch_one(&mut *conn)
+        .await?;
+        amount = halved_trial(amount, earlier);
+    }
     let account = id();
     sqlx::query("INSERT INTO accounts(id,contact,created_at,created_ip) VALUES(?,?,?,?)")
         .bind(&account)
@@ -520,13 +549,12 @@ async fn open_trial_account(
         .bind(ip)
         .execute(&mut *conn)
         .await?;
-    let amount = money::usd(&config.signup.free_credit_usd)?;
     if amount > 0 {
         let expires = (config.signup.free_credit_expiry_days > 0)
             .then(|| now() + i64::from(config.signup.free_credit_expiry_days) * DAY);
         crate::billing::credit(conn, &account, amount, "free", expires, "").await?;
     }
-    Ok(account)
+    Ok((account, amount))
 }
 
 /// Replaces an active key with a fresh one.
@@ -623,4 +651,19 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
     }
     tx.commit().await?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::halved_trial;
+
+    #[test]
+    fn trial_halves_per_earlier_signup_and_never_goes_negative() {
+        assert_eq!(halved_trial(100_000, 0), 100_000);
+        assert_eq!(halved_trial(100_000, 1), 50_000);
+        assert_eq!(halved_trial(100_000, 3), 12_500);
+        assert_eq!(halved_trial(100_000, 17), 0);
+        assert_eq!(halved_trial(100_000, 64), 0);
+        assert_eq!(halved_trial(100_000, -1), 0);
+    }
 }

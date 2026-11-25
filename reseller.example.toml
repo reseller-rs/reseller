@@ -148,6 +148,11 @@ public_url = "http://localhost:56787"
 # Default: "0.10".
 # free_credit_usd = "0.10"
 
+# Halve the trial credit for each further signup from the same IP in the same
+# calendar month: with ip_limit_per_month = 4 and free_credit_usd = "0.1" the
+# signups get 0.1, 0.05, 0.025, and 0.0125 USD. Default: false.
+# free_credit_halving = false
+
 # Days the trial credit stays spendable. 0 means it never expires. Maximum:
 # 3650. Default: 30.
 # free_credit_expiry_days = 30

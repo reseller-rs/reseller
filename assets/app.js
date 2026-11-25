@@ -147,11 +147,14 @@ function accountLink(id, contact) {
 }
 function keyLink(id, name, prefix) {
   if (!id) return '<span class="muted">-</span>';
-  const label = name || (prefix ? `${prefix}...` : shortId(id));
+  const label = name || (prefix ? `${String(prefix).slice(0, 12)}\u2026` : shortId(id));
   return `<button type="button" class="link" data-open-key="${esc(id)}" title="Open key details">${esc(label)}</button>`;
 }
 const goButton = (label, name, params = {}, cls = 'ghost small') =>
   `<button type="button" class="${cls}" data-go="${esc(name)}" data-go-params="${esc(new URLSearchParams(params))}">${esc(label)}</button>`;
+const KEY_PREFIX_TIP = 'Key prefix \u2014 the full key is shown only once when created or rotated';
+// A key prefix is only a label for recognising a key. It is deliberately not selectable or copyable.
+const keyPrefix = p => p ? `<span class="key-prefix" tabindex="0" title="${esc(KEY_PREFIX_TIP)}">${esc(String(p).slice(0, 12))}\u2026</span>` : '';
 const copyable = (value, label, display = value) =>
   `<button type="button" class="copy-value" data-copy-value="${esc(value)}" data-copy-label="${esc(label)}" title="Copy ${esc(label.toLowerCase())}"><code>${esc(display)}</code></button>`;
 
@@ -374,7 +377,7 @@ function bootSkeleton() {
 
 function modal(title, content, setup, size) {
   const d = document.createElement('dialog');
-  if (size) d.classList.add(size);
+  if (size) d.classList.add(...size.split(' '));
   d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button type="button" data-close aria-label="Close dialog">&times;</button></div><div class="dialog-content">${content}</div>`;
   document.body.append(d);
   d.querySelector('[data-close]').onclick = () => d.close();
@@ -428,6 +431,8 @@ const listStates = Object.fromEntries(Object.entries(LIST_DEFAULTS).map(([name, 
 const TABS = admin
   ? ['overview', 'accounts', 'keys', 'requests', 'payments', 'plans', 'codes', 'settings']
   : ['overview', 'keys', 'requests', 'usage', 'billing', 'connect'];
+let billingSub = 'overview';
+const BILLING_SUBS = ['overview', 'add', 'history'];
 const TAB_LABELS = { overview: 'Overview', accounts: 'Accounts', keys: 'API keys', requests: 'Requests', payments: 'Payments', plans: 'Plans', codes: 'Redeem codes', settings: 'Settings', usage: 'Usage', billing: 'Billing', connect: 'Connect' };
 
 function hashFor(name) {
@@ -435,12 +440,15 @@ function hashFor(name) {
   const params = new URLSearchParams();
   if (state) for (const f of FILTERS[name]) if (state[f] && state[f] !== LIST_DEFAULTS[name][f]) params.set(f, state[f]);
   const qs = params.toString();
-  return `#${name}${qs ? `?${qs}` : ''}`;
+  const sub = name === 'billing' && billingSub !== 'overview' ? `/${billingSub}` : '';
+  return `#${name}${sub}${qs ? `?${qs}` : ''}`;
 }
 // Reads the tab and its filters from the hash into the list state.
 function applyRoute() {
-  const [name, qs = ''] = location.hash.slice(1).split('?');
+  const [path, qs = ''] = location.hash.slice(1).split('?');
+  const [name, sub] = path.split('/');
   tab = TABS.includes(name) ? name : 'overview';
+  if (tab === 'billing') billingSub = BILLING_SUBS.includes(sub) ? sub : 'overview';
   const state = listStates[tab];
   if (state) {
     const params = new URLSearchParams(qs);
@@ -450,6 +458,7 @@ function applyRoute() {
 }
 // Navigates to a tab. With params, its filters are replaced by them.
 function go(name, params) {
+  if (name === 'billing') billingSub = BILLING_SUBS.includes(params?.sub) ? params.sub : 'overview';
   document.querySelectorAll('dialog[open]').forEach(d => d.close());
   const state = listStates[name];
   if (state && params) Object.assign(state, LIST_DEFAULTS[name], { limit: state.limit }, params);
@@ -469,11 +478,14 @@ function listToolbar(id, state, { placeholder, statuses, sorts, groups }) {
   const options = (items, selected) => items.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`).join('');
   return `<form class="toolbar" data-list-form="${id}" role="search">
     <input class="toolbar-search" name="q" type="search" value="${esc(state.q)}" aria-label="Search" placeholder="${esc(placeholder)}">
+    <button type="button" class="ghost toolbar-toggle" data-toolbar-toggle aria-expanded="false" aria-controls="${id}-filters">Filters${state.status || state.group ? ' •' : ''}</button>
+    <div class="toolbar-extra" id="${id}-filters">
     <select name="status" aria-label="Filter by status"><option value="">All statuses</option>${options(statuses, state.status)}</select>
     <select name="sort" aria-label="Sort by">${options(sorts, state.sort)}</select>
     <select name="dir" aria-label="Sort direction"><option value="desc"${state.dir === 'desc' ? ' selected' : ''}>High to low, newest first</option><option value="asc"${state.dir === 'asc' ? ' selected' : ''}>Low to high, oldest first</option></select>
     ${groups ? `<select name="group" aria-label="Group by"><option value="">No grouping</option>${options(groups, state.group)}</select>` : ''}
     <div class="toolbar-actions"><button type="submit" class="primary">Apply</button><button type="button" class="ghost" data-list-clear="${id}">Reset</button></div>
+    </div>
   </form>`;
 }
 // A removable filter shown above a list, e.g. "Account: ops@example.com".
@@ -532,8 +544,20 @@ function planCard(p, badges, cta) {
       <li>${CHECK}<span>Credit valid for ${esc(plural(i.days, 'day'))}</span></li>
     </ul>` : '<ul class="plan-features"></ul>'}
     <p class="plan-desc">${esc(p.description || 'Prepaid API credit.')}</p>
-    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/#billing">Choose plan</a>`}</div>
+    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/#billing/add">Choose plan</a>`}</div>
   </article>`;
+}
+function planFaq(plans, methods) {
+  const terms = plans.map(p => `${p.name}: ${plural(p.duration_days, 'day')}`).join('; ');
+  const faq = [
+    ['What is API credit?', `Credit is a prepaid USD balance. Each request is priced from its usage (tokens, characters, audio seconds, or images) and deducted from it. Every key on your account shares the balance.`],
+    ['What happens when my credit runs out?', 'Requests stop with a 429 insufficient_quota error that explains how to top up. Buy another plan, redeem a credit code, or add funds, and calls work again right away.'],
+    ['When does my credit expire?', `Plan credit expires when its plan ends (${terms}). Credit that expires soonest is spent first, so nothing is lost while you still have time left.`],
+    ['Can I pay as I go?', methods.includes('crypto')
+      ? 'Yes. Open Billing in your workspace and send stablecoins to your personal deposit address. Any amount is credited 1:1 in USD, with no plan needed.'
+      : 'Plans are prepaid packages. Ask the operator for a credit code to add a custom amount.'],
+  ];
+  return `<div class="faq" role="list">${faq.map(([q, a]) => `<details role="listitem"><summary>${esc(q)}</summary><p>${esc(a)}</p></details>`).join('')}</div>`;
 }
 const methodNames = methods => [methods.includes('stripe') && 'card', methods.includes('crypto') && 'crypto'].filter(Boolean);
 // Plan grid, reassurance row, and a short FAQ. `cta(plan)` renders each button.
@@ -547,59 +571,52 @@ function pricingSection(plans, methods = [], cta) {
     'One-time purchase, no auto-renewal',
     'Usage-based: each request is deducted from credit',
   ];
-  const terms = plans.map(p => `${p.name}: ${plural(p.duration_days, 'day')}`).join('; ');
-  const faq = [
-    ['What is API credit?', `Credit is a prepaid USD balance. Each request is priced from its usage (tokens, characters, audio seconds, or images) and deducted from it. Every key on your account shares the balance.`],
-    ['What happens when my credit runs out?', 'Requests stop with a 429 insufficient_quota error that explains how to top up. Buy another plan, redeem a credit code, or add funds, and calls work again right away.'],
-    ['When does my credit expire?', `Plan credit expires when its plan ends (${terms}). Credit that expires soonest is spent first, so nothing is lost while you still have time left.`],
-    ['Can I pay as I go?', methods.includes('crypto')
-      ? 'Yes. Open Billing in your workspace and send stablecoins to your personal deposit address. Any amount is credited 1:1 in USD, with no plan needed.'
-      : 'Plans are prepaid packages. Ask the operator for a credit code to add a custom amount.'],
-  ];
   return `<div class="plans pricing" data-count="${plans.length}">${plans.map(p => planCard(p, badges, cta?.(p))).join('')}</div>
     <ul class="assurance">${assurances.map(a => `<li>${CHECK}${esc(a)}</li>`).join('')}</ul>
-    <div class="faq" role="list">${faq.map(([q, a]) => `<details role="listitem"><summary>${esc(q)}</summary><p>${esc(a)}</p></details>`).join('')}</div>`;
+    ${planFaq(plans, methods)}`;
 }
 
 /* Checkout ---------------------------------------------------------------------
    Choose plan -> Pay -> Credit added, in one dialog. Card payments hand off to
    Stripe. Crypto orders stay in the dialog and update while it is open. */
 let planCatalog = { plans: [], methods: [] };
-const STEPS = ['Choose plan', 'Pay', 'Credit added'];
-const stepper = current => `<ol class="stepper" aria-label="Checkout progress">${STEPS.map((label, n) => `<li class="${n < current ? 'done' : n === current ? 'current' : ''}"${n === current ? ' aria-current="step"' : ''}><span class="step-dot">${n < current ? CHECK : n + 1}</span><span class="step-label">${esc(label)}</span></li>`).join('')}</ol>`;
 const expiryText = (i, paidAt) => paidAt
   ? `Valid until ${day(paidAt + i.days * DAY, { dateStyle: 'medium' })}`
   : `${plural(i.days, 'day')} from payment, until ${day(nowSeconds() + i.days * DAY, { dateStyle: 'medium' })}`;
-function orderSummary(p, { paidAt } = {}) {
+const tip = text => `<button type="button" class="tip" data-tip="${esc(text)}" aria-label="${esc(text)}">i</button>`;
+// Compact plan facts shared by checkout and the payment dialog.
+function planFacts(p, { paidAt } = {}) {
   const i = planInfo(p);
-  return `<aside class="card order-summary" aria-label="Order summary">
-    <div class="label">Order summary</div>
-    <div class="order-plan"><strong>${esc(p.name || p.code)}</strong><span class="hint">${esc(perMonthLabel(i))}${i.price > 0 ? ' per month' : ''}</span></div>
-    ${facts([
-      ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">${esc(i.months === 1 ? 'for 1 month' : `for ${i.months} months`)}, one-time</span>`],
-      i.credit ? ['API credit', `<strong>${esc(usdShort(i.credit))}</strong>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}`] : null,
-      ['Credit validity', esc(expiryText(i, paidAt))],
-    ])}
-  </aside>`;
+  return facts([
+    ['Plan', `<strong>${esc(p.name || p.code)}</strong>`],
+    ['Per month', esc(perMonthLabel(i))],
+    ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">${esc(i.months === 1 ? '1 month' : `${i.months} months`)}, one-time</span>`],
+    i.credit ? ['API credit', `<strong>${esc(usdShort(i.credit))}</strong>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}`] : null,
+    ['Credit validity', esc(expiryText(i, paidAt))],
+  ]);
 }
 const METHOD_INFO = {
-  stripe: ['Card', 'Pay securely on the Stripe checkout page.'],
-  crypto: ['Crypto', 'USDC, USDT, and native coins on supported networks.'],
+  stripe: ['Card', 'Secure Stripe checkout'],
+  crypto: ['Crypto', 'USDC, USDT or native coins'],
 };
 function checkout(plan, methods) {
   if (!methods.length) return notice('Online payments are not enabled. Use a credit code.', true);
   const i = planInfo(plan);
-  modal(`Checkout: ${plan.name}`, `<div data-pay>
-    ${stepper(1)}
-    <form class="checkout-grid">
-      <div>
-        <fieldset class="method-choice"><legend>Payment method</legend>
-          ${methods.map((m, n) => `<label class="method"><input type="radio" name="method" value="${esc(m)}"${n === 0 ? ' checked' : ''}><span class="method-body"><strong>${esc(METHOD_INFO[m]?.[0] || m)}</strong><span class="hint">${esc(METHOD_INFO[m]?.[1] || '')}</span></span></label>`).join('')}
-        </fieldset>
-        <p class="field-help">Plans are one-time purchases and do not renew. Credit is added to the balance shared by all your keys.</p>
+  modal(`Checkout`, `<div data-pay>
+    <form class="checkout">
+      <div class="co-plan">
+        <div><div class="label">Plan</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${esc(perMonthLabel(i))}${i.price > 0 ? ' per month' : ''} &middot; ${esc(i.months === 1 ? '1 month' : `${i.months} months`)}</div></div>
+        <div class="co-total"><div class="label">Total</div><div class="co-price">${esc(usdShort(i.price))}</div></div>
       </div>
-      ${orderSummary(plan)}
-      <div class="actions checkout-actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary" data-submit>Continue to payment</button></div>
+      ${i.credit ? `<div class="co-credit"><span>You get <strong>${esc(usdShort(i.credit))}</strong> API credit</span>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}</div>` : ''}
+      <fieldset class="method-choice"><legend>Pay with</legend>
+        ${methods.map((m, n) => `<label class="method"><input type="radio" name="method" value="${esc(m)}"${n === 0 ? ' checked' : ''}><span class="method-body"><strong>${esc(METHOD_INFO[m]?.[0] || m)}</strong><span class="hint">${esc(METHOD_INFO[m]?.[1] || '')}</span></span></label>`).join('')}
+      </fieldset>
+      <details class="more"><summary>Plan details</summary>
+        ${planFacts(plan)}
+        <p class="hint">One-time purchase, it does not renew. Credit goes to the balance shared by all your keys.</p>
+      </details>
+      <div class="actions sticky-actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary" data-submit>Continue</button></div>
     </form>
   </div>`, d => {
     const box = d.querySelector('[data-pay]');
@@ -607,7 +624,7 @@ function checkout(plan, methods) {
     const submit = form.querySelector('[data-submit]');
     const label = () => {
       const m = form.elements.method.value;
-      submit.textContent = m === 'stripe' ? `Pay ${usdShort(i.price)} by card` : `Show crypto payment details`;
+      submit.textContent = m === 'stripe' ? `Pay ${usdShort(i.price)} by card` : 'Continue to crypto payment';
     };
     label();
     form.addEventListener('change', label);
@@ -627,7 +644,7 @@ function checkout(plan, methods) {
       location.href = url.href;
       await new Promise(() => {});
     });
-  }, 'wide');
+  }, 'wide sheet');
 }
 
 /* Charts ----------------------------------------------------------------------- */
@@ -765,18 +782,19 @@ function redeemForm() {
 function secrets(v, { embedded = false } = {}) {
   modal('Save your credentials', `
     <p class="muted">These are shown only once. Keep the dashboard token to manage your account even if you block your API key.</p>
+    ${Number(v.trial_credit_usd) > 0 ? `<p class="trial-note">Your account starts with <strong>${esc(usd(v.trial_credit_usd))}</strong> of free trial credit.</p>` : ''}
     <div class="cred-row">
       <span class="cred-label">API key</span>
       <code class="cred-value secret" title="${esc(v.key)}">${esc(v.key)}</code>
-      <button type="button" class="small" data-copy="key">Copy</button>
+      <button type="button" class="small primary" data-copy="key">Copy key</button>
     </div>
     <div class="cred-row">
       <span class="cred-label">Dashboard token</span>
       <code class="cred-value" title="${esc(v.dashboard_token)}">${esc(v.dashboard_token)}</code>
-      <button type="button" class="small" data-copy="token">Copy</button>
+      <button type="button" class="small" data-copy="token">Copy token</button>
     </div>
     <div class="actions section">
-      <button type="button" data-copy-all class="primary">Copy both</button>
+      <button type="button" data-copy-all class="ghost">Copy both</button>
       ${admin || embedded ? '' : '<button type="button" data-open class="ghost">Open workspace</button>'}
     </div>`, d => {
     const wire = (selector, text, label) => {
@@ -877,7 +895,7 @@ function keyDetails(kid) {
     return `
       <div class="entity-head">
         <div class="entity-title"><h3>${esc(k.name)}</h3>${pill(k.status)}${expired ? pill('expired', 'warn') : ''}</div>
-        <div class="entity-sub">${copyable(k.key_prefix + '...', 'Key prefix')}<span class="hint">ID</span>${copyable(k.id, 'Key ID', shortId(k.id))}</div>
+        <div class="entity-sub">${keyPrefix(k.key_prefix)}<span class="hint">ID</span>${copyable(k.id, 'Key ID', shortId(k.id))}</div>
       </div>
       <div class="tiles">
         ${metric('Spent, all time', usd(k.billed_usd))}
@@ -1018,7 +1036,7 @@ function manageAccount(aid) {
       <section class="detail-section">
         <div class="section-head"><h4>Keys by spend</h4><span class="hint">${count(keyTotal)} total</span></div>
         ${table([
-          ['Key', k => `${keyLink(k.id, k.name)}<div class="hint"><code>${esc(k.key_prefix)}...</code></div>`, 'wrap'],
+          ['Key', k => `${keyLink(k.id, k.name)}<div class="hint">${keyPrefix(k.key_prefix)}</div>`, 'wrap'],
           ['Status', k => pill(k.status)],
           ['Spent', k => `<span class="num">${esc(usd(k.billed_usd))}</span>`, 'end'],
           ['30 days', k => `<span class="num">${esc(usd(k.usage_30d_usd))}</span>`, 'end'],
@@ -1228,7 +1246,7 @@ function requestDetails(r) {
         ['Request ID', copyable(r.id, 'Request ID')],
         ['Model', r.model ? `<code>${esc(r.model)}</code>` : '-'],
         ['Kind', esc(kindLabel(r.kind))],
-        ['Key', `${keyLink(r.key_id, r.key_name, r.key_prefix)}${r.key_prefix ? ` <code>${esc(r.key_prefix)}...</code>` : ''}`],
+        ['Key', `${keyLink(r.key_id, r.key_name, r.key_prefix)}${r.key_prefix ? ` ${keyPrefix(r.key_prefix)}` : ''}`],
         admin && ['Account', accountLink(r.account_id, r.account_contact)],
         ['Client IP', `<code>${esc(r.ip || '-')}</code>`],
       ])}</section>
@@ -1829,7 +1847,7 @@ function selectTab() {
 
 async function shell() {
   applyRoute();
-  if (location.hash.slice(1).split('?')[0] !== tab) history.replaceState(null, '', hashFor(tab));
+  if (location.hash.slice(1).split('?')[0].split('/')[0] !== tab) history.replaceState(null, '', hashFor(tab));
   main.innerHTML = `
     <div class="tabs" role="tablist" aria-label="${admin ? 'Console sections' : 'Workspace sections'}">
       ${TABS.map(t => `<button type="button" role="tab" id="tab-${t}" data-tab="${t}" aria-controls="content" aria-selected="${t === tab}" tabindex="${t === tab ? 0 : -1}">${esc(TAB_LABELS[t])}</button>`).join('')}
@@ -1948,7 +1966,7 @@ const views = {
           <div class="metric">${esc(usd(a.balance_usd))}</div>
           <div class="hint">${isPositive(a.debt_usd) ? `Outstanding debt ${esc(usd(a.debt_usd))} settles from the next top-up.` : empty ? 'API calls are refused until you add credit.' : 'Shared by every key on this account.'}</div>
         </div>
-        <div class="actions">${goButton('Add credit', 'billing', {}, empty ? 'primary' : 'ghost')}<button type="button" class="${empty ? 'ghost' : 'primary'}" data-create>Create key</button></div>
+        <div class="actions">${goButton('Add credit', 'billing', { sub: 'add' }, empty ? 'primary' : 'ghost')}<button type="button" class="${empty ? 'ghost' : 'primary'}" data-create>Create key</button></div>
       </div>
       <div class="stats">
         ${metric('Spent, all time', usd(a.billed_usd))}
@@ -1981,7 +1999,7 @@ const views = {
         ${facts([
           ['API base URL', `${copyable(`${location.origin}/v1`, 'API base URL')}<div class="hint">Works with any OpenAI-compatible SDK.</div>`],
           ['MCP endpoint', `${copyable(`${location.origin}/mcp`, 'MCP endpoint')}<div class="hint">Streamable HTTP, POST only.</div>`],
-          ['API key', `${prefix ? `<code>${esc(prefix)}...</code>` : '<span class="muted">No active key</span>'}<div class="hint">Only the prefix is shown. The full secret appears once when a key is created. Lost it? Rotate the key under API keys.</div>`],
+          ['API key', `${prefix ? keyPrefix(prefix) : '<span class="muted">No active key</span>'}<div class="hint">The full key is shown only once, when it is created or rotated. Lost it? Rotate the key under API keys.</div>`],
         ])}
       </div>
       <div class="card">
@@ -2005,7 +2023,7 @@ const views = {
     if (admin && state.account) params.set('account', state.account);
     const v = await get(`${endpoint('keys')}?${params}`, signal);
     const columns = [
-      ['Key', r => `${keyLink(r.id, r.name)}<div class="hint"><code>${esc(r.key_prefix)}...</code></div>`, 'wrap'],
+      ['Key', r => `${keyLink(r.id, r.name)}<div class="hint">${keyPrefix(r.key_prefix)}</div>`, 'wrap'],
       ['Status', r => `${pill(r.status)}${r.expires_at ? `<div class="hint">${r.expires_at < nowSeconds() ? 'expired' : 'expires'} ${esc(date(r.expires_at))}</div>` : ''}`],
     ];
     if (admin) columns.push(['Account', r => accountLink(r.account_id, r.account_contact), 'wrap']);
@@ -2131,11 +2149,14 @@ const views = {
     return `${pageHead('Requests', admin ? 'Every proxied request with its usage and charge.' : 'Every request made with your keys and what it was billed.', '<button type="button" data-refresh class="ghost small">Refresh</button>')}
       <form class="toolbar" data-list-form="requests" role="search">
         <input class="toolbar-search" name="q" type="search" value="${esc(state.q)}" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID">
+        <button type="button" class="ghost toolbar-toggle" data-toolbar-toggle aria-expanded="false" aria-controls="requests-filters">Filters${state.model || state.kind || state.status ? ' •' : ''}</button>
+        <div class="toolbar-extra" id="requests-filters">
         <select name="model" aria-label="Model"><option value="">All models</option>${[...new Set([state.model, ...models].filter(Boolean))].map(m => option(m, m, state.model)).join('')}</select>
         <select name="kind" aria-label="Kind">${option('', 'All kinds', state.kind)}${Object.entries(KIND_LABELS).map(([k, l]) => option(k, l, state.kind)).join('')}</select>
         <select name="status" aria-label="Status">${[['', 'All statuses'], ['2xx', 'Succeeded (2xx)'], ['4xx', 'Rejected (4xx)'], ['5xx', 'Failed (5xx)'], ['pending', 'In progress']].map(([k, l]) => option(k, l, state.status)).join('')}</select>
         <input type="hidden" name="key" value="${esc(state.key)}"><input type="hidden" name="account" value="${esc(state.account)}">
         <div class="toolbar-actions"><button type="submit" class="primary">Apply</button><button type="button" class="ghost" data-list-clear="requests">Reset</button></div>
+        </div>
       </form>
       ${chips.length ? `<div class="filter-chips">${chips.join('')}</div>` : ''}
       ${requestTable(v.requests)}
@@ -2162,76 +2183,10 @@ const views = {
   },
   async billing(signal) {
     const [v, p, orders] = await Promise.all([get('/v1/account', signal), get('/v1/plans', signal), get('/v1/account/payments', signal)]);
-    const a = v.account;
     const methods = p.payment_methods || [];
     planCatalog = { plans: p.plans, methods };
-    const topUp = v.top_up || {};
-    const hasTopUp = topUp.available === false || Boolean(topUp.networks?.length);
-    const badges = planBadges(p.plans);
-    const cta = plan => methods.length
-      ? `<button type="button" class="${badges.get(plan.code) === 'Best value' ? 'primary' : ''}" data-checkout="${esc(plan.code)}">Choose ${esc(plan.name)}</button>`
-      : '<span class="hint">Online payments are not enabled. Use a credit code.</span>';
-    const lots = v.credits.filter(c => lotState(c) === 'active');
-    const trial = lots.filter(c => c.source === 'free');
-    const trialLeft = trial.reduce((sum, c) => sum + Number(c.remaining_usd), 0);
-    const trialEnds = Math.min(...trial.map(c => c.expires_at || Infinity));
-    const nextExpiry = lots.filter(c => c.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
-    const sub = a.subscription;
-    const subPlan = sub && p.plans.find(x => x.code === sub.plan_code);
-    const daysLeft = sub ? Math.max(0, Math.ceil((sub.expires_at - nowSeconds()) / DAY)) : 0;
-    const empty = !isPositive(a.balance_usd);
-    const debt = isPositive(a.debt_usd);
-    const planName = code => p.plans.find(x => x.code === code)?.name || code;
-    const ways = [
-      methods.includes('stripe') && ['Card', 'Pay for a plan on Stripe\'s secure checkout page.', '<button type="button" class="small" data-scroll="plans">Choose a plan</button>'],
-      methods.includes('crypto') && ['Crypto checkout', 'Pay for a plan with USDC, USDT, or native coins on a supported network.', '<button type="button" class="small" data-scroll="plans">Choose a plan</button>'],
-      hasTopUp && ['Stablecoin top-up', 'Send stablecoins to your personal address. Any amount, no plan needed.', '<button type="button" class="small" data-scroll="topup">Show my address</button>'],
-      ['Redeem a code', 'Apply a single-use credit code from the operator.', '<button type="button" class="small" data-redeem>Redeem a code</button>'],
-    ].filter(Boolean);
-    return `<section class="card balance-hero${empty || debt ? ' warn' : ''}" aria-labelledby="balance-label">
-        <div class="balance-main">
-          <div class="label" id="balance-label">Available balance</div>
-          <div class="metric balance-amount">${esc(usd(a.balance_usd))}</div>
-          <ul class="balance-notes">
-            ${debt ? `<li class="warn">Outstanding debt of ${esc(usd(a.debt_usd))} is repaid from your next top-up.</li>` : ''}
-            ${empty && !debt ? '<li class="warn">Your balance is empty. API calls are refused until you add credit.</li>' : ''}
-            ${trialLeft > 0 ? `<li>Includes ${esc(usd(trialLeft))} of trial credit${Number.isFinite(trialEnds) ? `, valid until ${esc(date(trialEnds))}` : ''}.</li>` : ''}
-            ${nextExpiry && nextExpiry !== trial[0] ? `<li>Next credit expiry: ${esc(usd(nextExpiry.remaining_usd))} on ${esc(date(nextExpiry.expires_at))}. Credit that expires first is spent first.</li>` : ''}
-            <li>Shared by every key on your account.</li>
-          </ul>
-        </div>
-        <div class="actions"><button type="button" class="${empty ? 'primary' : 'ghost'}" data-scroll="${hasTopUp || methods.length ? 'ways' : 'plans'}">Add credit</button></div>
-      </section>
-      <div class="stats">
-        ${metric('Current plan', sub ? (subPlan?.name || sub.plan_code) : 'No active plan', sub ? `Active until ${esc(date(sub.expires_at))}, ${esc(plural(daysLeft, 'day'))} left` : 'Pay as you go. Buy a plan below to add bundled credit.')}
-        ${metric('Spent so far', usd(a.billed_usd), 'Across all your keys')}
-        ${metric('Credit lots in use', count(lots.length), 'Soonest-expiring credit is spent first')}
-      </div>
-      <section class="billing-ways" id="ways" tabindex="-1" aria-labelledby="ways-title">
-        <div class="section-head"><h3 id="ways-title">Ways to add credit</h3></div>
-        <div class="ways">${ways.map(([title, text, action]) => `<div class="card way"><strong>${esc(title)}</strong><p>${esc(text)}</p>${action}</div>`).join('')}</div>
-      </section>
-      <section class="billing-catalog" id="plans" tabindex="-1" aria-labelledby="plans-title">
-        <div class="catalog-head"><h3 id="plans-title">Prepaid plans</h3><p>Non-renewing packages. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto checkout accepts USDC, USDT, and native coins on supported networks.' : ''}</p></div>
-        ${pricingSection(p.plans, methods, cta)}
-      </section>
-      ${topUpCard(topUp)}
-      <section class="billing-section" aria-labelledby="history-title">
-        <div class="section-head"><h3 id="history-title">Payment history</h3><span class="hint">Latest ${esc(plural(orders.payments.length, 'payment'))}</span></div>
-        ${table([
-          ['Date', r => when(r.created_at)],
-          ['Plan', r => `<strong>${esc(planName(r.plan_code))}</strong><div class="hint">${esc(plural(r.duration_days, 'day'))}, ${esc(usd(r.credit_usd))} credit</div>`],
-          ['Method', r => esc(methodLabel(r.method))],
-          ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
-          ['Received', r => r.method === 'crypto' ? `<span class="num">${esc(usd(r.received_usd))}</span>` : DASH, 'end'],
-          ['Status', r => pill(r.status)],
-          ['', r => `<div class="actions">${r.method === 'crypto' && r.status === 'pending' ? `<button type="button" class="small primary" data-order="${esc(r.id)}">Pay</button>` : ''}<button type="button" class="small" data-receipt="${esc(r.id)}" aria-label="Details of payment ${esc(shortId(r.id))}">Details</button></div>`, 'end'],
-        ], orders.payments, { empty: ['No payments yet', 'Plan purchases appear here with their status and a receipt.'] })}
-      </section>
-      <section class="billing-section" aria-labelledby="ledger-title">
-        <div class="section-head"><h3 id="ledger-title">Credit ledger</h3><span class="hint">Each top-up, plan, or grant is one lot with its own expiry</span></div>
-        ${creditTable(v.credits)}
-      </section>`;
+    billingData = { v, p, orders, methods };
+    return renderBilling();
   },
   async settings(signal) {
     const v = await get(endpoint('settings'), signal);
@@ -2244,6 +2199,96 @@ const views = {
       </form>`;
   },
 };
+
+let billingData = null;
+const BILLING_LABELS = { overview: 'Overview', add: 'Add credit', history: 'History' };
+const billingTabs = () => `<div class="seg-tabs" role="tablist" aria-label="Billing sections">${BILLING_SUBS.map(k => `<button type="button" role="tab" data-bsub="${k}" aria-selected="${k === billingSub}" tabindex="${k === billingSub ? 0 : -1}">${esc(BILLING_LABELS[k])}</button>`).join('')}</div>`;
+// A short plan tile for the Add credit section: price first, details in a tooltip.
+function planTile(plan, badges, methods) {
+  const i = planInfo(plan);
+  const badge = badges.get(plan.code);
+  const featured = badge === 'Best value';
+  const detail = `${plural(i.days, 'day')} of validity. ${plan.description || 'Prepaid API credit.'}`;
+  return `<article class="card plan-tile${featured ? ' featured' : ''}" aria-label="${esc(plan.name)} plan">
+    <div class="plan-top"><h4 class="plan-name">${esc(plan.name)}</h4>${badge ? `<span class="plan-flag${featured ? '' : ' soft'}">${esc(badge)}</span>` : ''}${tip(detail)}</div>
+    <div class="plan-price"><span class="plan-amount">${esc(perMonthLabel(i))}</span>${i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
+    <div class="plan-billed">${esc(billedLine(i))}</div>
+    ${i.credit ? `<div class="plan-credit"><strong>${esc(usdShort(i.credit))}</strong> credit${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}</div>` : ''}
+    ${methods.length ? `<button type="button" class="${featured ? 'primary' : ''}" data-checkout="${esc(plan.code)}">Choose ${esc(plan.name)}</button>` : ''}
+  </article>`;
+}
+function renderBilling() {
+  const { v, p, orders, methods } = billingData;
+  const a = v.account;
+  const topUp = v.top_up || {};
+  const hasTopUp = topUp.available === false || Boolean(topUp.networks?.length);
+  const lots = v.credits.filter(c => lotState(c) === 'active');
+  const trial = lots.filter(c => c.source === 'free');
+  const trialLeft = trial.reduce((sum, c) => sum + Number(c.remaining_usd), 0);
+  const trialEnds = Math.min(...trial.map(c => c.expires_at || Infinity));
+  const nextExpiry = lots.filter(c => c.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
+  const sub = a.subscription;
+  const subPlan = sub && p.plans.find(x => x.code === sub.plan_code);
+  const daysLeft = sub ? Math.max(0, Math.ceil((sub.expires_at - nowSeconds()) / DAY)) : 0;
+  const empty = !isPositive(a.balance_usd);
+  const debt = isPositive(a.debt_usd);
+  const planName = code => p.plans.find(x => x.code === code)?.name || code;
+  const badges = planBadges(p.plans);
+  let body;
+  if (billingSub === 'add') {
+    body = `<div class="bill-section">
+        <div class="section-head"><h3>Choose a plan</h3><span class="hint">One-time, no auto-renewal</span></div>
+        ${p.plans.length ? `<div class="plan-tiles" data-count="${p.plans.length}">${p.plans.map(x => planTile(x, badges, methods)).join('')}</div>` : emptyState('No plans yet', 'An operator has not published any plans.')}
+        ${methods.length ? '' : '<p class="hint">Online payments are not enabled. Redeem a credit code instead.</p>'}
+      </div>
+      <div class="bill-section">
+        <div class="section-head"><h3>Other ways to add credit</h3></div>
+        <div class="ways">
+          ${hasTopUp ? `<div class="card way"><div><strong>Top up with stablecoins</strong> ${tip('Send USDC or USDT to your personal address. Any amount, credited 1:1 in USD, no plan needed.')}</div><p>Any amount, no plan needed.</p><button type="button" class="small" data-topup-open>Show my address</button></div>` : ''}
+          <div class="card way"><div><strong>Redeem a code</strong> ${tip('Apply a single-use credit code from the operator. Credit is available immediately.')}</div><p>Have a credit code?</p><button type="button" class="small" data-redeem>Redeem a code</button></div>
+        </div>
+      </div>
+      <details class="more faq-more"><summary>Common questions</summary>${planFaq(p.plans, methods)}</details>`;
+  } else if (billingSub === 'history') {
+    const dep = topUp.recent || [];
+    body = `<div class="bill-section">
+        <div class="section-head"><h3>Payments</h3><span class="hint">${esc(plural(orders.payments.length, 'payment'))}</span></div>
+        ${table([
+          ['Date', r => when(r.created_at)],
+          ['Plan', r => `<strong>${esc(planName(r.plan_code))}</strong><div class="hint">${esc(methodLabel(r.method))} &middot; ${esc(usd(r.credit_usd))} credit</div>`],
+          ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
+          ['Status', r => pill(r.status)],
+          ['', r => `<div class="actions">${r.method === 'crypto' && r.status === 'pending' ? `<button type="button" class="small primary" data-order="${esc(r.id)}">Pay</button>` : ''}<button type="button" class="small" data-receipt="${esc(r.id)}" aria-label="Details of payment ${esc(shortId(r.id))}">Details</button></div>`, 'end'],
+        ], orders.payments, { empty: ['No payments yet', 'Plan purchases appear here with their status and a receipt.'] })}
+      </div>
+      <details class="more"><summary>Credit lots (${count(v.credits.length)})</summary>
+        <p class="hint">Each top-up, plan, or grant is one lot with its own expiry. The lot that expires first is spent first.</p>
+        ${creditTable(v.credits)}
+      </details>
+      ${dep.length ? `<details class="more"><summary>Stablecoin deposits (${count(dep.length)})</summary>${depositsTable(dep)}</details>` : ''}`;
+  } else {
+    const line = debt ? `Outstanding debt of ${usd(a.debt_usd)} is repaid from your next top-up.`
+      : empty ? 'Your balance is empty. API calls are refused until you add credit.'
+      : 'Shared by every key on your account.';
+    const notes = [
+      trialLeft > 0 && `Includes ${usd(trialLeft)} of trial credit${Number.isFinite(trialEnds) ? `, valid until ${date(trialEnds)}` : ''}.`,
+      nextExpiry && nextExpiry !== trial[0] && `Next credit expiry: ${usd(nextExpiry.remaining_usd)} on ${date(nextExpiry.expires_at)}. Credit that expires first is spent first.`,
+      `Spent so far: ${usd(a.billed_usd)} across all keys.`,
+      `${plural(lots.length, 'active credit lot')}.`,
+    ].filter(Boolean);
+    body = `<section class="card balance-hero${empty || debt ? ' warn' : ''}" aria-labelledby="balance-label">
+        <div class="balance-main">
+          <div class="label" id="balance-label">Available balance</div>
+          <div class="metric balance-amount">${esc(usd(a.balance_usd))}</div>
+          <p class="balance-line${empty || debt ? ' warn' : ''}">${esc(line)}</p>
+        </div>
+        <div class="actions"><button type="button" class="primary" data-bsub-go="add">Add credit</button></div>
+      </section>
+      <div class="plan-chip-row"><span class="plan-chip${sub ? ' active' : ''}">${sub ? `${esc(subPlan?.name || sub.plan_code)} plan &middot; until ${esc(date(sub.expires_at))}` : 'No active plan &middot; pay as you go'}</span>${sub ? `<span class="hint">${esc(plural(daysLeft, 'day'))} left</span>` : ''}</div>
+      <details class="more"><summary>Balance details</summary><ul class="balance-notes">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></details>`;
+  }
+  return `${billingTabs()}<div class="bill-body">${body}</div>`;
+}
 
 const listParams = state => {
   const params = new URLSearchParams({ limit: state.limit, offset: state.offset, sort: state.sort, dir: state.dir });
@@ -2612,77 +2657,76 @@ function netPanel(n, t) {
     n.confirmations ? `${plural(n.confirmations, 'confirmation')}` : null,
     n.eta_minutes ? `usually about ${plural(n.eta_minutes, 'minute')}` : null,
   ].filter(Boolean).join(', ');
-  return `<div class="callout warn" role="note"><p><strong>Send only these tokens on ${esc(n.chain_name)}.</strong> Other tokens or networks can be lost. Native coins and any other token sent here are recorded but not credited.</p></div>
-    <div class="addr-card">
-      <div class="qr-box">${qrSvg(n.address, `QR code of your ${n.chain_name} deposit address`)}<span class="hint">Scan to read the address</span></div>
+  return `<p class="send-line">Send <strong>${esc(joinOr(symbols))}</strong> on <strong>${esc(n.chain_name)}</strong></p>
+    <div class="addr-main">
+      <div class="qr-box">${qrSvg(n.address, `QR code of your ${n.chain_name} deposit address`)}</div>
       <div class="addr-body">
         <div class="label">Your ${esc(n.chain_name)} deposit address</div>
         <div class="addr-value">${copyable(n.address, `${n.chain_name} address`)}</div>
-        <div class="actions"><button type="button" class="small" data-copy-value="${esc(n.address)}" data-copy-label="${esc(n.chain_name)} address">Copy address</button>${explorerLink(n.explorer, 'address', n.address, 'View on explorer')}</div>
-        <p class="hint">The address is personal to your account and does not change. Send ${esc(joinOr(symbols))} on the ${esc(n.chain_name)} network only.</p>
+        <button type="button" class="primary big" data-copy-value="${esc(n.address)}" data-copy-label="${esc(n.chain_name)} address">Copy address</button>
       </div>
     </div>
-    ${facts([
-      ['Network', `${esc(n.chain_name)}${n.chain_id ? ` <span class="hint">chain ID ${esc(n.chain_id)}</span>` : ''}`],
-      ['Credit', `Each accepted token is credited 1:1 in USD (for example 1 ${esc(symbols[0] || 'USDC')} = ${esc(usd(1))}).`],
-      timing && ['Credited after', esc(timing)],
-      ['Minimum', esc(minimum)],
-    ])}
-    <h4 class="sub-head">Accepted tokens on ${esc(n.chain_name)}</h4>
-    ${table([
-      ['Token', x => `<div class="model-cell"><strong>${esc(x.symbol)}</strong>${x.name && x.name !== x.symbol ? `<span class="hint">${esc(x.name)}</span>` : ''}</div>`],
-      ['Contract address', x => contractCell(n.explorer, x.contract), 'wrap'],
-      ['Decimals', x => `<span class="num">${esc(x.decimals)}</span>`, 'end'],
-      ['Credited as', x => esc(x.credit)],
-    ], n.tokens)}`;
+    <p class="warn-line">Send only ${esc(joinOr(symbols))} on ${esc(n.chain_name)}. Other tokens or networks can be lost.</p>
+    <details class="more"><summary>Details</summary>
+      ${facts([
+        ['Network', `${esc(n.chain_name)}${n.chain_id ? ` <span class="hint">chain ID ${esc(n.chain_id)}</span>` : ''}`],
+        ['Address', `The address is personal to your account and does not change. ${explorerLink(n.explorer, 'address', n.address, 'View on explorer')}`],
+        ['Credit', `Each accepted token is credited 1:1 in USD (1 ${esc(symbols[0] || 'USDC')} = ${esc(usd(1))}), once the network confirms it. Native coins and any other token are recorded but not credited.`],
+        timing && ['Credited after', esc(timing)],
+        ['Minimum', esc(minimum)],
+      ])}
+      <h4 class="sub-head">Accepted tokens</h4>
+      ${table([
+        ['Token', x => `<div class="model-cell"><strong>${esc(x.symbol)}</strong>${x.name && x.name !== x.symbol ? `<span class="hint">${esc(x.name)}</span>` : ''}</div>`],
+        ['Contract address', x => contractCell(n.explorer, x.contract), 'wrap'],
+        ['Decimals', x => `<span class="num">${esc(x.decimals)}</span>`, 'end'],
+        ['Credited as', x => esc(x.credit)],
+      ], n.tokens)}
+      <h4 class="sub-head">Recent deposits</h4>
+      ${depositsTable(t.recent || [])}
+    </details>`;
 }
-function topUpCard(t) {
+// The stablecoin top-up lives in a dialog, opened from the Add credit section.
+function topUpModal() {
+  const t = billingData?.v?.top_up;
+  if (!t) return;
   if (t.available === false) {
-    return `<section class="card" id="topup" aria-labelledby="topup-title"><div class="card-head"><h3 id="topup-title">Top up with stablecoins</h3></div>
-      <div class="callout warn"><p>Your deposit addresses are temporarily unavailable. Try again in a moment.</p><div class="actions"><button type="button" class="small" data-refresh>Try again</button></div></div></section>`;
+    modal('Top up with stablecoins', `<div class="callout warn"><p>Your deposit addresses are temporarily unavailable. Try again in a moment.</p></div>`, null, 'sheet');
+    return;
   }
-  if (!t.networks?.length) return '';
-  topUpState.data = t;
   if (!t.networks.some(n => n.chain === topUpState.chain)) topUpState.chain = t.networks[0].chain;
-  const symbols = [...new Set(t.networks.flatMap(n => n.tokens.map(x => x.symbol)))];
-  const steps = [
-    ['Pick a network', 'Choose the network your wallet or exchange will send on.'],
-    ['Send a supported token', `Send ${joinOr(symbols)} to your personal address. Anything else is not credited.`],
-    ['Credit appears', `Once the network confirms the transfer (usually about ${plural(t.eta_minutes, 'minute')}), the amount is added to your balance 1:1 in USD.`],
-  ];
-  return `<section class="card topup" id="topup" aria-labelledby="topup-title" data-topup>
-    <div class="card-head"><h3 id="topup-title">Top up with stablecoins</h3><span class="hint">Any amount, no plan needed</span></div>
-    <ol class="how-steps">${steps.map(([title, text], n) => `<li><span class="step-dot">${n + 1}</span><div><strong>${esc(title)}</strong><p>${esc(text)}</p></div></li>`).join('')}</ol>
-    <div class="net-tabs" role="tablist" aria-label="Network">${t.networks.map(n => `<button type="button" role="tab" id="net-tab-${esc(n.chain.replace(/\W/g, '-'))}" data-net="${esc(n.chain)}" aria-selected="${n.chain === topUpState.chain}" aria-controls="net-panel" tabindex="${n.chain === topUpState.chain ? 0 : -1}">${esc(n.chain_name)}</button>`).join('')}</div>
+  modal('Top up with stablecoins', `<div data-topup>
+    ${t.networks.length > 1 ? `<div class="net-tabs" role="tablist" aria-label="Network">${t.networks.map(n => `<button type="button" role="tab" data-net="${esc(n.chain)}" aria-selected="${n.chain === topUpState.chain}" aria-controls="net-panel" tabindex="${n.chain === topUpState.chain ? 0 : -1}">${esc(n.chain_name)}</button>`).join('')}</div>` : ''}
     <div id="net-panel" role="tabpanel" data-net-panel>${netPanel(t.networks.find(n => n.chain === topUpState.chain), t)}</div>
-    <h4 class="sub-head">Recent deposits</h4>
-    ${depositsTable(t.recent || [])}
-  </section>`;
+  </div>`, d => {
+    wireCopies(d);
+    const tabs = [...d.querySelectorAll('[data-net]')];
+    const select = (chain, focus) => {
+      topUpState.chain = chain;
+      const panel = d.querySelector('[data-net-panel]');
+      const open = panel.querySelector('details')?.open;
+      tabs.forEach(b => {
+        b.setAttribute('aria-selected', String(b.dataset.net === chain));
+        b.tabIndex = b.dataset.net === chain ? 0 : -1;
+        if (focus && b.dataset.net === chain) b.focus();
+      });
+      panel.innerHTML = netPanel(t.networks.find(n => n.chain === chain), t);
+      if (open) panel.querySelector('details').open = true;
+      wireCopies(panel);
+    };
+    tabs.forEach((b, i) => {
+      b.onclick = () => select(b.dataset.net);
+      b.onkeydown = e => {
+        const target = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+        if (target === undefined) return;
+        e.preventDefault();
+        select(tabs[(target + tabs.length) % tabs.length].dataset.net, true);
+      };
+    });
+  }, 'wide sheet');
 }
 function wireTopUp(root) {
-  const box = root.querySelector('[data-topup]');
-  if (!box) return;
-  const tabs = [...box.querySelectorAll('[data-net]')];
-  const select = (chain, focus) => {
-    topUpState.chain = chain;
-    tabs.forEach(b => {
-      b.setAttribute('aria-selected', String(b.dataset.net === chain));
-      b.tabIndex = b.dataset.net === chain ? 0 : -1;
-      if (focus && b.dataset.net === chain) b.focus();
-    });
-    const panel = box.querySelector('[data-net-panel]');
-    panel.innerHTML = netPanel(topUpState.data.networks.find(n => n.chain === chain), topUpState.data);
-    wireCopies(panel);
-  };
-  tabs.forEach((b, i) => {
-    b.onclick = () => select(b.dataset.net);
-    b.onkeydown = e => {
-      const target = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
-      if (target === undefined) return;
-      e.preventDefault();
-      select(tabs[(target + tabs.length) % tabs.length].dataset.net, true);
-    };
-  });
+  root.querySelectorAll('[data-topup-open]').forEach(b => b.onclick = topUpModal);
 }
 
 /* Pay with crypto ---------------------------------------------------------------- */
@@ -2714,13 +2758,6 @@ function orderState(o) {
   if (confirmed.length) return 'review';
   return o.status === 'expired' ? 'expired' : 'pending';
 }
-const PAY_STEPS = ['Waiting for payment', 'Detected', 'Confirmed', 'Credited'];
-const PAY_PROGRESS = { pending: 0, expired: 0, failed: 0, confirming: 1, underpaid: 2, review: 2, paid: 3 };
-const payTimeline = state => `<ol class="timeline" aria-label="Payment progress">${PAY_STEPS.map((label, n) => {
-  const done = state === 'paid' || n < PAY_PROGRESS[state];
-  const current = !done && n === PAY_PROGRESS[state];
-  return `<li class="${done ? 'done' : current ? 'current' : ''}"${current ? ' aria-current="step"' : ''}><span class="step-dot">${done ? CHECK : n + 1}</span><span class="step-label">${esc(label)}</span></li>`;
-}).join('')}</ol>`;
 const STATE_ICONS = { paid: CHECK, expired: '!', failed: '&times;', review: '!', underpaid: '!', pending: '<span class="spinner" aria-hidden="true"></span>', confirming: '<span class="spinner" aria-hidden="true"></span>' };
 const STATE_TONES = { paid: 'ok', expired: 'warn', failed: 'danger', review: 'warn', underpaid: 'warn' };
 function orderMessage(o, state, i) {
@@ -2748,28 +2785,54 @@ function pickQuote(quotes, sel) {
   if (chosen) Object.assign(sel, { chain: chosen.chain, asset: chosen.asset });
   return chosen;
 }
-function payCard(o, q, sel) {
-  const uri = paymentUri(q);
-  const content = sel.qr === 'link' ? uri : q.address;
-  const confirmations = q.confirmations ? ` after ${plural(q.confirmations, 'confirmation')}` : '';
-  return `<div class="pay-card">
-      <div class="qr-box">${qrSvg(content, `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}`) || qrSvg(q.address)}
-        <div class="seg" role="group" aria-label="QR code content"><button type="button" data-qr="link" aria-pressed="${sel.qr === 'link'}">Payment request</button><button type="button" data-qr="address" aria-pressed="${sel.qr === 'address'}">Address only</button></div>
-        <span class="hint">${sel.qr === 'link' ? 'Fills in the network, token, and amount in wallets that support payment requests.' : 'Works with any wallet or exchange: enter the amount yourself.'}</span>
-      </div>
+const RATE_NOTE = q => q.rate_usd === '1' ? `1 ${q.symbol} = ${usd(1)}` : `Quoted at ${usd(q.rate_usd)} per ${q.symbol}`;
+function payDetails(o, q, sel, state) {
+  const plan = planOfOrder(o);
+  const tolerance = o.underpayment_tolerance_pct;
+  const open = sel.details ?? state === 'review';
+  const rows = [
+    q && ['Token contract', contractCell(q.explorer, q.contract)],
+    q && q.chain_id && ['Chain ID', esc(q.chain_id)],
+    q && ['Rate', esc(RATE_NOTE(q))],
+    q && q.confirmations && ['Confirmations', `${esc(plural(q.confirmations, 'confirmation'))} before it counts`],
+    q && explorerHref(q.explorer, 'address', q.address) && ['Explorer', explorerLink(q.explorer, 'address', q.address, 'View address')],
+    tolerance && Number(tolerance) > 0 && ['Underpayment tolerance', `Shortfalls up to ${esc(tolerance)}% are accepted`],
+    o.expires_at && ['Quote expires', esc(date(o.expires_at))],
+    ['Order ID', copyable(o.id, 'Order ID', shortId(o.id))],
+  ];
+  return `<details class="more pay-more" data-details${open ? ' open' : ''}><summary>Details</summary>
+    ${q ? `<p class="hint">Send the amount in one transfer. Several smaller transfers or tokens add up, and anything above the price is not credited.</p>` : ''}
+    ${facts(rows)}
+    <h4 class="sub-head">Order</h4>${planFacts(plan, { paidAt: o.paid_at })}
+    ${q ? `<div class="seg" role="group" aria-label="QR code content"><button type="button" data-qr="link" aria-pressed="${sel.qr === 'link'}">QR: payment request</button><button type="button" data-qr="address" aria-pressed="${sel.qr === 'address'}">QR: address only</button></div>
+    <p class="hint">${sel.qr === 'link' ? 'The payment request fills in the network, token, and amount in wallets that support it.' : 'Works with any wallet or exchange. Enter the amount yourself.'}</p>` : ''}
+    ${transfersTable(o)}
+  </details>`;
+}
+function payScreen(o, q, sel, state, banner) {
+  const content = sel.qr === 'link' ? paymentUri(q) : q.address;
+  return `${banner}
+    <div class="pay-main">
       <div class="pay-fields">
-        <div class="pay-field"><span class="label">Amount to send</span><div class="pay-amount">${copyable(q.amount, `${q.symbol} amount`)}<span class="pay-symbol">${esc(q.symbol)}</span><button type="button" class="small" data-copy-value="${esc(q.amount)}" data-copy-label="${esc(q.symbol)} amount">Copy</button></div>${q.rate_usd !== '1' ? `<span class="hint">Quoted at ${esc(usd(q.rate_usd))} per ${esc(q.symbol)}</span>` : `<span class="hint">1 ${esc(q.symbol)} = ${esc(usd(1))}</span>`}</div>
-        <div class="pay-field"><span class="label">To this address</span>${copyable(q.address, `${q.chain_name} address`)}<div class="actions"><button type="button" class="small" data-copy-value="${esc(q.address)}" data-copy-label="${esc(q.chain_name)} address">Copy address</button>${explorerLink(q.explorer, 'address', q.address, 'View on explorer')}</div></div>
-        <div class="pay-field"><span class="label">Network</span><span>${esc(q.chain_name)}${q.chain_id ? ` <span class="hint">chain ID ${esc(q.chain_id)}</span>` : ''}</span></div>
-        <div class="pay-field"><span class="label">${q.contract ? `${esc(q.symbol)} token contract` : 'Asset'}</span>${contractCell(q.explorer, q.contract)}</div>
+        <div class="pay-row"><span class="label">Send exactly</span>
+          <div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span><button type="button" class="small primary" data-copy-value="${esc(q.amount)}" data-copy-label="${esc(q.symbol)} amount">Copy</button></div>
+          <div class="pay-chip-row"><span class="net-chip">${esc(q.chain_name)}</span>${(o.quotes || []).length > 1 && state === 'pending' ? '<button type="button" class="link" data-pay-change>Change</button>' : ''}</div>
+        </div>
+        <div class="pay-row"><span class="label">To address</span>
+          <div class="pay-addr"><code>${esc(q.address)}</code></div>
+          <button type="button" class="small" data-copy-value="${esc(q.address)}" data-copy-label="${esc(q.chain_name)} address">Copy address</button>
+        </div>
       </div>
+      <div class="pay-qr">${qrSvg(content, `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}`) || qrSvg(q.address)}</div>
     </div>
-    <div class="callout warn" role="note"><p><strong>Send only ${esc(q.symbol)} on ${esc(q.chain_name)}.</strong> Other tokens or networks can be lost. Send the amount in one transfer${confirmations ? `. It counts${esc(confirmations)}` : ''}. Several smaller transfers or tokens add up, and anything above the price is not credited.</p></div>`;
+    <p class="warn-line">Send only ${esc(q.symbol)} on ${esc(q.chain_name)}. Other tokens or networks can be lost.</p>`;
 }
 function cryptoView(o, sel) {
   const state = orderState(o);
   const plan = planOfOrder(o);
-  const [title, text] = orderMessage(o, state, planInfo(plan));
+  const info = planInfo(plan);
+  let [title, text] = orderMessage(o, state, info);
+  if (state === 'pending') text = 'Send the exact amount below. This page updates by itself.';
   // After a partial payment, every quote shrinks to what is still owed.
   const price = Math.round(Number(o.price_usd) * 1e6), owed = Math.max(0, price - Math.round(Number(o.received_usd) * 1e6));
   const quotes = (o.quotes || []).map(x => {
@@ -2777,40 +2840,48 @@ function cryptoView(o, sel) {
     const units = (BigInt(x.amount_units) * BigInt(owed) + BigInt(price) - 1n) / BigInt(price) || 1n;
     return { ...x, amount_units: units.toString(), amount: fromUnits(units.toString(), x.decimals) };
   });
-  const open = quotes.length && !['paid', 'failed', 'expired', 'review'].includes(state);
+  const open = quotes.length && !['paid', 'failed', 'expired', 'review', 'confirming'].includes(state);
   // Start on the network and token of the latest transfer, when there is one.
   const latest = (o.transfers || []).at(-1);
   if (latest && !sel.chain) Object.assign(sel, { chain: latest.chain, asset: latest.asset });
   const q = open ? pickQuote(quotes, sel) : null;
-  const networks = [...new Map(quotes.map(x => [x.chain, x.chain_name]))];
   const waiting = state === 'pending' && o.expires_at;
-  return `${stepper(state === 'paid' ? 3 : 1)}
-    <div class="pay-state tone-${STATE_TONES[state] || 'info'}" role="status">
+  const banner = `<div class="pay-state tone-${STATE_TONES[state] || 'info'}" role="status">
       <span class="pay-state-icon" aria-hidden="true">${STATE_ICONS[state]}</span>
-      <div><strong>${esc(title)}</strong><p>${esc(text)}</p>${waiting ? `<p class="pay-timer">Quote valid for <strong data-countdown="${esc(o.expires_at)}">${esc(countdown(o.expires_at - nowSeconds()))}</strong> (until ${esc(date(o.expires_at))})</p>` : ''}</div>
-      ${pill(state === 'confirming' ? 'Detected' : state === 'underpaid' ? 'Underpaid' : state === 'review' ? 'Needs review' : o.status)}
-    </div>
-    ${state === 'failed' || state === 'expired' ? '' : payTimeline(state)}
-    <div class="pay-grid">
-      ${orderSummary(plan, { paidAt: o.paid_at })}
-      <div>
-        ${q ? `<fieldset class="pay-choose"><legend>1. Choose a network</legend>
-          <div class="net-tabs" role="radiogroup" aria-label="Network">${networks.map(([chain, name]) => `<button type="button" role="radio" aria-checked="${chain === q.chain}" data-pick-chain="${esc(chain)}">${esc(name)}</button>`).join('')}</div></fieldset>
-        <fieldset class="pay-choose"><legend>2. Choose what to pay with</legend>
-          <div class="token-options" role="radiogroup" aria-label="Token">${quotes.filter(x => x.chain === q.chain).map(x => `<button type="button" role="radio" class="token-option" aria-checked="${x.asset === q.asset}" data-pick-asset="${esc(x.asset)}"><strong>${esc(x.amount)} ${esc(x.symbol)}</strong><span class="hint">${x.rate_usd === '1' ? 'Stablecoin, 1:1 with USD' : `Native coin at ${esc(usd(x.rate_usd))}`}</span></button>`).join('')}</div></fieldset>
-        <h4 class="sub-head">3. Send the payment</h4>
-        ${payCard(o, q, sel)}` : ''}
-        ${state === 'paid' ? '<div class="actions pay-done"><button type="button" class="primary" data-pay-done>Done</button></div>' : ''}
-        ${state === 'expired' || state === 'failed' ? '<div class="actions pay-done"><button type="button" class="primary" data-pay-again>Start a new payment</button></div>' : ''}
+      <div><strong>${esc(title)}</strong><p>${esc(text)}</p></div>
+      ${waiting ? `<span class="pay-timer" title="Quote valid until ${esc(date(o.expires_at))}"><span class="hint">Expires in</span><strong data-countdown="${esc(o.expires_at)}">${esc(countdown(o.expires_at - nowSeconds()))}</strong></span>` : ''}
+    </div>`;
+  // Step A: pick the network and token when there is a choice to make.
+  if (q && state === 'pending' && !sel.ready && quotes.length > 1) {
+    const networks = [...new Map(quotes.map(x => [x.chain, x.chain_name]))];
+    const tokens = quotes.filter(x => x.chain === q.chain);
+    return `<form class="pay-pick" data-pay-pick>
+      <div class="co-plan"><div><div class="label">Paying for</div><div class="co-name">${esc(plan.name)}</div></div><div class="co-total"><div class="label">Total</div><div class="co-price">${esc(usdShort(info.price))}</div></div></div>
+      <div class="pick-grid">
+        <div><label for="pay-chain">Network</label><select id="pay-chain" data-pick-chain>${networks.map(([chain, name]) => `<option value="${esc(chain)}"${chain === q.chain ? ' selected' : ''}>${esc(name)}</option>`).join('')}</select></div>
+        <div><label for="pay-asset">Token</label><select id="pay-asset" data-pick-asset>${tokens.map(x => `<option value="${esc(x.asset)}"${x.asset === q.asset ? ' selected' : ''}>${esc(x.symbol)}</option>`).join('')}</select></div>
       </div>
-    </div>
-    ${transfersTable(o)}`;
+      <div class="pick-amount"><span class="label">You will send</span><div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span></div><span class="hint">on ${esc(q.chain_name)} &middot; ${esc(RATE_NOTE(q))}</span></div>
+      <div class="actions sticky-actions"><button type="button" class="ghost" data-pay-cancel>Cancel</button><button type="submit" class="primary" data-pay-go>Continue</button></div>
+    </form>`;
+  }
+  let main, actions;
+  if (q) {
+    main = payScreen(o, q, sel, state, banner);
+    actions = '<button type="button" class="primary" data-pay-done>I have sent it</button>';
+  } else {
+    main = banner;
+    actions = state === 'paid' ? '<button type="button" class="primary" data-pay-done>Done</button>'
+      : state === 'expired' || state === 'failed' ? '<button type="button" class="primary" data-pay-again>Start a new payment</button>'
+      : '<button type="button" class="primary" data-pay-done>Close</button>';
+  }
+  return `<div class="pay-screen">${main}${payDetails(o, q, sel, state)}<div class="actions sticky-actions">${actions}</div></div>`;
 }
 // Shows a crypto order in a dialog and keeps it fresh until it settles. Polling
 // backs off after errors and stops when the dialog closes or the order is final.
 function runOrder(d, initial) {
   const box = d.querySelector('[data-pay]');
-  const sel = { chain: '', asset: '', qr: 'link' };
+  const sel = { chain: '', asset: '', qr: 'link', ready: false, details: undefined };
   const control = new AbortController();
   let order = initial, timer, clock, failures = 0, focus = '';
   const signature = o => JSON.stringify([o.status, o.received_usd, (o.transfers || []).map(t => [t.id, t.status, t.value_usd, t.note])]);
@@ -2829,20 +2900,27 @@ function runOrder(d, initial) {
   const draw = () => {
     box.innerHTML = cryptoView(order, sel);
     wireCopies(box);
-    box.querySelector('[data-pay-done]')?.addEventListener('click', () => d.close());
+    box.querySelector('[data-pay-done]')?.addEventListener('click', () => {
+      if (order.status !== 'paid' && order.status !== 'expired' && order.status !== 'failed') notice('Thanks. Credit is added automatically once the payment is confirmed.');
+      d.close();
+    });
+    box.querySelector('[data-pay-cancel]')?.addEventListener('click', () => d.close());
     box.querySelector('[data-pay-again]')?.addEventListener('click', () => {
       const plan = planCatalog.plans.find(p => p.code === order.plan_code);
       d.close();
       if (plan) checkout(plan, planCatalog.methods);
     });
-    const choose = (attr, apply) => box.querySelectorAll(`[${attr}]`).forEach(b => b.addEventListener('click', () => {
-      apply(b.getAttribute(attr));
+    box.querySelector('[data-pay-change]')?.addEventListener('click', () => { sel.ready = false; focus = '[data-pick-chain]'; draw(); });
+    box.querySelector('[data-pay-pick]')?.addEventListener('submit', e => { e.preventDefault(); sel.ready = true; draw(); });
+    box.querySelector('[data-details]')?.addEventListener('toggle', e => { sel.details = e.target.open; });
+    const choose = (attr, event, apply) => box.querySelectorAll(`[${attr}]`).forEach(b => b.addEventListener(event, () => {
+      apply(b.value ?? b.getAttribute(attr));
       focus = `[${attr}="${CSS.escape(b.getAttribute(attr))}"]`;
       draw();
     }));
-    choose('data-pick-chain', chain => Object.assign(sel, { chain, asset: '' }));
-    choose('data-pick-asset', asset => { sel.asset = asset; });
-    choose('data-qr', mode => { sel.qr = mode; });
+    box.querySelectorAll('select[data-pick-chain]').forEach(b => b.addEventListener('change', () => { Object.assign(sel, { chain: b.value, asset: '' }); focus = '[data-pick-chain]'; draw(); }));
+    box.querySelectorAll('select[data-pick-asset]').forEach(b => b.addEventListener('change', () => { sel.asset = b.value; focus = '[data-pick-asset]'; draw(); }));
+    choose('data-qr', 'click', mode => { sel.qr = mode; });
     if (focus) box.querySelector(focus)?.focus();
     focus = '';
     tick();
@@ -2880,7 +2958,7 @@ function runOrder(d, initial) {
   });
 }
 function cryptoOrder(initial) {
-  modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'wide');
+  modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'wide sheet');
 }
 // A customer's view of one of their payments, card or crypto.
 async function receiptModal(id) {
@@ -3255,6 +3333,17 @@ async function oauthConsent() {
 
 /* Interaction wiring --------------------------------------------------------------- */
 
+// Switches the billing sub-section in place and keeps the URL hash in sync.
+function showBilling(sub, focus) {
+  const content = document.querySelector('#content');
+  if (!billingData || !content || tab !== 'billing') return;
+  billingSub = sub;
+  history.pushState(null, '', hashFor('billing'));
+  content.innerHTML = renderBilling();
+  wire(content);
+  if (focus) content.querySelector('[data-bsub][aria-selected=true]')?.focus();
+  else window.scrollTo({ top: 0 });
+}
 function wire(root) {
   root.querySelectorAll('[data-refresh]').forEach(b => b.onclick = load);
   root.querySelectorAll('[data-create]').forEach(b => b.onclick = keyForm);
@@ -3263,6 +3352,16 @@ function wire(root) {
   wireDocs(root);
   wireCopies(root);
   wireTopUp(root);
+  root.querySelectorAll('[data-bsub]').forEach((b, i, all) => {
+    b.onclick = () => showBilling(b.dataset.bsub);
+    b.onkeydown = e => {
+      const target = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: all.length - 1 }[e.key];
+      if (target === undefined) return;
+      e.preventDefault();
+      showBilling(all[(target + all.length) % all.length].dataset.bsub, true);
+    };
+  });
+  root.querySelectorAll('[data-bsub-go]').forEach(b => b.onclick = () => showBilling(b.dataset.bsubGo));
   root.querySelectorAll('[data-scroll]').forEach(b => b.onclick = () => {
     const target = document.getElementById(b.dataset.scroll);
     if (!target) return;
@@ -3410,3 +3509,11 @@ main.setAttribute('aria-busy', 'true');
 Promise.resolve(boot()).catch(e => {
   main.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p></div>`;
 }).finally(() => main.removeAttribute('aria-busy'));
+
+// On narrow screens list filters fold behind a "Filters" toggle.
+document.addEventListener('click', e => {
+  const button = e.target.closest('[data-toolbar-toggle]');
+  if (!button) return;
+  const expanded = button.closest('.toolbar').classList.toggle('expanded');
+  button.setAttribute('aria-expanded', String(expanded));
+});

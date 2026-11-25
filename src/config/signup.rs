@@ -14,6 +14,11 @@ pub struct Signup {
     pub enabled: bool,
     /// USD trial credit granted to each new account, as a decimal string.
     pub free_credit_usd: String,
+    /// When true, each further signup from the same IP in the same calendar
+    /// month gets half the trial credit of the previous one: the first gets
+    /// `free_credit_usd`, the second half of it, the third a quarter, and so
+    /// on. An amount that rounds below one micro-USD grants nothing.
+    pub free_credit_halving: bool,
     /// Days the signup credit stays spendable. 0 means it never expires.
     pub free_credit_expiry_days: u32,
     /// Self-service keys per source IP per calendar month. 0 disables the guard.
@@ -36,6 +41,7 @@ impl Default for Signup {
         Self {
             enabled: true,
             free_credit_usd: "0.10".into(),
+            free_credit_halving: false,
             free_credit_expiry_days: 30,
             ip_limit_per_month: 2,
             cooldown_seconds: 30,

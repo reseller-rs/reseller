@@ -1459,6 +1459,44 @@ async fn new_accounts_get_the_default_or_configured_trial_credit() {
     assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.75");
 }
 
+#[tokio::test]
+async fn halving_gives_each_further_signup_from_one_ip_half_the_trial() {
+    let t = Test::new().await;
+    {
+        let mut c = t.app.config_mut().await;
+        c.signup.free_credit_usd = "0.1".into();
+        c.signup.free_credit_halving = true;
+        c.signup.ip_limit_per_month = 4;
+    }
+    let signup = |ip: &'static str| {
+        let app = t.app.clone();
+        async move {
+            reseller::keys::create(
+                &app,
+                reseller::keys::Requester::Signup { altcha: None },
+                ip,
+                &json!({}),
+            )
+            .await
+        }
+    };
+    for expected in ["0.1", "0.05", "0.025", "0.0125"] {
+        let v = signup("203.0.113.9").await.unwrap();
+        assert_eq!(v["trial_credit_usd"], expected);
+        assert_eq!(t.balance(v["account_id"].as_str().unwrap()).await, expected);
+    }
+    // The fifth is over the monthly allowance; another IP starts at full credit.
+    assert!(signup("203.0.113.9").await.is_err());
+    let other = signup("198.51.100.4").await.unwrap();
+    assert_eq!(other["trial_credit_usd"], "0.1");
+
+    // Without halving every signup gets the full amount.
+    t.app.config_mut().await.signup.free_credit_halving = false;
+    t.app.config_mut().await.signup.ip_limit_per_month = 0;
+    let v = signup("203.0.113.9").await.unwrap();
+    assert_eq!(v["trial_credit_usd"], "0.1");
+}
+
 /// The overview counts only credit active accounts can spend as outstanding.
 /// Credit of suspended accounts and customer debt are reported apart, and
 /// usable keys exclude keys of suspended accounts.
