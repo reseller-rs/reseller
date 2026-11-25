@@ -405,8 +405,8 @@ Every `429` response carries a `Retry-After` header in seconds, computed from th
 | Invalid redeem codes | Account, per hour | `rate_limits.redeem_failures_per_hour` | `redeem_rate_limited` |
 | Checkout attempts | Account, per hour | `rate_limits.checkouts_per_hour` | `checkout_rate_limited` |
 | In-flight proxy requests | Account | `rate_limits.max_concurrent_requests` | `concurrency_limit_exceeded` |
-| Self-service key creations per calendar month | IP | `signup.ip_limit_per_month`, `signup.ip_overrides` | `ip_key_limit` |
-| Gap between creations | IP | `signup.cooldown_seconds` | `creation_cooldown` |
+| New accounts (signups) per calendar month. Keys on an existing account and accounts that pay or are trusted do not count. | IP | `signup.ip_limit_per_month`, `signup.ip_overrides` | `ip_signup_limit` |
+| Gap between two signups | IP | `signup.cooldown_seconds` | `signup_cooldown` |
 | Key creations (signup, child keys, rotations) per hour | Global | `signup.global_hourly_limit` | `creation_rate_limited` |
 
 | Keys created or rotated per rolling 24 hours | Account (customers, admin exempt) | `keys.max_new_per_day` | `key_creation_daily_limit` |
@@ -435,7 +435,7 @@ A request whose own hold can never fit a key window (for example a 4096-token ho
 | Upstream `insufficient_quota` (the operator's provider account is out of credit) | Passed through as `429` | `502 upstream_error` | It is not the caller's quota |
 | Upstream status rewritten (for example 401 to 502) | Kept the upstream `Retry-After` | Header dropped | The hint belonged to the upstream status |
 
-Accounts that are subscribed or have `can_create_keys` set bypass the per-IP monthly allowance and the cooldown. They do not bypass the global, daily, or account key caps. The in-memory limiter state is per process and is not persisted, so a restart only relaxes limits.
+The per-address allowance limits free trials, not keys: a household sharing one connection can open up to `ip_limit_per_month` accounts each month, and each person can hold several keys on their own account (`keys.max_per_account`, `keys.max_new_per_day`). Accounts with a paid order or an active subscription, and accounts the operator trusts (`can_create_keys`), no longer count. Trusted accounts also skip the daily key creation budget, but not the account key cap or the global hourly cap.
 
 ### Auth-failure lockout
 
@@ -707,7 +707,7 @@ All routes live under `/admin/api`. They require the administrator token, sent a
 | `POST` | `/keys/:id/revoke` | Revoke a key |
 | `GET` | `/accounts?q=&status=&sort=&dir=&limit=&offset=` | List accounts with balance, `debt_usd`, `billed_usd`, `usage_30d_usd`, and key counts. `sort` is `created`, `contact`, `status`, `balance`, `keys`, `spend`, or `usage`. |
 | `GET` | `/accounts/:id?key_limit=&key_offset=&key_sort=&key_dir=` | One account with a page of its keys and 30-day usage |
-| `PATCH` | `/accounts/:id` | Update status, contact, note, `markup_pct`, or `can_create_keys` |
+| `PATCH` | `/accounts/:id` | Update status, contact, note, `markup_pct`, or `can_create_keys` (trusted: skips the daily key budget and the signup allowance) |
 | `POST` | `/accounts/:id/keys` | Create a key with a name and limits (bypasses creation guards) |
 | `POST` | `/accounts/:id/credits` | Add credit: `amount_usd`, `source`, optional `expires_at` and `note`. Requires an `Idempotency-Key` header (see below) |
 | `POST` | `/accounts/:id/subscriptions` | Grant a plan (`plan_code`): a subscription starting now, or a top-up. Requires an `Idempotency-Key` header |

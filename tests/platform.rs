@@ -497,31 +497,22 @@ async fn redemption_is_atomic_under_retries() {
     );
 }
 #[tokio::test]
-async fn plan_grants_expiring_credit_and_bypasses_ip_allowance() {
+async fn plan_grants_expiring_credit_and_frees_the_signup_allowance() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
     t.app.config_mut().await.signup.ip_limit_per_month = 1;
     let i = t.identity(&k).await;
-    assert!(
+    let body = json!({});
+    let signup = || {
         keys::create(
             &t.app,
-            keys::Requester::Customer(&i),
+            keys::Requester::Signup { altcha: None },
             "127.0.0.1",
-            &json!({})
+            &body,
         )
-        .await
-        .is_err()
-    );
-    let (s, _) = t
-        .call(
-            "POST",
-            &format!("/admin/api/accounts/{aid}/subscriptions"),
-            Some(ADMIN),
-            json!({"plan_code":"monthly"}),
-        )
-        .await;
-    assert_eq!(s, 200);
+    };
+    // Keys on the existing account never count against the address.
     assert!(
         keys::create(
             &t.app,
@@ -532,6 +523,20 @@ async fn plan_grants_expiring_credit_and_bypasses_ip_allowance() {
         .await
         .is_ok()
     );
+    // A second free account from the same address is over the allowance.
+    let blocked = signup().await.unwrap_err();
+    assert_eq!(blocked.code, "ip_signup_limit");
+    let (s, _) = t
+        .call(
+            "POST",
+            &format!("/admin/api/accounts/{aid}/subscriptions"),
+            Some(ADMIN),
+            json!({"plan_code":"monthly"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    // A subscribed account no longer uses up the free allowance.
+    assert!(signup().await.is_ok());
     let v = billing::account(&t.app, aid).await.unwrap();
     assert_eq!(v["account"]["balance_usd"], "20.1");
     assert!(v["account"]["subscription"]["expires_at"].as_i64().unwrap() > db::now());

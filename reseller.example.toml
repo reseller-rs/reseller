@@ -157,10 +157,13 @@ public_url = "http://localhost:56787"
 # 3650. Default: 30.
 # free_credit_expiry_days = 30
 
-# New keys allowed per source IP per calendar month. Default: 4.
+# New accounts (signups) per source IP per calendar month, for example a
+# household sharing one connection. Keys created on an existing account never
+# count, and neither do accounts that pay or that the operator trusts.
+# Default: 4.
 # ip_limit_per_month = 4
 
-# Minimum seconds between key creations from one IP. Default: 30.
+# Minimum seconds between two signups from one IP. Default: 30.
 # cooldown_seconds = 30
 
 # Key creations per hour across all accounts (signup, child keys, and

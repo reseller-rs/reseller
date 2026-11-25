@@ -273,7 +273,7 @@ function planRequests(i) {
   };
 }
 const ESTIMATE_NOTE = 'Request counts are estimates for typical requests. Long prompts and outputs use more.';
-const estimateNote = () => `<p class="estimate-note">${ico('info', 16)}<span>${esc(ESTIMATE_NOTE)}</span></p>`;
+const estimateNote = () => `<p class="estimate-note"><span>Counts are estimates</span>${tip(ESTIMATE_NOTE)}</p>`;
 
 /* Legal links -------------------------------------------------------------------- */
 const LEGAL_LABELS = { terms: 'Terms of Service', privacy: 'Privacy Policy' };
@@ -451,22 +451,48 @@ function flash(el, duration = 1400) {
   clearTimeout(el._flashTimer);
   el._flashTimer = setTimeout(() => el.classList.remove('copied'), duration);
 }
+// Icon-only action button: a 32px+ hit area, a tooltip (hover, focus, tap) and an aria-label.
+const iconBtn = (name, label, attrs = '', cls = '') => `<button type="button" class="icon-btn${cls.includes('primary') ? '' : ' ghost'}${cls ? ` ${cls}` : ''}" data-tip="${esc(label)}" aria-label="${esc(label)}"${attrs ? ` ${attrs}` : ''}>${ico(name)}</button>`;
+const copyBtn = (value, label, cls = '') => iconBtn('copy', `Copy ${label}`, `data-copy-value="${esc(value)}" data-copy-label="${esc(label)}"`, cls);
 function flashCopied(button) {
   if (!button) return;
-  if (button._label === undefined) button._label = button.innerHTML;
+  const iconOnly = button.classList.contains('icon-btn');
+  if (button._label === undefined) {
+    button._label = button.innerHTML;
+    button._tip = button.dataset.tip;
+  }
   button.classList.add('copied');
-  button.innerHTML = withIcon('check', 'Copied');
+  if (iconOnly) {
+    button.innerHTML = `${ico('check')}<span class="sr-only" aria-live="polite">Copied</span>`;
+    button.dataset.tip = 'Copied';
+    button.classList.add('tip-open');
+  } else {
+    button.innerHTML = withIcon('check', 'Copied');
+  }
   clearTimeout(button._flashTimer);
   button._flashTimer = setTimeout(() => {
-    button.classList.remove('copied');
+    button.classList.remove('copied', 'tip-open');
     button.innerHTML = button._label;
+    if (button._tip !== undefined) button.dataset.tip = button._tip;
     button._label = undefined;
   }, 1400);
 }
+// Tooltips on [data-tip] show on hover and keyboard focus. A tap or click toggles
+// them for touch screens, and Escape or a tap elsewhere hides them.
+document.addEventListener('click', e => {
+  const target = e.target.closest?.('[data-tip]');
+  document.querySelectorAll('.tip-open').forEach(el => { if (el !== target && !el.classList.contains('copied')) el.classList.remove('tip-open'); });
+  if (target && !target.classList.contains('copied') && target.matches('.tip, .icon-btn')) target.classList.toggle('tip-open');
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('.tip-open').forEach(el => el.classList.remove('tip-open'));
+});
 
 const ERROR_HINTS = {
   rotate_cooldown: 'This key was created or rotated too recently to rotate again.',
   key_creation_daily_limit: 'Daily limit for creating or rotating keys reached.',
+  ip_signup_limit: 'This network has reached its monthly limit of new accounts. Sign in to your existing account to create more keys.',
+  signup_cooldown: 'Please wait a little before creating another account.',
   pow_required: 'Human verification is required. Please try again.',
   pow_invalid: 'Human verification failed. Please try again.',
   pow_replayed: 'That verification was already used. Please try again.',
@@ -475,11 +501,12 @@ const ERROR_HINTS = {
 };
 function apiError(r, v) {
   const code = v?.error?.code || v?.error?.type || '';
-  let message = v?.error?.message || ERROR_HINTS[code] || `Request failed (${r.status})`;
+  // The per-network signup limit always gets the fixed wording, with no retry hint: it resets monthly.
+  let message = (code === 'ip_signup_limit' && ERROR_HINTS[code]) || v?.error?.message || ERROR_HINTS[code] || `Request failed (${r.status})`;
   const wait = Number.parseInt(r.headers.get('retry-after'), 10);
   if (r.status === 429) {
     if (!v?.error?.message && !ERROR_HINTS[code]) message = 'Too many requests. Please slow down.';
-    if (wait > 0) message = `${message.replace(/[.!]?$/, '.')} Try again in ${wait >= 120 ? `${Math.ceil(wait / 60)} minutes` : `${wait} second${wait === 1 ? '' : 's'}`}.`;
+    if (wait > 0 && code !== 'ip_signup_limit') message = `${message.replace(/[.!]?$/, '.')} Try again in ${wait >= 120 ? `${Math.ceil(wait / 60)} minutes` : `${wait} second${wait === 1 ? '' : 's'}`}.`;
   }
   return Object.assign(new Error(message), { status: r.status, code, retryAfter: wait > 0 ? wait : null, redirect: typeof v?.redirect === 'string' ? v.redirect : '' });
 }
@@ -858,7 +885,7 @@ function pricingSection(plans, methods = [], cta, { faq = true, deposits = false
    Choose plan -> Pay -> Plan active, in one dialog. Card payments hand off to
    Stripe. Crypto orders stay in the dialog and update while it is open. */
 let planCatalog = { plans: [], methods: [] };
-const tip = text => `<button type="button" class="tip" data-tip="${esc(text)}" aria-label="${esc(text)}">i</button>`;
+const tip = text => `<button type="button" class="tip" data-tip="${esc(text)}" aria-label="${esc(text)}">${ico('info', 14)}</button>`;
 // Compact plan facts shared by checkout and the payment dialog.
 function planFacts(p, { paidAt } = {}) {
   const i = planInfo(p);
@@ -875,8 +902,8 @@ function planFacts(p, { paidAt } = {}) {
   ]);
 }
 const METHOD_INFO = {
-  stripe: ['Card', 'Secure Stripe checkout'],
-  crypto: ['Crypto', 'USDC, USDT or native coins'],
+  stripe: ['Card', 'Stripe'],
+  crypto: ['Crypto', 'USDC, USDT'],
 };
 function checkout(plan, methods) {
   if (!methods.length) return notice('Online payments are not enabled. Use a code.', true);
@@ -886,16 +913,15 @@ function checkout(plan, methods) {
   modal('Checkout', `<div data-pay>
     <form class="checkout">
       <section class="co-plan" aria-label="Order">
-        <div class="co-info"><div class="label">${i.topup ? 'Top-up' : 'Plan'}</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${esc(term)}</div></div>
+        <div class="co-info"><div class="label">${i.topup ? 'Top-up' : 'Plan'}</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${esc(term)}${tip(i.topup ? 'Top-ups never expire. The monthly quota is used first, then your top-up balance.' : 'Prepaid for the whole term, with no auto-renewal. The quota is shared by all your keys.')}</div></div>
         <div class="co-total"><div class="label">Total today</div><div class="co-price">${esc(usdShort(i.price))}</div></div>
       </section>
-      <div class="co-credit">${ico('zap', 20)}<div><strong>${esc(r.main)}</strong><span class="muted">${esc(r.sub)}</span>${estimateNote()}</div></div>
+      <div class="co-credit">${ico('zap', 20)}<div><strong>${esc(r.main)}</strong> <span class="muted">${esc(r.sub)}</span>${tip(ESTIMATE_NOTE)}</div></div>
       <fieldset class="method-choice"><legend>Pay with</legend>
         ${methods.map((m, n) => `<label class="method"><input type="radio" name="method" value="${esc(m)}"${n === 0 ? ' checked' : ''}><span class="method-body"><strong>${esc(METHOD_INFO[m]?.[0] || m)}</strong><span class="hint">${esc(METHOD_INFO[m]?.[1] || '')}</span></span></label>`).join('')}
       </fieldset>
       <details class="more"><summary>Plan details</summary>
         ${planFacts(plan)}
-        <p class="hint">${i.topup ? 'Top-ups never expire. The monthly quota is used first, then your top-up balance.' : 'Prepaid for the whole term, with no auto-renewal. The quota is shared by all your keys.'}</p>
       </details>
       <p class="clickwrap">By continuing, you agree to the ${legalLink('terms', { newTab: true })} and ${legalLink('privacy', { newTab: true })}.</p>
       <div class="actions sticky-actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary" data-submit>Continue</button></div>
@@ -914,7 +940,7 @@ function checkout(plan, methods) {
     bindForm(form, async b => {
       const v = await api('/v1/account/checkout', 'POST', { plan_code: plan.code, method: b.method });
       if (v.method === 'crypto') {
-        setModalTitle(d, 'Pay with crypto', 'Send the exact amount. This window updates by itself.');
+        setModalTitle(d, 'Pay with crypto');
         runOrder(d, v);
         if (tab === 'billing') load();
         return;
@@ -926,7 +952,7 @@ function checkout(plan, methods) {
       location.href = url.href;
       await new Promise(() => {});
     });
-  }, 'wide sheet', 'Review your plan, then choose how to pay.');
+  }, 'narrow sheet');
 }
 
 /* Charts ----------------------------------------------------------------------- */
@@ -1048,7 +1074,6 @@ function redeemForm() {
     <form>
       <label for="redeem-code">Credit code</label>
       <input id="redeem-code" name="code" autocomplete="off" required placeholder="RES-...">
-      <p class="field-help">Codes are single-use. The usage is available as soon as you redeem it.</p>
       <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary">Redeem code</button></div>
     </form>`, d => {
     d.querySelector('[data-cancel]').onclick = () => d.close();
@@ -1058,25 +1083,25 @@ function redeemForm() {
       notice('Code redeemed');
       await load();
     });
-  }, 'narrow', 'Enter the code from your operator.');
+  }, 'narrow');
 }
 
 function secrets(v, { embedded = false } = {}) {
   modal('Save your credentials', `
-    ${alertBox('warn', 'Copy these now', 'They are shown only once. The dashboard token lets you manage your account even if you block your API key.')}
+    ${alertBox('warn', 'Save these now', 'They are shown only once.')}
     ${Number(v.trial_credit_usd) > 0 ? `<div class="trial-note">${ico('zap', 20)}<div><strong>${esc(approx(v.trial_credit_usd))} free requests to try the API</strong>${estimateNote()}</div></div>` : ''}
     <div class="cred-row">
       <span class="cred-label">API key</span>
       <code class="cred-value secret" title="${esc(v.key)}">${esc(v.key)}</code>
-      <button type="button" class="small primary" data-copy="key">${withIcon('copy', 'Copy key')}</button>
+      ${iconBtn('copy', 'Copy API key', 'data-copy="key"')}
     </div>
     <div class="cred-row">
-      <span class="cred-label">Dashboard token</span>
+      <span class="cred-label">Dashboard token${tip('Manages your account even if you block your API key.')}</span>
       <code class="cred-value" title="${esc(v.dashboard_token)}">${esc(v.dashboard_token)}</code>
-      <button type="button" class="small" data-copy="token">${withIcon('copy', 'Copy token')}</button>
+      ${iconBtn('copy', 'Copy dashboard token', 'data-copy="token"')}
     </div>
     <div class="actions">
-      <button type="button" data-copy-all class="ghost">${withIcon('copy', 'Copy both')}</button>
+      ${iconBtn('copy', 'Copy key and token', 'data-copy-all')}
       ${admin || embedded ? '' : `<button type="button" data-open class="primary">${withIcon('grid', 'Open workspace')}</button>`}
     </div>`, d => {
     const wire = (selector, text, label) => {
@@ -1099,7 +1124,7 @@ function secrets(v, { embedded = false } = {}) {
       sessionStorage.setItem(CUSTOMER_STORE, v.dashboard_token);
       location.href = '/workspace/';
     });
-  }, 'wide', 'Your account is ready.');
+  }, 'wide');
 }
 
 function keyForm() {
@@ -1110,7 +1135,7 @@ function keyForm() {
       <input id="key-name" name="name" maxlength="80" value="${esc(suggestedName())}" placeholder="My application" required>
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
-      <p class="field-help">${signedIn ? 'The new key shares your account balance.' : 'New accounts get free trial usage. More keys share the same balance.'}</p>
+      ${signedIn ? '' : '<p class="field-help">Free trial usage included.</p>'}
       <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Checking that you are human...</span></div><progress max="100" value="0"></progress></div>
       ${signedIn ? '' : clickwrap('Create key')}
       <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button class="primary" type="submit">${withIcon('plus', 'Create key')}</button></div>
@@ -1135,7 +1160,7 @@ function keyForm() {
       secrets(v);
       if (document.querySelector('#content')) await load();
     });
-  }, 'narrow', signedIn ? 'Give it a name you will recognize.' : 'No card needed. You get a key and a dashboard token.');
+  }, 'narrow');
 }
 
 /* Key details ------------------------------------------------------------------ */
@@ -1336,7 +1361,7 @@ function manageAccount(aid) {
       </section>
       <section class="detail-section"><h4>Settings</h4>${facts([
         ['Markup', a.markup_pct ? `${esc(a.markup_pct)}%` : 'Global default'],
-        ['Key creation', a.can_create_keys ? 'Beyond self-service limits' : 'Self-service limits'],
+        ['Account type', a.can_create_keys ? 'Trusted' : 'Standard'],
         ['Contact', esc(a.contact || '-')],
       ])}</section>`;
   };
@@ -1427,7 +1452,6 @@ async function grantForm(aid, done) {
       <select id="grant-plan" name="plan_code" required>
         ${plans.map(p => `<option value="${esc(p.code)}">${esc(planTitle(p))}</option>`).join('')}
       </select>
-      <p class="field-help">Starts the plan or adds the top-up immediately.</p>
       <div class="actions"><button class="primary" type="submit">Grant plan</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     const v = await api(endpoint(`accounts/${aid}/subscriptions`), 'POST', { plan_code: b.plan_code }, { headers: { 'idempotency-key': idempotencyKey } });
@@ -1442,7 +1466,6 @@ function createAccountKeyForm(aid, done) {
     <form>
       <label for="account-key-name">Key name</label>
       <input id="account-key-name" name="name" maxlength="80" value="${esc(suggestedName())}" required>
-      <p class="field-help">Limits, markup, and expiry can be set afterwards with Edit key.</p>
       <div class="actions"><button class="primary" type="submit">Create key</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     const v = await api(endpoint(`accounts/${aid}/keys`), 'POST', { name: b.name });
@@ -1467,7 +1490,7 @@ function editAccountForm(a, done) {
       <input id="account-note" name="note" value="${esc(a.note)}" placeholder="VIP customer">
       <label for="account-markup">Markup %</label>
       <input id="account-markup" name="markup_pct" inputmode="decimal" value="${a.markup_pct ? esc(a.markup_pct) : ''}" placeholder="Global default">
-      <label class="inline check-line"><input type="checkbox" name="can_create_keys"${a.can_create_keys ? ' checked' : ''}> Allow key creation beyond self-service limits</label>
+      <label class="inline check-line"><input type="checkbox" name="can_create_keys"${a.can_create_keys ? ' checked' : ''}> Trusted account${tip('Skips the daily key creation budget and does not count toward its network\'s monthly signup allowance.')}</label>
       <div class="actions"><button class="primary" type="submit">Save changes</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     await api(endpoint(`accounts/${a.id}`), 'PATCH', {
@@ -1491,7 +1514,7 @@ function remember(rows) {
   if (requestIndex.size > 2000) requestIndex.clear();
   rows.forEach(r => requestIndex.set(r.id, r));
 }
-const routeCell = r => `<span class="route"><span class="method">${esc(r.method)}</span><code>${esc(r.path)}</code></span>`;
+const routeCell = r => `<span class="route">${methodTag(r.method)}<code>${esc(r.path)}</code></span>`;
 function requestTable(rows, { compact = false } = {}) {
   remember(rows);
   const columns = [
@@ -1555,7 +1578,7 @@ function requestDetails(r) {
 
 /* API and MCP guidance ----------------------------------------------------------- */
 
-const codeBlock = (text, label) => `<div class="code-block">${label ? `<div class="code-label">${esc(label)}</div>` : ''}<button type="button" class="small ghost" data-copy-code>${withIcon('copy', 'Copy')}</button><pre><code>${esc(text)}</code></pre></div>`;
+const codeBlock = (text, label) => `<div class="code-block"><div class="code-bar"><span class="code-label">${esc(label || '')}</span>${iconBtn('copy', 'Copy', 'data-copy-code')}</div><pre><code>${esc(text)}</code></pre></div>`;
 
 function snippetTabs(items) {
   return `<div class="snippets">
@@ -1566,7 +1589,7 @@ function snippetTabs(items) {
 
 function wireDocs(root) {
   root.querySelectorAll('[data-copy-code]').forEach(button => {
-    button.onclick = () => copyText(button.parentElement.querySelector('code').textContent, 'Snippet').then(ok => ok && flashCopied(button));
+    button.onclick = () => copyText(button.closest('.code-block').querySelector('code').textContent, 'Snippet').then(ok => ok && flashCopied(button));
   });
   root.querySelectorAll('.snippets').forEach(box => {
     const tabs = [...box.querySelectorAll('[data-snippet-tab]')];
@@ -1766,7 +1789,7 @@ function appsCard(apps) {
     ], apps, { empty: ['No connected apps', 'Apps you approve through the sign-in page in your browser appear here.'] });
   return `<div class="card"><div class="card-head"><h3>Connected apps</h3><span class="hint">${apps.error ? '' : esc(plural(apps.length, 'app'))}</span></div>${body}</div>`;
 }
-const methodTag = m => `<span class="method method-${esc(m.toLowerCase())}">${esc(m)}</span>`;
+const methodTag = m => `<span class="verb verb-${esc(String(m).toLowerCase())}">${esc(m)}</span>`;
 const endpointTable = rows => table([
   ['Method', r => methodTag(r[0])],
   ['Path', r => `<code>${esc(r[1])}</code>`, 'wrap'],
@@ -2933,7 +2956,7 @@ function planForm(initial = {}) {
 function showIssuedCodes(v) {
   const codes = v.codes || [v.code];
   const list = codes.join('\n');
-  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'}. Shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button type="button" class="primary" data-copy-codes>${withIcon('copy', codes.length === 1 ? 'Copy code' : 'Copy all')}</button></div>`, d => {
+  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'}. Shown only once.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section">${iconBtn('copy', codes.length === 1 ? 'Copy code' : 'Copy all codes', 'data-copy-codes', 'primary')}</div>`, d => {
     const button = d.querySelector('[data-copy-codes]');
     button.onclick = () => copyText(list, 'Redeem codes').then(ok => ok && flashCopied(button));
   }, 'wide');
@@ -2976,7 +2999,7 @@ function editCodeForm(button) {
 const shortHash = v => v && v.length > 18 ? `${v.slice(0, 10)}...${v.slice(-6)}` : v || '';
 function wireCopies(root) {
   root.querySelectorAll('[data-copy-value]').forEach(b => {
-    b.onclick = () => copyText(b.dataset.copyValue, b.dataset.copyLabel || 'Value').then(ok => ok && flash(b));
+    b.onclick = () => copyText(b.dataset.copyValue, b.dataset.copyLabel || 'Value').then(ok => ok && (b.classList.contains('icon-btn') ? flashCopied(b) : flash(b)));
   });
 }
 /* QR code ------------------------------------------------------------------------
@@ -3200,9 +3223,9 @@ function explorerHref(links, kind, value) {
     return '';
   }
 }
-function explorerLink(links, kind, value, label = 'Explorer') {
+function explorerLink(links, kind, value, label = 'View on explorer') {
   const href = explorerHref(links, kind, value);
-  return href ? `<a class="ext-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(label)}<span class="sr-only"> on ${esc(links.name)} (opens in a new tab)</span></a>` : '';
+  return href ? `<a class="icon-btn ghost" data-tip="${esc(label)}" aria-label="${esc(`${label} on ${links.name || 'explorer'} (opens in a new tab)`)}" href="${esc(href)}" target="_blank" rel="noopener noreferrer">${ico('external')}</a>` : '';
 }
 // Base units to a decimal string, without floating point: ("19990000", 6) is "19.99".
 function fromUnits(units, decimals) {
@@ -3223,6 +3246,8 @@ function paymentUri(q) {
     ? `ethereum:${q.contract}@${q.chain_id}/transfer?address=${q.address}&uint256=${q.amount_units}`
     : `ethereum:${q.address}@${q.chain_id}?value=${q.amount_units}`;
 }
+// An address on one line, with an icon button that copies it. Narrow screens show the short form.
+const addrLine = (address, label) => `<div class="addr-line"><code class="addr-full" title="${esc(address)}">${esc(address)}</code><code class="addr-short" aria-hidden="true">${esc(shortHash(address))}</code>${copyBtn(address, label)}</div>`;
 const contractCell = (links, contract) => contract
   ? `<span class="contract">${copyable(contract, 'Contract address', shortHash(contract))}${explorerLink(links, 'token', contract)}</span>`
   : '<span class="muted">Native coin, no contract</span>';
@@ -3267,8 +3292,7 @@ function netPanel(n, t) {
       <div class="qr-box">${qrSvg(n.address, `QR code of your ${n.chain_name} deposit address`)}</div>
       <div class="addr-body">
         <div class="label">Your ${esc(n.chain_name)} deposit address</div>
-        <div class="addr-value">${copyable(n.address, `${n.chain_name} address`)}</div>
-        <button type="button" class="primary big" data-copy-value="${esc(n.address)}" data-copy-label="${esc(n.chain_name)} address">${withIcon('copy', 'Copy address')}</button>
+        ${addrLine(n.address, `${n.chain_name} address`)}
       </div>
     </div>
     ${alertBox('warn', `Send only ${joinOr(symbols)} on ${n.chain_name}`, 'Other tokens or networks can be lost.')}
@@ -3324,7 +3348,7 @@ function topUpModal() {
         select(tabs[(target + tabs.length) % tabs.length].dataset.net, true);
       };
     });
-  }, 'wide sheet', 'Send stablecoins to your personal address. Any amount is added as usage that never expires.');
+  }, 'wide sheet');
 }
 function wireTopUp(root) {
   root.querySelectorAll('[data-topup-open]').forEach(b => b.onclick = topUpModal);
@@ -3369,7 +3393,6 @@ function orderState(o) {
   if (confirmed.length) return 'review';
   return o.status === 'expired' ? 'expired' : 'pending';
 }
-const STATE_ICONS = { paid: CHECK, expired: ico('clock', 18), failed: ico('x', 18), review: ico('alert', 18), underpaid: ico('alert', 18), pending: '<span class="spinner" aria-hidden="true"></span>', confirming: '<span class="spinner" aria-hidden="true"></span>' };
 const STATE_LABELS = { pending: 'Waiting', confirming: 'Confirming', paid: 'Paid', expired: 'Expired', failed: 'Failed', review: 'Needs review', underpaid: 'Partly paid' };
 const STATE_TONES = { paid: 'ok', expired: 'warn', failed: 'danger', review: 'warn', underpaid: 'warn' };
 function orderMessage(o, state, i) {
@@ -3406,50 +3429,44 @@ function payDetails(o, q, sel, state) {
     q && ['Token contract', contractCell(q.explorer, q.contract)],
     q && q.chain_id && ['Chain ID', esc(q.chain_id)],
     q && ['Rate', esc(RATE_NOTE(q))],
-    q && q.confirmations && ['Confirmations', `${esc(plural(q.confirmations, 'confirmation'))} before it counts`],
+    q && q.confirmations && ['Confirmations', esc(plural(q.confirmations, 'confirmation'))],
     q && explorerHref(q.explorer, 'address', q.address) && ['Explorer', explorerLink(q.explorer, 'address', q.address, 'View address')],
-    tolerance && Number(tolerance) > 0 && ['Underpayment tolerance', `Shortfalls up to ${esc(tolerance)}% are accepted`],
-    o.expires_at && ['Quote expires', esc(date(o.expires_at))],
+    tolerance && Number(tolerance) > 0 && ['Tolerance', `Up to ${esc(tolerance)}% short`],
+    o.expires_at && ['Quote expires', state === 'pending' ? `<span data-countdown="${esc(o.expires_at)}">${esc(countdown(o.expires_at - nowSeconds()))}</span> <span class="hint">${esc(date(o.expires_at))}</span>` : esc(date(o.expires_at))],
     ['Order ID', copyable(o.id, 'Order ID', shortId(o.id))],
   ];
   return `<details class="more pay-more" data-details${open ? ' open' : ''}><summary>Details</summary>
-    ${q ? `<p class="hint">Send the amount in one transfer. Several smaller transfers or tokens add up, and anything above the price is not credited.</p>` : ''}
     ${facts(rows)}
     <h4 class="sub-head">Order</h4>${planFacts(plan, { paidAt: o.paid_at })}
     ${transfersTable(o)}
   </details>`;
 }
-// One labelled value with its own copy button.
-const payField = (label, valueHtml, copy, copyLabel) => `<div class="pay-field"><div class="label">${esc(label)}</div><div class="pay-value">${valueHtml}<button type="button" class="small ghost" data-copy-value="${esc(copy)}" data-copy-label="${esc(copyLabel)}" aria-label="Copy ${esc(copyLabel.toLowerCase())}">${withIcon('copy', 'Copy')}</button></div></div>`;
-function payScreen(o, q, sel, state, banner) {
+const payPick = (attr, label, options, value) => options.length > 1
+  ? `<select ${attr} aria-label="${esc(label)}">${options.map(([v, text]) => `<option value="${esc(v)}"${v === value ? ' selected' : ''}>${esc(text)}</option>`).join('')}</select>`
+  : `<span class="pay-chip">${esc(options[0]?.[1] || '')}</span>`;
+function payScreen(o, q, sel, state, quotes, pill_) {
   const request = sel.qr === 'link' && Boolean(q.chain_id);
   const content = request ? paymentUri(q) : q.address;
-  const change = (o.quotes || []).length > 1 && state === 'pending' ? '<button type="button" class="link" data-pay-change>Change</button>' : '';
-  return `${banner}
-    <div class="pay-main">
-      <div class="pay-fields">
-        ${payField('Amount to send', `<span class="pay-amount-line"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span></span>`, q.amount, `${q.symbol} amount`)}
-        <div class="pay-pair">
-          ${payField('Network', `<span class="pay-text">${esc(q.chain_name)}</span>`, q.chain_name, 'Network')}
-          ${payField('Token', `<span class="pay-text">${esc(q.symbol)}</span>`, q.symbol, 'Token')}
-        </div>
-        ${change}
-        ${payField('Address', `<code class="pay-addr-text">${esc(q.address)}</code>`, q.address, `${q.chain_name} address`)}
-      </div>
-      <div class="pay-qr">
-        <div class="qr-frame">${qrSvg(content, request ? `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}` : `QR code of the ${q.chain_name} address`) || qrSvg(q.address)}</div>
-        ${q.chain_id ? `<div class="seg-group"><span class="seg-label" id="qr-mode-label">QR code contains</span><div class="seg" role="group" aria-labelledby="qr-mode-label"><button type="button" data-qr="link" aria-pressed="${sel.qr === 'link'}">Payment request</button><button type="button" data-qr="address" aria-pressed="${sel.qr === 'address'}">Address only</button></div></div>` : ''}
-        <p class="hint qr-caption" aria-live="polite">${request ? `Encodes the network, token, and amount. Wallets that support payment requests fill them in.` : 'Encodes the address only. Enter the amount yourself.'}</p>
-      </div>
+  const networks = [...new Map(quotes.map(x => [x.chain, x.chain_name]))];
+  const tokens = quotes.filter(x => x.chain === q.chain).map(x => [x.asset, x.symbol]);
+  const editable = state === 'pending';
+  const picks = editable
+    ? `${payPick('data-pick-chain', 'Network', networks, q.chain)}${payPick('data-pick-asset', 'Token', tokens, q.asset)}`
+    : `<span class="pay-chip">${esc(q.chain_name)}</span><span class="pay-chip">${esc(q.symbol)}</span>`;
+  return `<div class="pay-top">${pill_}</div>
+    <div class="pay-amount-line"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span>${copyBtn(q.amount, `${q.symbol} amount`)}</div>
+    <div class="pay-picks">${picks}</div>
+    <div class="pay-qr">
+      <div class="qr-frame" data-qr-box data-qr-content="${esc(content)}">${qrSvg(content, request ? `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}` : `QR code of the ${q.chain_name} address`) || qrSvg(q.address)}</div>
+      ${q.chain_id ? `<div class="seg" role="group" aria-label="QR code contents"><button type="button" data-qr="link" aria-pressed="${sel.qr === 'link'}">Payment request</button><button type="button" data-qr="address" aria-pressed="${sel.qr === 'address'}">Address only</button>${tip(request ? 'The QR code carries the network, token, and amount. Wallets that support payment requests fill them in.' : 'The QR code carries the address only. Enter the amount yourself.')}</div>` : ''}
     </div>
-    ${alertBox('warn', `Send only ${q.symbol} on ${q.chain_name}`, 'Other tokens or networks can be lost.')}`;
+    ${addrLine(q.address, `${q.chain_name} address`)}
+    <p class="hint pay-warn">Send only ${esc(q.symbol)} on ${esc(q.chain_name)}.</p>`;
 }
 function cryptoView(o, sel) {
   const state = orderState(o);
   const plan = planOfOrder(o);
-  const info = planInfo(plan);
-  let [title, text] = orderMessage(o, state, info);
-  if (state === 'pending') text = 'Send the exact amount below. This page updates by itself.';
+  const [title, text] = orderMessage(o, state, planInfo(plan));
   // After a partial payment, every quote shrinks to what is still owed.
   const price = Math.round(Number(o.price_usd) * 1e6), owed = Math.max(0, price - Math.round(Number(o.received_usd) * 1e6));
   const quotes = (o.quotes || []).map(x => {
@@ -3457,37 +3474,21 @@ function cryptoView(o, sel) {
     const units = (BigInt(x.amount_units) * BigInt(owed) + BigInt(price) - 1n) / BigInt(price) || 1n;
     return { ...x, amount_units: units.toString(), amount: fromUnits(units.toString(), x.decimals) };
   });
-  const open = quotes.length && !['paid', 'failed', 'expired', 'review', 'confirming'].includes(state);
+  const open = quotes.length && !['paid', 'failed', 'expired', 'review'].includes(state);
   // Start on the network and token of the latest transfer, when there is one.
   const latest = (o.transfers || []).at(-1);
   if (latest && !sel.chain) Object.assign(sel, { chain: latest.chain, asset: latest.asset });
   const q = open ? pickQuote(quotes, sel) : null;
-  const waiting = state === 'pending' && o.expires_at;
-  const banner = `<div class="pay-state tone-${STATE_TONES[state] || 'info'}" role="status">
-      <span class="pay-state-icon" aria-hidden="true">${STATE_ICONS[state]}</span>
-      <div><span class="pay-status">${pill(STATE_LABELS[state] || state, STATE_TONES[state] || 'info')}</span><strong>${esc(title)}</strong><p>${esc(text)}</p></div>
-      ${waiting ? `<span class="pay-timer" title="Quote valid until ${esc(date(o.expires_at))}"><span class="hint">Expires in</span><strong data-countdown="${esc(o.expires_at)}">${esc(countdown(o.expires_at - nowSeconds()))}</strong></span>` : ''}
-    </div>`;
-  // Step A: pick the network and token when there is a choice to make.
-  if (q && state === 'pending' && !sel.ready && quotes.length > 1) {
-    const networks = [...new Map(quotes.map(x => [x.chain, x.chain_name]))];
-    const tokens = quotes.filter(x => x.chain === q.chain);
-    return `<form class="pay-pick" data-pay-pick>
-      <div class="co-plan"><div><div class="label">Paying for</div><div class="co-name">${esc(plan.name)}</div></div><div class="co-total"><div class="label">Total</div><div class="co-price">${esc(usdShort(info.price))}</div></div></div>
-      <div class="pick-grid">
-        <div><label for="pay-chain">Network</label><select id="pay-chain" data-pick-chain>${networks.map(([chain, name]) => `<option value="${esc(chain)}"${chain === q.chain ? ' selected' : ''}>${esc(name)}</option>`).join('')}</select></div>
-        <div><label for="pay-asset">Token</label><select id="pay-asset" data-pick-asset>${tokens.map(x => `<option value="${esc(x.asset)}"${x.asset === q.asset ? ' selected' : ''}>${esc(x.symbol)}</option>`).join('')}</select></div>
-      </div>
-      <div class="pick-amount"><span class="label">You will send</span><div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span></div><span class="hint">on ${esc(q.chain_name)}, ${esc(RATE_NOTE(q))}</span></div>
-      <div class="actions sticky-actions"><button type="button" class="ghost" data-pay-cancel>Cancel</button><button type="submit" class="primary" data-pay-go>Continue</button></div>
-    </form>`;
-  }
+  const tone = STATE_TONES[state] || 'info';
+  const status = `<span class="pay-status" role="status">${pill(STATE_LABELS[state] || state, tone)}</span>`;
+  // Essential outcomes stay visible. A plain wait needs no sentence at all.
+  const note = ['pending', 'confirming'].includes(state) ? '' : `<div class="pay-note tone-${tone}"><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
   let main, actions;
   if (q) {
-    main = payScreen(o, q, sel, state, banner);
-    actions = `${state === 'pending' ? '<button type="button" class="ghost" data-pay-later>Pay later</button>' : ''}<button type="button" class="primary" data-pay-done>${state === 'pending' ? 'I have sent it' : 'Close'}</button>`;
+    main = `${payScreen(o, q, sel, state, quotes, status)}${note}`;
+    actions = `<button type="button" class="primary" data-pay-done>${state === 'pending' ? 'Done' : 'Close'}</button>`;
   } else {
-    main = banner;
+    main = `<div class="pay-top">${status}</div>${note}`;
     actions = state === 'paid' ? '<button type="button" class="primary" data-pay-done>Done</button>'
       : state === 'expired' || state === 'failed' ? '<button type="button" class="primary" data-pay-again>Start a new payment</button>'
       : '<button type="button" class="primary" data-pay-done>Close</button>';
@@ -3498,7 +3499,7 @@ function cryptoView(o, sel) {
 // backs off after errors and stops when the dialog closes or the order is final.
 function runOrder(d, initial) {
   const box = d.querySelector('[data-pay]');
-  const sel = { chain: '', asset: '', qr: 'link', ready: false, details: undefined };
+  const sel = { chain: '', asset: '', qr: 'link', details: undefined };
   const control = new AbortController();
   let order = initial, timer, clock, failures = 0, focus = '';
   const signature = o => JSON.stringify([o.status, o.received_usd, (o.transfers || []).map(t => [t.id, t.status, t.value_usd, t.note])]);
@@ -3518,21 +3519,19 @@ function runOrder(d, initial) {
     box.innerHTML = cryptoView(order, sel);
     wireCopies(box);
     box.querySelector('[data-pay-done]')?.addEventListener('click', () => {
-      if (order.status !== 'paid' && order.status !== 'expired' && order.status !== 'failed') notice('Thanks. Your purchase is applied automatically once the payment is confirmed.');
+      if (order.status !== 'paid' && order.status !== 'expired' && order.status !== 'failed') notice('Your purchase applies once the payment is confirmed.');
       d.close();
     });
     box.querySelector('[data-pay-cancel]')?.addEventListener('click', () => d.close());
-    box.querySelector('[data-pay-later]')?.addEventListener('click', () => d.close());
     box.querySelector('[data-pay-again]')?.addEventListener('click', () => {
       const plan = planCatalog.plans.find(p => p.code === order.plan_code);
       d.close();
       if (plan) checkout(plan, planCatalog.methods);
     });
-    box.querySelector('[data-pay-change]')?.addEventListener('click', () => { sel.ready = false; focus = '[data-pick-chain]'; draw(); });
-    box.querySelector('[data-pay-pick]')?.addEventListener('submit', e => { e.preventDefault(); sel.ready = true; draw(); });
     box.querySelector('[data-details]')?.addEventListener('toggle', e => { sel.details = e.target.open; });
     const choose = (attr, event, apply) => box.querySelectorAll(`[${attr}]`).forEach(b => b.addEventListener(event, () => {
-      apply(b.value ?? b.getAttribute(attr));
+      // A button's .value is an empty string, so read the attribute instead.
+      apply(b.getAttribute(attr));
       focus = `[${attr}="${CSS.escape(b.getAttribute(attr))}"]`;
       draw();
     }));
@@ -3576,7 +3575,7 @@ function runOrder(d, initial) {
   });
 }
 function cryptoOrder(initial) {
-  modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'wide sheet', 'Send the exact amount. This window updates by itself.');
+  modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'narrow sheet');
 }
 // A customer's view of one of their payments, card or crypto.
 async function receiptModal(id) {

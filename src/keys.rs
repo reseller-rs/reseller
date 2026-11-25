@@ -163,8 +163,6 @@ struct NewKey<'a> {
     name: &'a str,
     parent: Option<&'a str>,
     limits: &'a Limits,
-    /// Excluded from the per-IP monthly allowance.
-    bypass_ip: bool,
 }
 
 /// Inserts a key and returns its one-time credentials.
@@ -177,7 +175,7 @@ async fn mint(conn: &mut SqliteConnection, config: &Config, key: NewKey<'_>) -> 
     let prefix = &secret_key[..15];
     sqlx::query(
         "INSERT INTO api_keys(id,account_id,parent_key_id,key_hash,dash_hash,key_prefix,name,\
-         limits,created_at,created_ip,bypass_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+         limits,created_at,created_ip) VALUES(?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&kid)
     .bind(key.account)
@@ -189,7 +187,6 @@ async fn mint(conn: &mut SqliteConnection, config: &Config, key: NewKey<'_>) -> 
     .bind(serde_json::to_string(key.limits)?)
     .bind(now())
     .bind(key.ip)
-    .bind(key.bypass_ip)
     .execute(conn)
     .await?;
     let base = config.public_base();
@@ -270,7 +267,9 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
         Requester::Signup { .. } => (None, None),
     };
     let admin = matches!(requester, Requester::Admin { .. });
-    let mut bypass_ip = admin;
+    // Operator-trusted accounts (`can_create_keys`) skip the daily creation
+    // budget. The per-account key cap applies to everyone but the operator.
+    let mut trusted = admin;
     if let Some(account) = &existing {
         let row = sqlx::query("SELECT status,can_create_keys FROM accounts WHERE id=?")
             .bind(account)
@@ -292,19 +291,14 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
                 "Account key limit reached. Revoke a key to create another",
             ));
         }
-        let subscribed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=? AND status='active' AND expires_at>?)",
-        )
-        .bind(account)
-        .bind(now())
-        .fetch_one(&mut *tx)
-        .await?;
-        bypass_ip |= row.get::<bool, _>("can_create_keys") || subscribed;
+        trusted |= row.get::<bool, _>("can_create_keys");
     }
     if !admin {
-        check_creation_guards(&mut tx, &config, identity, ip, bypass_ip).await?;
+        check_creation_guards(&mut tx, &config, identity, ip, existing.is_none()).await?;
     }
-    if let Some(account) = identity.map(|i| i.account_id.as_str()) {
+    if let Some(account) = identity.map(|i| i.account_id.as_str())
+        && !trusted
+    {
         check_daily_budget(&mut tx, &config, account).await?;
     }
     if let Some(proof) = &proof {
@@ -339,7 +333,6 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
             name: body["name"].as_str().unwrap_or("My key"),
             parent: identity.map(|i| i.key_id.as_str()),
             limits: &limits,
-            bypass_ip,
         },
     )
     .await?;
@@ -460,14 +453,20 @@ async fn check_daily_budget(
     Ok(())
 }
 
-/// Abuse guards for self-service creation: global hourly cap, child-key cap,
-/// and (unless exempt) the per-IP monthly allowance and cooldown.
+/// Abuse guards for self-service creation: the global hourly cap and the
+/// child-key cap for every key, and for a signup (a new account) the per-IP
+/// monthly signup allowance and the cooldown between signups.
+///
+/// Keys on an existing account never count against the address: a family
+/// sharing one connection may each open an account, and one person may hold
+/// several keys on theirs (bounded by `keys.max_per_account` and
+/// `keys.max_new_per_day`).
 async fn check_creation_guards(
     conn: &mut SqliteConnection,
     config: &Config,
     identity: Option<&Identity>,
     ip: &str,
-    bypass_ip: bool,
+    signup: bool,
 ) -> Result<()> {
     check_global_hourly(conn, config).await?;
     if let Some(parent) = identity.filter(|i| !i.dashboard)
@@ -486,9 +485,20 @@ async fn check_creation_guards(
             ));
         }
     }
-    if bypass_ip {
-        return Ok(());
+    if signup {
+        check_signup_guards(conn, config, ip).await?;
     }
+    Ok(())
+}
+
+/// Per-IP signup guards: at most `ip_limit_per_month` new accounts per
+/// calendar month (or the address's `ip_overrides` entry), and at least
+/// `cooldown_seconds` between two signups.
+///
+/// Accounts that became paying customers (a paid order or an active
+/// subscription) or that the operator trusts (`can_create_keys`) do not
+/// count: the allowance limits free trials, not customers.
+async fn check_signup_guards(conn: &mut SqliteConnection, config: &Config, ip: &str) -> Result<()> {
     let limit = config
         .signup
         .ip_overrides
@@ -497,18 +507,23 @@ async fn check_creation_guards(
         .unwrap_or(config.signup.ip_limit_per_month);
     if limit > 0 {
         let month = chrono::Utc::now().format("%Y-%m-01 00:00:00").to_string();
-        let created: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM api_keys \
-             WHERE created_ip=? AND created_at>=unixepoch(?) AND bypass_ip=0",
+        let opened: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM accounts a WHERE a.created_ip=?1 AND a.created_at>=unixepoch(?2) \
+             AND a.can_create_keys=0 \
+             AND NOT EXISTS(SELECT 1 FROM payments p WHERE p.account_id=a.id AND p.status='paid') \
+             AND NOT EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id=a.id \
+               AND s.status='active' AND s.expires_at>?3)",
         )
         .bind(ip)
         .bind(month)
+        .bind(now())
         .fetch_one(&mut *conn)
         .await?;
-        if created >= i64::from(limit) {
+        if opened >= i64::from(limit) {
             return Err(Error::quota_window(
-                "ip_key_limit",
-                "Monthly key allowance reached for this address",
+                "ip_signup_limit",
+                "This network has reached its monthly limit of new accounts. \
+                 Sign in to an existing account to create more keys",
                 until_next_month(),
             ));
         }
@@ -516,14 +531,14 @@ async fn check_creation_guards(
     let cooldown = i64::from(config.signup.cooldown_seconds);
     if cooldown > 0 {
         let last: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(created_at) FROM api_keys WHERE created_ip=?")
+            sqlx::query_scalar("SELECT MAX(created_at) FROM accounts WHERE created_ip=?")
                 .bind(ip)
                 .fetch_one(&mut *conn)
                 .await?;
         if let Some(t) = last.filter(|t| t + cooldown > now()) {
             return Err(Error::too_many(
-                "creation_cooldown",
-                "Please wait before creating another key",
+                "signup_cooldown",
+                "Please wait a moment before opening another account",
                 window_retry(Some(t), cooldown),
             ));
         }
@@ -669,7 +684,6 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
             name: row.get("name"),
             parent: Some(kid),
             limits: &limits,
-            bypass_ip: true,
         },
     )
     .await?;

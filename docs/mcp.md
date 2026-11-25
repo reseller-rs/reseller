@@ -274,7 +274,7 @@ The content of a `generate_*` or `transcribe_audio` result is the result only, s
 | `usage_summary` | any | `days?` (1 to 365, default 30), `key_id?` | Daily and per-model usage | Read-only |
 | `list_requests` | any | `limit?` (1 to 100, default 20), `offset?`, `model?`, `status?` (`2xx`, `4xx`, `5xx`, or `pending`), `kind?` (`llm`, `tts`, `stt`, or `image`) | Request history with billed cost and the `estimated` flag | Read-only |
 | `list_keys` | any | None | Keys with ID, prefix, name, status, and limits. Never secrets. | Read-only |
-| `create_key` | any | `name` (1 to 80 characters) | New key `{id, key, key_prefix, dashboard_token, ...}`, shown once | Creates a child key. Subject to `account_key_limit`, `key_creation_daily_limit`, `creation_rate_limited`, `ip_key_limit`, `creation_cooldown`, and `child_key_limit`. |
+| `create_key` | any | `name` (1 to 80 characters) | New key `{id, key, key_prefix, dashboard_token, ...}`, shown once | Creates a child key. Subject to `account_key_limit`, `key_creation_daily_limit`, `creation_rate_limited`, and `child_key_limit`. |
 | `rotate_key` | any | `key_id` | New credentials, shown once | **Blocks the old key.** Limited by `rotate_cooldown`, the daily budget, and the global hourly cap. |
 | `block_key` | any | `key_id` | Updated key | Blocks a key. Customers cannot unblock it. |
 | `list_plans` | any | None | Plans and enabled payment methods | Read-only |
@@ -354,7 +354,7 @@ A tool error has `isError: true`. The text reads `<message> (error code: <code>)
 | `insufficient_quota` (402) | Out of credit, or the request may cost more than the balance (lower `max_tokens`). Use `list_plans` and `start_checkout`, or `redeem_code`. |
 | `model_not_found` (404) | The model is unknown or the key's allowlist excludes it. Omit `model`, or use `list_models`. |
 | `rate_limit_exceeded`, `request_limit_exceeded`, `token_limit_exceeded`, `spend_limit_exceeded`, `concurrency_limit_exceeded` | Wait `retry_after_seconds` when it is given. |
-| `creation_cooldown`, `ip_key_limit`, and other key or signup guards | Wait, then retry. See the README rate-limit table. |
+| `signup_cooldown`, `ip_signup_limit`, and other key or signup guards | Wait, then retry. See the README rate-limit table. |
 | `pow_required`, `pow_invalid`, `pow_replayed` | The signup proof of work is missing, wrong or expired, or already used (bridge `signup`). Fetch a new challenge. |
 | `upstream_error` | The provider returned a non-2xx response. The message includes its status, detail, and request ID. |
 | `invalid_upstream_response` | The provider's reply was not usable (invalid JSON, or no audio or images) |

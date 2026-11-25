@@ -21,9 +21,11 @@ pub struct Signup {
     pub free_credit_halving: bool,
     /// Days the signup credit stays spendable. 0 means it never expires.
     pub free_credit_expiry_days: u32,
-    /// Self-service keys per source IP per calendar month. 0 disables the guard.
+    /// New self-service accounts (signups) per source IP per calendar month.
+    /// Keys created on an existing account never count, and neither do accounts
+    /// that became paying or operator-trusted. 0 disables the guard.
     pub ip_limit_per_month: u32,
-    /// Minimum seconds between creations from one IP. 0 disables the guard.
+    /// Minimum seconds between two signups from one IP. 0 disables the guard.
     pub cooldown_seconds: u32,
     /// Self-service key creations (signup, child keys, rotations) per hour
     /// across all accounts. 0 disables the guard.

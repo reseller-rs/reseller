@@ -21,6 +21,7 @@ CREATE TABLE accounts (
  created_at INTEGER NOT NULL, created_ip TEXT NOT NULL
 ) STRICT;
 CREATE INDEX accounts_status_created ON accounts(status,created_at DESC);
+CREATE INDEX accounts_ip_created ON accounts(created_ip,created_at);
 -- API keys. Only HMAC hashes of the secret and dashboard token are stored.
 -- parent_key_id links child keys. limits holds the per-key limits as JSON.
 CREATE TABLE api_keys (
@@ -28,14 +29,13 @@ CREATE TABLE api_keys (
  key_hash TEXT NOT NULL UNIQUE, dash_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
  name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','blocked','revoked')),
  limits TEXT NOT NULL CHECK(json_valid(limits)), markup_pct TEXT, expires_at INTEGER,
- created_at INTEGER NOT NULL, created_ip TEXT NOT NULL, bypass_ip INTEGER NOT NULL DEFAULT 0,
+ created_at INTEGER NOT NULL, created_ip TEXT NOT NULL,
  last_used_at INTEGER,
  -- Lifetime billed spend in micro-USD, added by the meter on every billed amount. It survives
  -- usage bucket and request log retention. An account's lifetime spend is the sum over its keys.
  billed_micro INTEGER NOT NULL DEFAULT 0 CHECK(billed_micro>=0)
 ) STRICT;
 CREATE INDEX keys_account ON api_keys(account_id);
-CREATE INDEX keys_ip_time ON api_keys(created_ip,created_at);
 CREATE INDEX keys_status_created ON api_keys(status,created_at DESC);
 -- Plans. kind is subscription or topup.
 -- A subscription runs for months (1 to 12) and includes credit_micro of usage
