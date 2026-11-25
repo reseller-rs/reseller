@@ -7,6 +7,7 @@
 mod inspect;
 mod models;
 mod multipart;
+pub mod reasoning;
 mod websocket;
 
 pub use inspect::Inspector;
@@ -285,7 +286,32 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
         identity.as_ref(),
     )
     .await?;
-    let (model, payload) = (prepared.model, prepared.payload);
+    let (model, mut payload) = (prepared.model, prepared.payload);
+    // Reasoning effort: validated and capped for the requested model here,
+    // and again for each fallback model from the original request.
+    let mut effort = Effort::default();
+    if reasoning::applies(&path)
+        && let Payload::Json(value, bytes) = &mut payload
+    {
+        effort.original = reasoning::requested(value)?;
+        effort.free = match &identity {
+            Some(i) => {
+                crate::billing::is_free(&mut *app.db.acquire().await?, &i.account_id).await?
+            }
+            None => false,
+        };
+        effort.path = Some(path.clone());
+        reasoning::apply(
+            value,
+            &path,
+            &config,
+            &model,
+            effort.original.as_ref(),
+            effort.free,
+            true,
+        )?;
+        *bytes = Bytes::from(serde_json::to_vec(value)?);
+    }
     let estimate = match &payload {
         Payload::Json(value, bytes) => inspect::worst_case(
             &path,
@@ -374,6 +400,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
             models,
             characters,
             estimate,
+            effort,
         }
         .run(head_tx),
     );
@@ -399,6 +426,17 @@ struct Exchange {
     models: Vec<String>,
     characters: i64,
     estimate: Option<i64>,
+    effort: Effort,
+}
+
+/// The reasoning effort of a request, kept to re-apply the policy for each
+/// fallback model.
+#[derive(Default)]
+struct Effort {
+    /// The route, when it carries a reasoning level.
+    path: Option<String>,
+    original: Option<reasoning::Requested>,
+    free: bool,
 }
 
 /// Chunks buffered between the upstream reader and the client.
@@ -424,6 +462,7 @@ impl Exchange {
             models,
             characters,
             estimate,
+            effort,
         } = self;
         let upstream = kind.upstream(&config);
         let timeout = timeout(&config, upstream);
@@ -445,6 +484,18 @@ impl Exchange {
                 Payload::Json(value, bytes) => {
                     if index > 0 {
                         value["model"] = model.as_str().into();
+                        if let Some(path) = &effort.path {
+                            // Lenient: a level the fallback lacks maps down.
+                            let _ = reasoning::apply(
+                                value,
+                                path,
+                                &config,
+                                model,
+                                effort.original.as_ref(),
+                                effort.free,
+                                false,
+                            );
+                        }
                         match serde_json::to_vec(value) {
                             Ok(v) => *bytes = Bytes::from(v),
                             Err(e) => {

@@ -612,6 +612,22 @@ pub async fn block_after_refund(
     Ok(())
 }
 
+/// Whether an account is on the free tier: no active subscription and no
+/// spendable credit other than signup trial credit. The operator's free-tier
+/// rules (for example the reasoning effort cap) apply to it.
+pub async fn is_free(conn: &mut SqliteConnection, account: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=?1 AND status='active' \
+           AND expires_at>?2) \
+         AND NOT EXISTS(SELECT 1 FROM credits WHERE account_id=?1 AND source<>'free' \
+           AND remaining_micro>0 AND (expires_at IS NULL OR expires_at>?2))",
+    )
+    .bind(account)
+    .bind(now())
+    .fetch_one(conn)
+    .await?)
+}
+
 /// Whether `value` of `kind` is blocked after an earlier refund.
 pub async fn refund_blocked(conn: &mut SqliteConnection, kind: &str, value: &str) -> Result<bool> {
     Ok(sqlx::query_scalar(

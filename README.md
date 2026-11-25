@@ -177,6 +177,7 @@ Defaults appear in parentheses.
 | `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.10"`), `free_credit_halving` (`true`; when true each further signup from the same IP in a calendar month gets half the previous trial credit, so with `ip_limit_per_month = 4` and `"0.1"` the signups get $0.1, $0.05, $0.025, and $0.0125), `free_credit_expiry_days` (30; 0 means never; max 3650), `ip_limit_per_month` (4; 0 turns it off), `cooldown_seconds` (30; 0 turns it off), `global_hourly_limit` (100; 0 turns it off), `pow_max_number` (100000; 0 disables proof of work; max 10000000), `pow_ttl_seconds` (300; 10 to 86400), `adaptive_pow` (`true`), `pow_max_number_ceiling` (1000000; from `pow_max_number` to 10000000), `adaptive_pow_reset_minutes` (30; 1 to 1440), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
 | `[keys]` | `max_per_account` (10 active keys; must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours; 0 turns it off), `rotate_cooldown_seconds` (300; 0 turns it off; max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new account's first key; child keys inherit their parent's limits) |
 | `[rate_limits]` | `management_per_minute` (120), `auth_failures_per_hour` (20), `max_concurrent_requests` (8), `checkouts_per_hour` (10), `redeem_failures_per_hour` (10), `challenges_per_minute` (10), `new_account_hours` (48) and `new_account_daily_spend_pct` (`"20"`): the new-account spending cap (see [Refund protection](#refund-protection)). 0 disables each one. |
+| `[reasoning]` | `free_effort` (`"low"`) and `[reasoning.models."<upstream model>"]` with `efforts` and `default` (see [Reasoning effort](#reasoning-effort)) |
 | `[billing]` | `request_estimate_usd` (`"0.001"`, the typical billed cost of one request, used to show customers approximate request counts), `default_max_output_tokens` (4096, held for LLM requests without an output limit), `min_hold_usd` (`"0.01"`, the smallest hold per request), `refund_ip_block_days` (30; 0 turns the address block off), `refund_decline_pct` (50; share of a purchase that must be used before refund answers ask the store to decline) |
 | `[mcp]` | `enabled` (`true`), `oauth` (`true`; OAuth sign-in for `/mcp`, see [MCP](#mcp)), and `max_media_bytes` (16 MiB; 1 byte to 256 MiB), the largest audio or image returned inline |
 | `[stripe]` | `secret_key`, `webhook_secret` |
@@ -603,6 +604,35 @@ curl http://localhost:56787/v1/images \
 ```
 
 JSON requests apply model and voice policies. Chat requests stream usage reporting. Multipart uploads stream with bounded size, and only the `model` form field is rewritten by the policy.
+
+### Reasoning effort
+
+Clients set the reasoning level as `reasoning_effort` (Chat Completions) or `reasoning.effort` (Responses API, and the OpenRouter chat form). Supported levels differ by provider and model, and an upstream may reject an unknown level with a 400 or ignore it. So the `[reasoning]` section declares them per upstream model and enforces them before forwarding:
+
+```toml
+[reasoning]
+free_effort = "low"      # cap for free accounts; "" disables
+
+[reasoning.models."deepseek/deepseek-v4.1-flash-1017"]
+efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+default = ""             # applied when a request names no level; "" keeps the provider default
+
+[reasoning.models."my-plain-model"]
+efforts = []             # no reasoning control: the parameter is removed
+```
+
+| Case | What is forwarded |
+|---|---|
+| Configured model, supported level | The level, in the route's own form (`reasoning_effort` for chat, `reasoning.effort` for `/v1/responses` or when the client used it) |
+| Configured model, unsupported level | Nothing. The request fails with `400 unsupported_reasoning_effort`, which lists the supported levels. |
+| Configured model, no level | `default`, if set |
+| Model configured with `efforts = []` | The parameter is removed |
+| Model not configured | The client's value, unchanged |
+| Fallback model | The original level, or the nearest lower level the fallback supports (never a 400) |
+
+**Free accounts** have no active subscription and no spendable credit beyond signup trial credit. They are capped at `free_effort` (default `"low"`): a higher level is lowered to the highest supported level at or below the cap, and a configured reasoning model gets that level even when the request names none. For an unconfigured model, only an explicitly higher level is lowered. Operator and anonymous requests are not capped.
+
+Levels are ordered `none < minimal < low < medium < high < xhigh < max`. Configure each model's real levels: OpenRouter, for example, accepts all seven for DeepSeek models and answers others with a 400. A model-name suffix such as `model#low` is not used. Suffixes would split one model into several names for prices, allowlists, fallbacks, and `/v1/models`, while clients already have a standard field for the level.
 
 ### Fallbacks
 

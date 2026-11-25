@@ -14,6 +14,7 @@ mod mcp;
 mod models;
 mod payments;
 mod rate_limits;
+mod reasoning;
 mod signup;
 mod stores;
 
@@ -24,6 +25,7 @@ pub use mcp::Mcp;
 pub use models::{Capability, Model, Resolved};
 pub use payments::{Payroof, RateSource, Stripe};
 pub use rate_limits::RateLimits;
+pub use reasoning::{EFFORT_LEVELS, Reasoning, ReasoningModel, effort_rank};
 pub use signup::Signup;
 pub use stores::{Apple, AppleEnvironment, Google};
 
@@ -241,6 +243,7 @@ pub struct Config {
     pub log_retention_days: u32,
     pub max_log_entries: u32,
     pub billing: Billing,
+    pub reasoning: Reasoning,
     pub stripe: Stripe,
     pub payroof: Payroof,
     pub apple: Apple,
@@ -277,6 +280,7 @@ impl Default for Config {
             log_retention_days: 30,
             max_log_entries: 5000,
             billing: Billing::default(),
+            reasoning: Reasoning::default(),
             stripe: Stripe::default(),
             payroof: Payroof::default(),
             apple: Apple::default(),
@@ -436,6 +440,7 @@ impl Config {
         }
         self.payroof.validate()?;
         self.billing.validate()?;
+        self.reasoning.validate()?;
         self.rate_limits.validate()?;
         self.apple.validate()?;
         self.google.validate()?;

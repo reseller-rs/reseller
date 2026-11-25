@@ -1232,3 +1232,111 @@ async fn new_accounts_have_a_daily_spending_cap() {
         .unwrap();
     assert_eq!(t.post("/v1/chat/completions", &body).await.status(), 200);
 }
+
+/// The reasoning effort reaching the upstream: free accounts are capped at
+/// `free_effort` (and get it even when they name none), paid accounts keep
+/// their level, an unsupported level is a 400 that never reaches the
+/// upstream, and a fallback model gets its own supported level.
+#[tokio::test]
+async fn reasoning_effort_is_validated_capped_and_mapped_per_model() {
+    let mut t = Test::new(&[("m", price("1", "1"))]).await;
+    let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let record = seen.clone();
+    t.mock(
+        llm_upstream,
+        fixed(move |body| {
+            let record = record.clone();
+            async move {
+                record.lock().unwrap().push(body.clone());
+                if body["model"] == "m" && body["fail"] == true {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+                }
+                json_response(json!({"usage":{"total_tokens":1}}))
+            }
+        }),
+    )
+    .await;
+    {
+        let mut c = t.app.config_mut().await;
+        c.llm.fallbacks = vec!["backup".into()];
+        c.reasoning.models.insert(
+            "m".into(),
+            reseller::config::ReasoningModel {
+                efforts: vec!["low".into(), "medium".into(), "high".into()],
+                default: String::new(),
+            },
+        );
+        c.reasoning.models.insert(
+            "backup".into(),
+            reseller::config::ReasoningModel {
+                efforts: vec!["minimal".into(), "medium".into()],
+                default: String::new(),
+            },
+        );
+    }
+    let last = || seen.lock().unwrap().last().cloned().unwrap();
+    let chat = |extra: Value| {
+        let mut body =
+            json!({"model":"m","max_tokens":5,"messages":[{"role":"user","content":"hi"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+
+    // Trial credit only: a free account.
+    let r = t
+        .post(
+            "/v1/chat/completions",
+            &chat(json!({"reasoning_effort":"high"})),
+        )
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(last()["reasoning_effort"], "low");
+    t.post("/v1/chat/completions", &chat(json!({}))).await;
+    assert_eq!(last()["reasoning_effort"], "low");
+
+    let before = seen.lock().unwrap().len();
+    let r = t
+        .post(
+            "/v1/chat/completions",
+            &chat(json!({"reasoning_effort":"max"})),
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    let error: Value = r.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "unsupported_reasoning_effort");
+    assert_eq!(error["error"]["param"], "reasoning_effort");
+    assert_eq!(seen.lock().unwrap().len(), before, "never forwarded");
+
+    // Paid credit lifts the cap.
+    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    billing::credit(&mut tx, t.account(), 1_000_000, "purchase", None, "")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    t.post(
+        "/v1/chat/completions",
+        &chat(json!({"reasoning":{"effort":"high"}})),
+    )
+    .await;
+    assert_eq!(last()["reasoning"]["effort"], "high");
+    assert!(last().get("reasoning_effort").is_none());
+
+    // The fallback lacks "high": it gets the nearest lower level it has.
+    let r = t
+        .post(
+            "/v1/chat/completions",
+            &chat(json!({"reasoning_effort":"high","fail":true})),
+        )
+        .await;
+    assert_eq!(r.status(), 200);
+    let backup = last();
+    assert_eq!(
+        (
+            backup["model"].as_str(),
+            backup["reasoning_effort"].as_str()
+        ),
+        (Some("backup"), Some("medium"))
+    );
+}

@@ -273,6 +273,27 @@ public_url = "http://localhost:56787"
 # new_account_daily_spend_pct = "20"
 
 # =============================================================================
+#  REASONING EFFORT
+# =============================================================================
+
+# Requests set the level as reasoning_effort (chat) or reasoning.effort
+# (Responses API). Levels: none, minimal, low, medium, high, xhigh, max.
+
+# [reasoning]
+
+# Highest level for free accounts (trial credit only, no subscription or paid
+# credit). Higher requested levels are lowered to it, and configured reasoning
+# models get it when a request names none. "" disables the cap. Default: "low".
+# free_effort = "low"
+
+# Levels each upstream model accepts. An unsupported level is rejected with 400
+# before forwarding; efforts = [] removes the parameter for models without
+# reasoning control. Unlisted models pass the client's value through.
+# [reasoning.models."deepseek/deepseek-v4.1-flash-1017"]
+# efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+# default = ""
+
+# =============================================================================
 #  BILLING HOLDS AND REFUNDS
 # =============================================================================
 
