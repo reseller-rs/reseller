@@ -262,6 +262,7 @@ mod tests {
         assert_eq!(
             fast["architecture"],
             json!({
+                "capability": "chat",
                 "input_modalities": ["text", "image"],
                 "output_modalities": ["text"],
                 "modality": "text+image->text",

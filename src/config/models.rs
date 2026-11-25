@@ -96,7 +96,11 @@ impl Model {
     /// modalities win. Empty ones come from the upstream route that serves
     /// the entry's upstream model, and stay empty when no route does.
     pub fn resolved(&self, config: &Config) -> Resolved {
-        let capability = config.capability_of(self.upstream_name());
+        // A route decides first. Without one, explicit catalog modalities
+        // still name the capability (never guessed from nothing).
+        let capability = config.capability_of(self.upstream_name()).or_else(|| {
+            Capability::from_modalities(&self.input_modalities, &self.output_modalities)
+        });
         let pick = |explicit: &[String], derived: Option<&[&str]>| -> Vec<String> {
             if !explicit.is_empty() {
                 explicit.to_vec()
@@ -178,6 +182,24 @@ impl Capability {
             Self::Speech => "speech",
             Self::Transcription => "transcription",
             Self::Image => "image",
+        }
+    }
+
+    /// The capability named by explicit modalities, if they name one.
+    fn from_modalities(input: &[String], output: &[String]) -> Option<Self> {
+        let has = |list: &[String], m: &str| list.iter().any(|x| x.eq_ignore_ascii_case(m));
+        if output.is_empty() {
+            None
+        } else if has(output, "image") {
+            Some(Self::Image)
+        } else if has(output, "audio") {
+            Some(Self::Speech)
+        } else if has(output, "text") && has(input, "audio") {
+            Some(Self::Transcription)
+        } else if has(output, "text") {
+            Some(Self::Chat)
+        } else {
+            None
         }
     }
 
@@ -422,6 +444,20 @@ mod tests {
             (strs(&r.input), strs(&r.output)),
             ("text+image".into(), "text".into())
         );
+        // No route, but explicit modalities name the capability.
+        for (input, output, kind) in [
+            (vec!["text"], vec!["text"], Capability::Chat),
+            (vec!["text"], vec!["audio"], Capability::Speech),
+            (vec!["audio"], vec!["text"], Capability::Transcription),
+            (vec!["text", "image"], vec!["image"], Capability::Image),
+        ] {
+            let catalog_only = Model {
+                input_modalities: input.iter().map(|m| (*m).to_owned()).collect(),
+                output_modalities: output.iter().map(|m| (*m).to_owned()).collect(),
+                ..model("catalog-only")
+            };
+            assert_eq!(catalog_only.resolved(&config).capability, Some(kind));
+        }
         // No route, no guess.
         let r = model("unknown").resolved(&config);
         assert_eq!(
