@@ -19,7 +19,7 @@ use crate::{
     db,
     error::{Error, Result},
     identity::{self, Identity, Scope},
-    meter::{Meter, RequestMeta},
+    meter::{Meter, RequestMeta, Usage},
     money,
 };
 use axum::{
@@ -286,6 +286,15 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
     )
     .await?;
     let (model, payload) = (prepared.model, prepared.payload);
+    let estimate = match &payload {
+        Payload::Json(value, bytes) => inspect::worst_case(
+            &path,
+            value,
+            bytes.len(),
+            i64::from(config.billing.default_max_output_tokens),
+        ),
+        Payload::Stream(_) => Usage::NONE,
+    };
     let meter = Meter::begin_with(
         &app,
         identity.clone(),
@@ -295,6 +304,7 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
             kind: kind.as_str(),
             model: &model,
             ip: &ip,
+            estimate: &estimate,
         },
         !prepared.checked,
     )
@@ -556,6 +566,11 @@ impl Exchange {
         let (out_tx, mut out_rx) = mpsc::channel::<std::io::Result<Bytes>>(RELAY_BUFFER);
         let gone = match head_result {
             Ok(mut headers) => {
+                if out_status != status {
+                    // A rewritten status (for example 429 to 502) must not
+                    // keep the upstream's retry hint.
+                    headers.remove(header::RETRY_AFTER);
+                }
                 if replacement.is_some() {
                     headers.remove(header::CONTENT_ENCODING);
                     headers.remove(header::CONTENT_LENGTH);
@@ -701,6 +716,19 @@ fn upstream_error(status: StatusCode, raw: Option<&[u8]>) -> (StatusCode, Value)
             .filter(|s| !s.is_empty())
             .map(|s| s.chars().take(1000).collect::<String>())
     };
+    // An upstream `insufficient_quota` (OpenAI sends it as a 429) means the
+    // operator's upstream account is out of credit, not the caller's: it
+    // must not look like the caller's quota or rate limit.
+    if text("code").as_deref() == Some("insufficient_quota")
+        || text("type").as_deref() == Some("insufficient_quota")
+    {
+        let error = Error::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "The upstream provider is temporarily unavailable. Please try again later",
+        );
+        return (StatusCode::BAD_GATEWAY, error.body());
+    }
     let message = text("message")
         .or_else(|| error.and_then(Value::as_str).map(str::to_owned))
         .unwrap_or_else(generic);
@@ -991,6 +1019,19 @@ mod tests {
             assert_eq!(body["error"]["code"], "upstream_error");
             assert!(!body.to_string().contains("credentials"));
         }
+    }
+
+    #[test]
+    fn upstream_insufficient_quota_is_the_operators_problem() {
+        let raw = br#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        let (out, body) = upstream_error(StatusCode::TOO_MANY_REQUESTS, Some(raw));
+        assert_eq!(out, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "upstream_error");
+        assert!(!body.to_string().contains("quota"));
+        let limited = br#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#;
+        let (out, body) = upstream_error(StatusCode::TOO_MANY_REQUESTS, Some(limited));
+        assert_eq!(out, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
     }
 
     #[test]

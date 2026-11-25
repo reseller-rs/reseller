@@ -366,6 +366,9 @@ async fn serve(cli: &Cli, app: App) -> anyhow::Result<()> {
             if let Err(e) = stats::prune(&maintenance).await {
                 tracing::error!(error = %e, "log maintenance failed");
             }
+            if let Err(e) = reseller::billing::grant_all_due(&maintenance).await {
+                tracing::error!(error = %e, "monthly quota grant failed");
+            }
         }
     });
     axum::serve(

@@ -319,16 +319,22 @@ async fn route(app: App, peer: SocketAddr, req: Request<Body>) -> Result<Respons
     let is_api = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
 
     if method == Method::POST
-        && (path == "/webhooks/stripe" || path == payments::payroof::WEBHOOK_PATH)
+        && (path == "/webhooks/stripe"
+            || path == payments::payroof::WEBHOOK_PATH
+            || path == "/webhooks/apple"
+            || path == "/webhooks/google")
     {
         let (parts, body) = req.into_parts();
         let body = to_bytes(body, WEBHOOK_BODY_LIMIT)
             .await
             .map_err(|_| Error::too_large("Webhook too large"))?;
-        let handled = if path == "/webhooks/stripe" {
-            payments::stripe::webhook(&app, &parts.headers, &body).await?
-        } else {
-            payments::payroof::webhook(&app, &parts.headers, &body).await?
+        let handled = match path.as_str() {
+            "/webhooks/stripe" => payments::stripe::webhook(&app, &parts.headers, &body).await?,
+            "/webhooks/apple" => payments::store::apple::webhook(&app, &body).await?,
+            "/webhooks/google" => {
+                payments::store::google::webhook(&app, &parts.headers, &body).await?
+            }
+            _ => payments::payroof::webhook(&app, &parts.headers, &body).await?,
         };
         return Ok(Json(handled).into_response());
     }

@@ -91,6 +91,8 @@ impl Test {
                 ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
+                // Halving is on by default; these tests expect full trial credit.
+                free_credit_halving: false,
                 ..Default::default()
             },
             ..Config::default()
@@ -1387,6 +1389,12 @@ async fn generate_image_returns_inline_images_and_never_fetches_urls() {
     .await;
     let mut t = Test::new().await;
     t.tasks.push(victim_task);
+    // Three images hold 3 * 0.04 USD at admission, more than the trial credit.
+    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    reseller::billing::credit(&mut tx, t.account(), 1_000_000, "admin", None, "")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let seen = Arc::default();
     let link = format!("{victim}/secret.png");
     let b64 = STANDARD.encode(PNG);

@@ -233,14 +233,28 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
                     "Self-service signup is disabled",
                 ));
             }
-            match config.signup.pow_max_number {
+            match crate::security::pow_difficulty(app, ip).await {
                 0 => None,
-                max => {
+                required => {
                     let payload = altcha.ok_or_else(|| {
                         Error::bad("Solve the proof-of-work challenge to sign up")
                             .with_code("pow_required")
                     })?;
-                    Some(pow::verify(&config.key_pepper, payload, max, now())?)
+                    let verified = pow::verify(
+                        &config.key_pepper,
+                        payload,
+                        config.signup.pow_ceiling(),
+                        now(),
+                    )?;
+                    // A challenge issued before this address's difficulty
+                    // went up (or fetched from another address) is too easy.
+                    if verified.difficulty < u64::from(required) {
+                        return Err(Error::bad(
+                            "This address needs a harder challenge. Request a new one",
+                        )
+                        .with_code("pow_too_easy"));
+                    }
+                    Some(verified)
                 }
             }
         }
@@ -273,13 +287,13 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
         .fetch_one(&mut *tx)
         .await?;
         if active >= i64::from(config.keys.max_per_account) {
-            return Err(Error::too_many(
+            return Err(Error::forbidden(
                 "account_key_limit",
-                "Account key limit reached",
+                "Account key limit reached. Revoke a key to create another",
             ));
         }
         let subscribed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=? AND expires_at>?)",
+            "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=? AND status='active' AND expires_at>?)",
         )
         .bind(account)
         .bind(now())
@@ -384,6 +398,12 @@ async fn spend_proof(conn: &mut SqliteConnection, proof: &pow::Verified) -> Resu
 
 /// Returns the seconds until the oldest row leaves the window, or 60 when no
 /// row exists.
+/// Seconds until the next calendar month (UTC), when monthly allowances reset.
+fn until_next_month() -> u64 {
+    let now = now();
+    (db::next_month_start(now) - now).max(1).unsigned_abs()
+}
+
 fn window_retry(oldest: Option<i64>, window: i64) -> u64 {
     oldest.map_or(60, |t| (t + window - now()).max(1).unsigned_abs())
 }
@@ -402,10 +422,11 @@ async fn check_global_hourly(conn: &mut SqliteConnection, config: &Config) -> Re
             .fetch_one(&mut *conn)
             .await?;
     if recent >= i64::from(limit) {
-        return Err(
-            Error::too_many("creation_rate_limited", "Key creation hourly limit reached")
-                .retry_after(window_retry(oldest, HOUR)),
-        );
+        return Err(Error::too_many(
+            "creation_rate_limited",
+            "Key creation hourly limit reached",
+            window_retry(oldest, HOUR),
+        ));
     }
     Ok(())
 }
@@ -433,8 +454,8 @@ async fn check_daily_budget(
         return Err(Error::too_many(
             "key_creation_daily_limit",
             "Daily key creation limit reached for this account",
-        )
-        .retry_after(window_retry(oldest, DAY)));
+            window_retry(oldest, DAY),
+        ));
     }
     Ok(())
 }
@@ -459,9 +480,9 @@ async fn check_creation_guards(
         .fetch_one(&mut *conn)
         .await?;
         if children >= i64::from(max) {
-            return Err(Error::too_many(
+            return Err(Error::forbidden(
                 "child_key_limit",
-                "Child key limit reached",
+                "Child key limit reached. Revoke a child key to create another",
             ));
         }
     }
@@ -485,9 +506,10 @@ async fn check_creation_guards(
         .fetch_one(&mut *conn)
         .await?;
         if created >= i64::from(limit) {
-            return Err(Error::too_many(
+            return Err(Error::quota_window(
                 "ip_key_limit",
-                "Monthly key allowance reached",
+                "Monthly key allowance reached for this address",
+                until_next_month(),
             ));
         }
     }
@@ -502,8 +524,8 @@ async fn check_creation_guards(
             return Err(Error::too_many(
                 "creation_cooldown",
                 "Please wait before creating another key",
-            )
-            .retry_after(window_retry(Some(t), cooldown)));
+                window_retry(Some(t), cooldown),
+            ));
         }
     }
     Ok(())
@@ -526,6 +548,20 @@ async fn open_trial_account(
     ip: &str,
     body: &Value,
 ) -> Result<(String, i64)> {
+    if crate::billing::refund_blocked(conn, "ip", ip).await? {
+        return Err(Error::forbidden(
+            "signup_blocked",
+            "New accounts cannot be opened from this address after a refunded store purchase",
+        ));
+    }
+    let consent = match body.get("consumption_consent") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(consent)) => *consent,
+        Some(_) => {
+            return Err(Error::bad("consumption_consent must be a boolean")
+                .with_param("consumption_consent"));
+        }
+    };
     let mut amount = money::usd(&config.signup.free_credit_usd)?;
     if config.signup.free_credit_halving && amount > 0 {
         let month = chrono::Utc::now().format("%Y-%m-01 00:00:00").to_string();
@@ -539,16 +575,21 @@ async fn open_trial_account(
         amount = halved_trial(amount, earlier);
     }
     let account = id();
-    sqlx::query("INSERT INTO accounts(id,contact,created_at,created_ip) VALUES(?,?,?,?)")
-        .bind(&account)
-        .bind(clip(
-            body["contact"].as_str().unwrap_or(""),
-            MAX_CONTACT_CHARS,
-        ))
-        .bind(now())
-        .bind(ip)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "INSERT INTO accounts(id,contact,consumption_consent,consent_at,created_at,created_ip) \
+         VALUES(?,?,?,?,?,?)",
+    )
+    .bind(&account)
+    .bind(clip(
+        body["contact"].as_str().unwrap_or(""),
+        MAX_CONTACT_CHARS,
+    ))
+    .bind(consent)
+    .bind(consent.then(now))
+    .bind(now())
+    .bind(ip)
+    .execute(&mut *conn)
+    .await?;
     if amount > 0 {
         let expires = (config.signup.free_credit_expiry_days > 0)
             .then(|| now() + i64::from(config.signup.free_credit_expiry_days) * DAY);
@@ -590,8 +631,8 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
             return Err(Error::too_many(
                 "rotate_cooldown",
                 "This key was created recently. Wait before rotating it",
-            )
-            .retry_after((cooldown - age).unsigned_abs()));
+                (cooldown - age).unsigned_abs(),
+            ));
         }
         check_global_hourly(&mut tx, &config).await?;
         check_daily_budget(&mut tx, &config, &aid).await?;
@@ -605,9 +646,9 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
     .fetch_one(&mut *tx)
     .await?;
     if others >= i64::from(config.keys.max_per_account) {
-        return Err(Error::too_many(
+        return Err(Error::forbidden(
             "account_key_limit",
-            "Account key limit reached",
+            "Account key limit reached. Revoke a key to create another",
         ));
     }
     sqlx::query("UPDATE api_keys SET status='blocked' WHERE id=?")

@@ -1,8 +1,10 @@
-//! Plan purchases.
+//! Plan and top-up purchases.
 //!
-//! Every checkout creates a server-side order that snapshots the plan's price,
-//! credit, and duration. A verified provider event, or an administrator,
-//! completes the order. Completion grants exactly that snapshot, once.
+//! Every checkout creates a server-side order that snapshots the plan's kind,
+//! price, credit (monthly quota or top-up credit), and months. A verified
+//! provider event, or an administrator, completes the order. Completion
+//! grants exactly that snapshot, once: a subscription with a monthly quota,
+//! or non-expiring top-up credit.
 //!
 //! Providers:
 //! - [`stripe`]: hosted card Checkout, completed by a signed webhook.
@@ -10,9 +12,12 @@
 //!   EVM chains), completed by signed `confirmed` transfer webhooks.
 //! - [`deposits`]: standing per-account Payroof addresses. Confirmed
 //!   stablecoin transfers to them credit the account directly.
+//! - [`store`]: native App Store and Google Play purchases, verified with
+//!   the stores and kept current by their server notifications.
 pub mod chains;
 pub mod deposits;
 pub mod payroof;
+pub mod store;
 pub mod stripe;
 
 use crate::{
@@ -112,8 +117,8 @@ async fn check_checkout_budget(app: &App, config: &Config, account: &str) -> Res
         return Err(Error::too_many(
             "checkout_rate_limited",
             "Too many checkout attempts. Try again later",
-        )
-        .retry_after(oldest.map_or(60, |t| (t + HOUR - now()).max(1).unsigned_abs())));
+            oldest.map_or(60, |t| (t + HOUR - now()).max(1).unsigned_abs()),
+        ));
     }
     Ok(())
 }
@@ -127,21 +132,90 @@ pub(crate) async fn create_order(
     provider: &str,
     expires_at: Option<i64>,
 ) -> Result<()> {
+    let terms = billing::Terms::from_row(plan, "code");
     sqlx::query(
-        "INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,\
-         created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,months,\
+         created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(order)
     .bind(account)
-    .bind(plan.get::<String, _>("code"))
+    .bind(&terms.code)
     .bind(provider)
-    .bind(plan.get::<i64, _>("price_micro"))
-    .bind(plan.get::<i64, _>("credit_micro"))
-    .bind(plan.get::<i64, _>("duration_days"))
+    .bind(&terms.kind)
+    .bind(terms.price)
+    .bind(terms.credit)
+    .bind(terms.months)
     .bind(now())
     .bind(expires_at)
     .execute(conn)
     .await?;
+    Ok(())
+}
+
+/// Grants a paid order's snapshot: a subscription starting now (or, for a
+/// store, over `period`), or a non-expiring top-up lot linked to the order.
+async fn fulfil(
+    conn: &mut SqliteConnection,
+    order_id: &str,
+    store: Option<&StoreCharge<'_>>,
+) -> Result<()> {
+    let order = sqlx::query("SELECT * FROM payments WHERE id=?")
+        .bind(order_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    let account: String = order.get("account_id");
+    let provider: String = order.get("provider");
+    let terms = billing::Terms::from_row(&order, "plan_code");
+    let Some(months) = terms.months else {
+        let lot = billing::Lot {
+            note: &terms.code,
+            payment: Some(order_id),
+            ..billing::Lot::default()
+        };
+        billing::credit_lot(conn, &account, terms.credit, "purchase", &lot).await?;
+        return Ok(());
+    };
+    // A store renewal continues the subscription that the original
+    // transaction (App Store) or purchase token (Google Play) started.
+    let existing: Option<String> =
+        match store {
+            Some(charge) => sqlx::query_scalar(
+                "SELECT id FROM subscriptions WHERE original_transaction_id=? OR purchase_token=?",
+            )
+            .bind(charge.original_transaction_id)
+            .bind(charge.purchase_token)
+            .fetch_optional(&mut *conn)
+            .await?,
+            None => None,
+        };
+    let subscription = match (existing, store) {
+        (Some(subscription), Some(charge)) => {
+            let period = charge
+                .period
+                .ok_or_else(|| Error::internal("store subscription without a period"))?;
+            billing::renew(conn, &subscription, period, charge.auto_renew).await?;
+            subscription
+        }
+        _ => {
+            let start = billing::Subscription {
+                plan: &terms.code,
+                quota: terms.credit,
+                months,
+                provider: &provider,
+                period: store.and_then(|c| c.period),
+                auto_renew: store.is_some_and(|c| c.auto_renew),
+                original_transaction_id: store.and_then(|c| c.original_transaction_id),
+                purchase_token: store.and_then(|c| c.purchase_token),
+                idempotency_key: None,
+            };
+            billing::subscribe(conn, &account, &start).await?
+        }
+    };
+    sqlx::query("UPDATE payments SET subscription_id=? WHERE id=?")
+        .bind(&subscription)
+        .bind(order_id)
+        .execute(conn)
+        .await?;
     Ok(())
 }
 
@@ -163,21 +237,126 @@ pub(crate) async fn complete(
     if updated.rows_affected() == 0 {
         return Ok(false);
     }
-    let order = sqlx::query(
-        "SELECT account_id,plan_code,credit_micro,duration_days FROM payments WHERE id=?",
-    )
-    .bind(order_id)
-    .fetch_one(&mut *conn)
-    .await?;
-    billing::grant_snapshot(
-        conn,
-        order.get("account_id"),
-        order.get("plan_code"),
-        order.get("credit_micro"),
-        order.get("duration_days"),
-    )
-    .await?;
+    fulfil(conn, order_id, None).await?;
     Ok(true)
+}
+
+/// A verified App Store or Google Play charge.
+#[derive(Clone, Debug)]
+pub struct StoreCharge<'a> {
+    /// `apple` or `google`.
+    pub provider: &'a str,
+    pub account: &'a str,
+    pub plan: &'a billing::Terms,
+    /// App Store transactionId or Google Play orderId of this charge. Each
+    /// subscription renewal is a new charge with its own id.
+    pub external_id: &'a str,
+    pub original_transaction_id: Option<&'a str>,
+    pub purchase_token: Option<&'a str>,
+    pub product_id: &'a str,
+    pub environment: &'a str,
+    /// Paid period of a subscription charge, from the store.
+    pub period: Option<(i64, i64)>,
+    pub auto_renew: bool,
+}
+
+/// Records a verified store charge as a paid order and grants it.
+///
+/// The order is keyed by `(provider, external_id)`, and a Google Play
+/// one-time purchase token is unique as well, so a receipt or notification
+/// delivered again (by the app or the store) grants nothing. Returns the
+/// order id and whether this call recorded it. A purchase by an App Store
+/// customer whose earlier subscription was refunded suspends the account.
+pub async fn record_store_charge(
+    conn: &mut SqliteConnection,
+    charge: &StoreCharge<'_>,
+    refund_ip_block_days: u32,
+) -> Result<(String, bool)> {
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM payments WHERE (provider=? AND external_id=?) \
+         OR (provider='google' AND kind='topup' AND purchase_token=? AND ?='topup')",
+    )
+    .bind(charge.provider)
+    .bind(charge.external_id)
+    .bind(charge.purchase_token)
+    .bind(&charge.plan.kind)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(order) = previous {
+        return Ok((order, false));
+    }
+    let order = db::id();
+    let t = now();
+    sqlx::query(
+        "INSERT INTO payments(id,account_id,plan_code,provider,platform,kind,price_micro,credit_micro,\
+         months,external_id,original_transaction_id,purchase_token,product_id,environment,status,\
+         received_micro,created_at,paid_at,paid_by) \
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'paid',?,?,?,?)",
+    )
+    .bind(&order)
+    .bind(charge.account)
+    .bind(&charge.plan.code)
+    .bind(charge.provider)
+    .bind(if charge.provider == "apple" { "ios" } else { "android" })
+    .bind(&charge.plan.kind)
+    .bind(charge.plan.price)
+    .bind(charge.plan.credit)
+    .bind(charge.plan.months)
+    .bind(charge.external_id)
+    .bind(charge.original_transaction_id)
+    .bind(charge.purchase_token)
+    .bind(charge.product_id)
+    .bind(charge.environment)
+    .bind(charge.plan.price)
+    .bind(t)
+    .bind(t)
+    .bind(charge.provider)
+    .execute(&mut *conn)
+    .await?;
+    fulfil(conn, &order, Some(charge)).await?;
+    if let Some(original) = charge.original_transaction_id
+        && billing::refund_blocked(conn, "apple_original_transaction", original).await?
+    {
+        billing::block_after_refund(conn, charge.account, refund_ip_block_days, Some(original))
+            .await?;
+    }
+    Ok((order, true))
+}
+
+/// Marks the paid orders matching a refunded store charge as refunded and
+/// blocks their account (see [`billing::block_after_refund`]). Returns the
+/// affected account ids.
+pub async fn refund_store_charge(
+    conn: &mut SqliteConnection,
+    provider: &str,
+    external_id: Option<&str>,
+    purchase_token: Option<&str>,
+    refund_ip_block_days: u32,
+) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "UPDATE payments SET status='refunded',refunded_at=? WHERE provider=? AND status='paid' \
+         AND ((? IS NOT NULL AND external_id=?) OR (? IS NOT NULL AND purchase_token=?)) \
+         RETURNING account_id,original_transaction_id",
+    )
+    .bind(now())
+    .bind(provider)
+    .bind(external_id)
+    .bind(external_id)
+    .bind(purchase_token)
+    .bind(purchase_token)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut accounts: Vec<String> = Vec::new();
+    for row in rows {
+        let account: String = row.get("account_id");
+        let original: Option<String> = row.get("original_transaction_id");
+        billing::block_after_refund(conn, &account, refund_ip_block_days, original.as_deref())
+            .await?;
+        if !accounts.contains(&account) {
+            accounts.push(account);
+        }
+    }
+    Ok(accounts)
 }
 
 /// Records a provider event id. Returns `false` when the event was already
@@ -192,6 +371,16 @@ pub(crate) async fn first_delivery(conn: &mut SqliteConnection, event: &str) -> 
     .await?
     .rows_affected()
         == 1)
+}
+
+/// Customer-facing payment method of a provider.
+fn method(provider: &str) -> &'static str {
+    match provider {
+        "stripe" => STRIPE,
+        "payroof" => CRYPTO,
+        "apple" => "app_store",
+        _ => "google_play",
+    }
 }
 
 /// Customer-safe view of an order, with crypto quotes and transfers.
@@ -256,11 +445,15 @@ pub fn summary(r: &SqliteRow) -> Value {
         "id": r.get::<String, _>("id"),
         "account_id": r.get::<String, _>("account_id"),
         "plan_code": r.get::<String, _>("plan_code"),
+        "kind": r.get::<String, _>("kind"),
         "provider": r.get::<String, _>("provider"),
-        "method": if r.get::<String, _>("provider") == "stripe" { STRIPE } else { CRYPTO },
+        "platform": r.get::<Option<String>, _>("platform"),
+        "method": method(&r.get::<String, _>("provider")),
         "price_usd": money::display(r.get("price_micro")),
         "credit_usd": money::display(r.get("credit_micro")),
-        "duration_days": r.get::<i64, _>("duration_days"),
+        "months": r.get::<Option<i64>, _>("months"),
+        "product_id": r.get::<Option<String>, _>("product_id"),
+        "refunded_at": r.get::<Option<i64>, _>("refunded_at"),
         "received_usd": money::display(r.get("received_micro")),
         "status": if expired { "expired" } else { status.as_str() },
         "created_at": r.get::<i64, _>("created_at"),

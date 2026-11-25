@@ -7,6 +7,7 @@
 //!
 //! - Edit it through the administrator API.
 //! - Replace it with `reseller config import`.
+mod billing;
 mod branding;
 mod keys;
 mod mcp;
@@ -14,7 +15,9 @@ mod models;
 mod payments;
 mod rate_limits;
 mod signup;
+mod stores;
 
+pub use billing::Billing;
 pub use branding::{Branding, Link};
 pub use keys::KeyPolicy;
 pub use mcp::Mcp;
@@ -22,6 +25,7 @@ pub use models::{Capability, Model, Resolved};
 pub use payments::{Payroof, RateSource, Stripe};
 pub use rate_limits::RateLimits;
 pub use signup::Signup;
+pub use stores::{Apple, AppleEnvironment, Google};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -33,7 +37,7 @@ pub const MIN_SECRET_LEN: usize = 24;
 ///
 /// API responses redact these values. A blank value in a settings patch keeps
 /// the stored secret.
-pub const SECRET_PATHS: [&str; 10] = [
+pub const SECRET_PATHS: [&str; 12] = [
     "/admin_token",
     "/key_pepper",
     "/llm/api_key",
@@ -44,6 +48,8 @@ pub const SECRET_PATHS: [&str; 10] = [
     "/stripe/webhook_secret",
     "/payroof/token",
     "/payroof/webhook_secret",
+    "/apple/private_key",
+    "/google/service_account_json",
 ];
 
 /// One OpenAI-compatible upstream endpoint.
@@ -234,8 +240,11 @@ pub struct Config {
     pub upstream_timeout_seconds: u64,
     pub log_retention_days: u32,
     pub max_log_entries: u32,
+    pub billing: Billing,
     pub stripe: Stripe,
     pub payroof: Payroof,
+    pub apple: Apple,
+    pub google: Google,
 }
 
 impl Default for Config {
@@ -267,10 +276,28 @@ impl Default for Config {
             upstream_timeout_seconds: 300,
             log_retention_days: 30,
             max_log_entries: 5000,
+            billing: Billing::default(),
             stripe: Stripe::default(),
             payroof: Payroof::default(),
+            apple: Apple::default(),
+            google: Google::default(),
         }
     }
+}
+
+/// Requires an http(s) URL without credentials, query, or fragment.
+fn check_http_url(name: &str, value: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(value).with_context(|| format!("{name} is not a valid URL"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "{name} must be an http(s) URL without credentials, query or fragment"
+    );
+    Ok(())
 }
 
 /// Splits a comma-separated list, dropping blanks.
@@ -339,6 +366,19 @@ impl Config {
             ("PAYROOF_PROJECT", &mut self.payroof.project),
             ("PAYROOF_TOKEN", &mut self.payroof.token),
             ("PAYROOF_WEBHOOK_SECRET", &mut self.payroof.webhook_secret),
+            ("APPLE_BUNDLE_ID", &mut self.apple.bundle_id),
+            ("APPLE_ISSUER_ID", &mut self.apple.issuer_id),
+            ("APPLE_KEY_ID", &mut self.apple.key_id),
+            ("APPLE_PRIVATE_KEY", &mut self.apple.private_key),
+            ("GOOGLE_PACKAGE_NAME", &mut self.google.package_name),
+            (
+                "GOOGLE_SERVICE_ACCOUNT_JSON",
+                &mut self.google.service_account_json,
+            ),
+            (
+                "GOOGLE_PUBSUB_SERVICE_ACCOUNT",
+                &mut self.google.pubsub_service_account,
+            ),
         ] {
             if let Some(v) = var(name) {
                 *field = v;
@@ -395,6 +435,10 @@ impl Config {
                 .context("cors_origin")?;
         }
         self.payroof.validate()?;
+        self.billing.validate()?;
+        self.rate_limits.validate()?;
+        self.apple.validate()?;
+        self.google.validate()?;
         Ok(())
     }
 

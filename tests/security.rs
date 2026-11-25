@@ -7,10 +7,10 @@ use axum::{
     http::{HeaderMap, Request},
 };
 use reseller::{
-    App,
+    App, billing,
     config::{Config, KeyPolicy, RateLimits, Signup},
     db, identity,
-    meter::{Meter, RequestMeta},
+    meter::{Meter, RequestMeta, Usage},
     security::pow,
 };
 use serde_json::{Value, json};
@@ -63,6 +63,8 @@ impl Test {
                 checkouts_per_hour: 0,
                 redeem_failures_per_hour: 0,
                 challenges_per_minute: 0,
+                new_account_hours: 0,
+                new_account_daily_spend_pct: "0".into(),
             },
             ..Config::default()
         };
@@ -571,6 +573,7 @@ fn meta() -> RequestMeta<'static> {
         kind: "llm",
         model: "m",
         ip: "127.0.0.1",
+        estimate: &Usage::NONE,
     }
 }
 
@@ -628,8 +631,8 @@ async fn checkouts_are_capped_per_account_per_hour() {
     let k = t.key().await;
     for i in 0..2 {
         sqlx::query(
-            "INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,\
-             duration_days,created_at) VALUES(?,?,'monthly','stripe',1,1,30,?)",
+            "INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,\
+             months,created_at) VALUES(?,?,'monthly','stripe','subscription',1,1,1,?)",
         )
         .bind(format!("p{i}"))
         .bind(k["account_id"].as_str())
@@ -710,4 +713,225 @@ async fn strict_transport_security_only_with_https_public_url() {
     let r = secure.call("GET", "/healthz", None, json!({})).await;
     assert_eq!(r.headers["strict-transport-security"], "max-age=31536000");
     assert_eq!(r.headers["x-content-type-options"], "nosniff");
+}
+
+/// Count caps are not rate limits: the per-account key cap is a 403 without
+/// a retry hint, while the monthly per-address allowance is a 429 whose
+/// `Retry-After` points at the start of next month and that SDKs must not
+/// retry right away.
+#[tokio::test]
+async fn key_caps_and_monthly_allowance_have_correct_retry_semantics() {
+    let t = Test::with(|c| {
+        c.signup.ip_limit_per_month = 1;
+        c.keys.max_per_account = 1;
+    })
+    .await;
+    let k = t.key().await;
+    let token = k["key"].as_str().unwrap();
+    let r = t.call("POST", "/v1/keys", Some(token), json!({})).await;
+    assert_eq!(
+        (r.status, code(&r)),
+        (403, "account_key_limit"),
+        "{}",
+        r.body
+    );
+    assert!(r.headers.get("retry-after").is_none());
+
+    let r = t
+        .call("POST", "/v1/signup", None, json!({"name":"second"}))
+        .await;
+    assert_eq!((r.status, code(&r)), (429, "ip_key_limit"), "{}", r.body);
+    assert_eq!(r.headers["x-should-retry"], "false");
+    let expected = db::next_month_start(db::now()) - db::now();
+    let wait = i64::try_from(retry_after(&r)).unwrap();
+    assert!(
+        (expected - 2..=expected + 2).contains(&wait),
+        "{wait} vs {expected}"
+    );
+}
+
+/// After a store refund blocks an account, its signup address cannot open
+/// new accounts until the block expires.
+#[tokio::test]
+async fn refund_blocked_address_cannot_sign_up_again() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    billing::block_after_refund(&mut tx, k["account_id"].as_str().unwrap(), 30, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let r = t
+        .call("POST", "/v1/signup", None, json!({"name":"again"}))
+        .await;
+    assert_eq!((r.status, code(&r)), (403, "signup_blocked"), "{}", r.body);
+    // Another address is not affected, and an expired block lifts.
+    let r = t
+        .call_from(
+            "10.9.9.9",
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"name":"other"}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    sqlx::query("UPDATE refund_blocks SET expires_at=?")
+        .bind(db::now() - 1)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let r = t
+        .call("POST", "/v1/signup", None, json!({"name":"later"}))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+async fn challenge_from(t: &Test, ip: &str) -> pow::Challenge {
+    let r = t
+        .call_from(ip, "GET", "/v1/signup/challenge", None, json!({}))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    serde_json::from_value(r.body).unwrap()
+}
+
+/// Adaptive proof of work: business failures from an IP double its next
+/// challenge's difficulty up to the ceiling, an easier challenge solved
+/// before (or fetched from another address) is refused, server-side limits
+/// do not count, and a successful signup resets the difficulty.
+#[tokio::test]
+async fn failed_attempts_raise_the_signup_difficulty_up_to_a_ceiling() {
+    let t = Test::with(|c| {
+        c.signup.pow_max_number = 100;
+        c.signup.pow_max_number_ceiling = 500;
+    })
+    .await;
+    let ip = "10.7.7.7";
+    let easy = challenge_from(&t, ip).await;
+    assert_eq!(easy.maxnumber, 100);
+    assert!(easy.salt.contains("&max=100"));
+    let easy_altcha = pow::encode(&easy, pow::solve(&easy).unwrap());
+
+    // Two wrong guesses (a garbage proof, an invalid API key) double twice.
+    let r = t
+        .call_from(ip, "POST", "/v1/signup", None, json!({"altcha":"e30="}))
+        .await;
+    assert_eq!((r.status, code(&r)), (400, "pow_invalid"));
+    let r = t
+        .call_from(ip, "GET", "/v1/account", Some("sk-res-wrong"), json!({}))
+        .await;
+    assert_eq!(r.status, 401);
+    assert_eq!(challenge_from(&t, ip).await.maxnumber, 400);
+    // Other addresses are unaffected, and the ceiling caps the growth.
+    assert_eq!(challenge_from(&t, "10.8.8.8").await.maxnumber, 100);
+    let r = t
+        .call_from(ip, "POST", "/v1/signup", None, json!({"altcha":"e30="}))
+        .await;
+    assert_eq!(code(&r), "pow_invalid");
+    assert_eq!(challenge_from(&t, ip).await.maxnumber, 500);
+
+    // The challenge solved at the old difficulty is now too easy for this
+    // address, and a challenge from a clean address does not help either.
+    let r = t
+        .call_from(
+            ip,
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"altcha":easy_altcha}),
+        )
+        .await;
+    assert_eq!((r.status, code(&r)), (400, "pow_too_easy"), "{}", r.body);
+    let elsewhere = challenge_from(&t, "10.9.9.9").await;
+    let r = t
+        .call_from(
+            ip,
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"altcha": pow::encode(&elsewhere, pow::solve(&elsewhere).unwrap())}),
+        )
+        .await;
+    assert_eq!(code(&r), "pow_too_easy");
+    // A difficulty above the ceiling is never accepted, even if signed.
+    let forged = pow::create(PEPPER, 600, 60, db::now());
+    let r = t
+        .call_from(
+            ip,
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"altcha": pow::encode(&forged, pow::solve(&forged).unwrap())}),
+        )
+        .await;
+    assert_eq!(code(&r), "pow_invalid");
+
+    // Solving the current challenge signs up and resets the difficulty.
+    let hard = challenge_from(&t, ip).await;
+    assert_eq!(hard.maxnumber, 500);
+    let r = t
+        .call_from(
+            ip,
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"altcha": pow::encode(&hard, pow::solve(&hard).unwrap())}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(challenge_from(&t, ip).await.maxnumber, 100);
+}
+
+/// With `adaptive_pow = false` the difficulty stays fixed whatever happens,
+/// and rate-limit rejections never raise it.
+#[tokio::test]
+async fn adaptive_pow_can_be_disabled_and_ignores_rate_limits() {
+    let t = Test::with(|c| {
+        c.signup.pow_max_number = 100;
+        c.signup.adaptive_pow = false;
+    })
+    .await;
+    for _ in 0..3 {
+        t.call_from(
+            "10.1.1.1",
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"altcha":"e30="}),
+        )
+        .await;
+    }
+    assert_eq!(challenge_from(&t, "10.1.1.1").await.maxnumber, 100);
+
+    let t = Test::with(|c| {
+        c.signup.pow_max_number = 100;
+        c.signup.global_hourly_limit = 1;
+    })
+    .await;
+    let first = challenge_from(&t, "10.2.2.2").await;
+    let second = challenge_from(&t, "10.2.2.2").await;
+    let ok = t
+        .call_from(
+            "10.2.2.2",
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"altcha": pow::encode(&first, pow::solve(&first).unwrap())}),
+        )
+        .await;
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    let limited = t
+        .call_from(
+            "10.2.2.2",
+            "POST",
+            "/v1/signup",
+            None,
+            json!({"altcha": pow::encode(&second, pow::solve(&second).unwrap())}),
+        )
+        .await;
+    assert_eq!(
+        (limited.status, code(&limited)),
+        (429, "creation_rate_limited")
+    );
+    assert_eq!(challenge_from(&t, "10.2.2.2").await.maxnumber, 100);
 }

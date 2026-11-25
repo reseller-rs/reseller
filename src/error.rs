@@ -2,7 +2,7 @@
 //! `{"error":{"message","type","param","code"}}` JSON body.
 use axum::{
     Json,
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -19,8 +19,13 @@ pub struct Error {
     pub code: &'static str,
     pub message: String,
     pub param: Option<&'static str>,
-    /// Seconds a client should wait before retrying (429 responses).
+    /// Seconds a client should wait before retrying. Every 429 carries one,
+    /// and it becomes the `Retry-After` header.
     pub retry_after: Option<u64>,
+    /// An immediate automatic retry cannot succeed (a usage quota, not a
+    /// momentary throttle). Sent as `x-should-retry: false`, which the
+    /// OpenAI and Anthropic SDKs honor instead of their own backoff.
+    pub no_auto_retry: bool,
     /// Methods the path accepts (`Allow` header of 405 responses).
     pub allow: Option<&'static str>,
     /// Replaces the `WWW-Authenticate` header of a 401 response.
@@ -39,6 +44,7 @@ impl Error {
             message: message.into(),
             param: None,
             retry_after: None,
+            no_auto_retry: false,
             allow: None,
             challenge: None,
         }
@@ -96,8 +102,20 @@ impl Error {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }
 
-    pub fn too_many(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::TOO_MANY_REQUESTS, code, message)
+    /// 429 for a momentary throttle (request rate, concurrency, cooldowns):
+    /// retrying after `retry_after` seconds succeeds.
+    pub fn too_many(code: &'static str, message: impl Into<String>, retry_after: u64) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, code, message).retry_after(retry_after)
+    }
+
+    /// 429 for an exhausted usage quota over a time window (request, token,
+    /// or spend windows, monthly allowances). The request succeeds again
+    /// only after `retry_after` seconds, so clients must not retry it
+    /// automatically right away.
+    pub fn quota_window(code: &'static str, message: impl Into<String>, retry_after: u64) -> Self {
+        let mut error = Self::too_many(code, message, retry_after);
+        error.no_auto_retry = true;
+        error
     }
 
     /// 405 `method_not_allowed` for a path that accepts only `allow`.
@@ -121,9 +139,11 @@ impl Error {
         Self::not_found("model_not_found", message).with_param("model")
     }
 
-    /// 429 `insufficient_quota`: the account has no spendable balance.
+    /// 402 `insufficient_quota`: the account cannot pay for the request.
+    /// Waiting does not help, only a top-up or a smaller request does, so
+    /// this is not a 429 and carries no `Retry-After`.
     pub fn insufficient_quota(message: impl Into<String>) -> Self {
-        Self::too_many("insufficient_quota", message)
+        Self::new(StatusCode::PAYMENT_REQUIRED, "insufficient_quota", message)
     }
 
     pub fn too_large(message: impl Into<String>) -> Self {
@@ -166,7 +186,7 @@ impl Error {
     /// The OpenAI-style `type` of this error, derived from status and code.
     pub fn kind(&self) -> &'static str {
         match self.status.as_u16() {
-            429 if self.code == "insufficient_quota" => "insufficient_quota",
+            402 => "insufficient_quota",
             403 => "permission_error",
             429 => "rate_limit_error",
             500..=599 => "server_error",
@@ -193,10 +213,15 @@ impl IntoResponse for Error {
                 .headers_mut()
                 .insert(header::ALLOW, HeaderValue::from_static(allow));
         }
-        if self.status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        if self.no_auto_retry {
             response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from(self.retry_after.unwrap_or(60)),
+                HeaderName::from_static("x-should-retry"),
+                HeaderValue::from_static("false"),
             );
         }
         if self.status == StatusCode::UNAUTHORIZED {

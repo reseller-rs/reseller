@@ -32,6 +32,18 @@ pub struct Signup {
     pub pow_max_number: u32,
     /// Seconds a challenge stays solvable.
     pub pow_ttl_seconds: u32,
+    /// Adaptive proof of work: each business failure from a client IP
+    /// (rejected signup, invalid credential, invalid redeem code) doubles
+    /// the difficulty of that IP's next signup challenge, up to
+    /// `pow_max_number_ceiling`. A successful signup or
+    /// `adaptive_pow_reset_minutes` without failures resets it. Server
+    /// errors and rate limits never count.
+    pub adaptive_pow: bool,
+    /// Highest difficulty adaptive proof of work may reach. Keep it low
+    /// enough for old phones (about 1000000 solves in a few seconds).
+    pub pow_max_number_ceiling: u32,
+    /// Minutes after the last failure at which an IP's difficulty resets.
+    pub adaptive_pow_reset_minutes: u32,
     /// Per-IP replacements for `ip_limit_per_month`. 0 means unlimited.
     pub ip_overrides: BTreeMap<String, u32>,
 }
@@ -41,19 +53,32 @@ impl Default for Signup {
         Self {
             enabled: true,
             free_credit_usd: "0.10".into(),
-            free_credit_halving: false,
+            free_credit_halving: true,
             free_credit_expiry_days: 30,
-            ip_limit_per_month: 2,
+            ip_limit_per_month: 4,
             cooldown_seconds: 30,
             global_hourly_limit: 100,
             pow_max_number: 100_000,
             pow_ttl_seconds: 300,
+            adaptive_pow: true,
+            pow_max_number_ceiling: 1_000_000,
+            adaptive_pow_reset_minutes: 30,
             ip_overrides: BTreeMap::new(),
         }
     }
 }
 
 impl Signup {
+    /// Highest difficulty a challenge may carry: the adaptive ceiling, or
+    /// the fixed difficulty when adaptivity is off.
+    pub fn pow_ceiling(&self) -> u32 {
+        if self.adaptive_pow {
+            self.pow_max_number_ceiling
+        } else {
+            self.pow_max_number
+        }
+    }
+
     /// Checks the credit amount, expiry, proof-of-work difficulty, and challenge lifetime.
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         crate::money::usd(&self.free_credit_usd).context("signup.free_credit_usd")?;
@@ -64,6 +89,15 @@ impl Signup {
         anyhow::ensure!(
             self.pow_max_number <= MAX_POW_NUMBER,
             "signup.pow_max_number must be at most {MAX_POW_NUMBER}"
+        );
+        anyhow::ensure!(
+            self.pow_max_number_ceiling >= self.pow_max_number
+                && self.pow_max_number_ceiling <= MAX_POW_NUMBER,
+            "signup.pow_max_number_ceiling must be between pow_max_number and {MAX_POW_NUMBER}"
+        );
+        anyhow::ensure!(
+            (1..=1440).contains(&self.adaptive_pow_reset_minutes),
+            "signup.adaptive_pow_reset_minutes must be between 1 and 1440"
         );
         anyhow::ensure!(
             (10..=86_400).contains(&self.pow_ttl_seconds),

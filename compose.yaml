@@ -32,6 +32,14 @@ services:
       PAYROOF_PROJECT: ${PAYROOF_PROJECT:-}
       PAYROOF_TOKEN: ${PAYROOF_TOKEN:-}
       PAYROOF_WEBHOOK_SECRET: ${PAYROOF_WEBHOOK_SECRET:-}
+      # Native app purchases (App Store, Google Play). See README > Payments.
+      APPLE_BUNDLE_ID: ${APPLE_BUNDLE_ID:-}
+      APPLE_ISSUER_ID: ${APPLE_ISSUER_ID:-}
+      APPLE_KEY_ID: ${APPLE_KEY_ID:-}
+      APPLE_PRIVATE_KEY: ${APPLE_PRIVATE_KEY:-}
+      GOOGLE_PACKAGE_NAME: ${GOOGLE_PACKAGE_NAME:-}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${GOOGLE_SERVICE_ACCOUNT_JSON:-}
+      GOOGLE_PUBSUB_SERVICE_ACCOUNT: ${GOOGLE_PUBSUB_SERVICE_ACCOUNT:-}
       # White-label files (logo, favicon, theme.css, index.html). See README.
       # RESELLER_THEME_DIR: /theme
     # Named volume for the SQLite database and generated files.

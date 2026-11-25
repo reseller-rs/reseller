@@ -351,7 +351,7 @@ A tool error has `isError: true`. The text reads `<message> (error code: <code>)
 | `invalid_token` (HTTP 401) | The OAuth access token is invalid, expired, or revoked. The client refreshes or signs in again. |
 | `dashboard_token_not_allowed` | The tool needs an API key. Use `create_key`, or use the API key. |
 | `invalid_api_key`, `key_revoked`, `key_blocked`, `key_expired`, `account_suspended` | Credential problems. Rotate or replace the key, or contact the operator. |
-| `insufficient_quota` (429) | Out of credit. Use `list_plans` and `start_checkout`, or `redeem_code`. |
+| `insufficient_quota` (402) | Out of credit, or the request may cost more than the balance (lower `max_tokens`). Use `list_plans` and `start_checkout`, or `redeem_code`. |
 | `model_not_found` (404) | The model is unknown or the key's allowlist excludes it. Omit `model`, or use `list_models`. |
 | `rate_limit_exceeded`, `request_limit_exceeded`, `token_limit_exceeded`, `spend_limit_exceeded`, `concurrency_limit_exceeded` | Wait `retry_after_seconds` when it is given. |
 | `creation_cooldown`, `ip_key_limit`, and other key or signup guards | Wait, then retry. See the README rate-limit table. |

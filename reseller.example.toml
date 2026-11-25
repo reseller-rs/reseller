@@ -150,15 +150,15 @@ public_url = "http://localhost:56787"
 
 # Halve the trial credit for each further signup from the same IP in the same
 # calendar month: with ip_limit_per_month = 4 and free_credit_usd = "0.1" the
-# signups get 0.1, 0.05, 0.025, and 0.0125 USD. Default: false.
-# free_credit_halving = false
+# signups get 0.1, 0.05, 0.025, and 0.0125 USD. Default: true.
+# free_credit_halving = true
 
 # Days the trial credit stays spendable. 0 means it never expires. Maximum:
 # 3650. Default: 30.
 # free_credit_expiry_days = 30
 
-# New keys allowed per source IP per calendar month. Default: 2.
-# ip_limit_per_month = 2
+# New keys allowed per source IP per calendar month. Default: 4.
+# ip_limit_per_month = 4
 
 # Minimum seconds between key creations from one IP. Default: 30.
 # cooldown_seconds = 30
@@ -174,6 +174,21 @@ public_url = "http://localhost:56787"
 # Seconds a signup challenge stays solvable. Must be between 10 and 86400.
 # Default: 300.
 # pow_ttl_seconds = 300
+
+# Adaptive proof of work. Each business failure from a client IP (a rejected
+# signup, an invalid API key or dashboard token, an invalid redeem code)
+# doubles that IP's next challenge difficulty. Server errors and rate limits
+# never count. A successful signup, or adaptive_pow_reset_minutes without
+# failures, resets it. Turn it off for load tests. Default: true.
+# adaptive_pow = true
+
+# Highest difficulty adaptive proof of work may reach. Keep it solvable on
+# older phones. Must be between pow_max_number and 10000000. Default: 1000000.
+# pow_max_number_ceiling = 1000000
+
+# Minutes after the last failure at which an IP's difficulty resets. 1 to
+# 1440. Default: 30.
+# adaptive_pow_reset_minutes = 30
 
 # Per-IP replacements for ip_limit_per_month. 0 means unlimited.
 # [signup.ip_overrides]
@@ -245,6 +260,44 @@ public_url = "http://localhost:56787"
 
 # Signup challenges per client IP per minute. Default: 10.
 # challenges_per_minute = 10
+
+# Hours after signup during which an account's spending is capped per rolling
+# 24 hours, so a fresh purchase cannot be burned in one evening and then
+# refunded. 0 disables the cap. Default: 48.
+# new_account_hours = 48
+
+# Percent of the paid allowance (monthly quota of active subscriptions plus
+# purchased top-ups) a new account may spend per rolling 24 hours. 20% allows
+# about 40% of a month's allowance in the first two days, far above typical
+# daily use (about 3.3%). "0" disables the cap. Default: "20".
+# new_account_daily_spend_pct = "20"
+
+# =============================================================================
+#  BILLING HOLDS AND REFUNDS
+# =============================================================================
+
+# Every admitted request holds its worst-case cost until it settles, so
+# concurrent requests cannot overdraw a balance or a key's spend and token
+# limits.
+
+# [billing]
+
+# Output tokens held for an LLM request that sets no max_tokens,
+# max_completion_tokens, or max_output_tokens. 1 to 1000000. Default: 4096.
+# default_max_output_tokens = 4096
+
+# Smallest hold per request, in USD. It also covers uploads and realtime
+# sessions, whose cost is unknown up front. Default: "0.01".
+# min_hold_usd = "0.01"
+
+# Days a refunded customer's signup address may not open new accounts.
+# 0 disables the address block. At most 3650. Default: 30.
+# refund_ip_block_days = 30
+
+# Percent of a purchase that must be used before refund answers to Apple and
+# Google ask to decline the refund. Below it they ask for a prorated refund
+# (Apple) or stay neutral (Google). 1 to 100. Default: 50.
+# refund_decline_pct = 50
 
 # =============================================================================
 #  MCP (Model Context Protocol)
@@ -483,6 +536,63 @@ api_key = "sk-replace-with-your-upstream-key"
 
 # Signing secret of the Stripe webhook endpoint. Default: "".
 # webhook_secret = ""
+
+# App Store in-app purchases (StoreKit 2). Map products to plans with each
+# plan's apple_product_id (Admin > Plans), and set the App Store Server
+# Notifications V2 URL to {public_url}/webhooks/apple.
+
+# [apple]
+
+# The app's bundle id. Setting it enables App Store purchases. Default: "".
+# bundle_id = "com.example.app"
+
+# The app's numeric Apple ID. Default: unset.
+# app_apple_id = 1234567890
+
+# Which transactions are accepted: "production" or "sandbox" (TestFlight and
+# Xcode). Default: "production".
+# environment = "production"
+
+# In-App Purchase key from App Store Connect (Users and Access > Integrations).
+# It is needed for lookups by transaction id and for consumption answers.
+# issuer_id = ""
+# key_id = ""
+# private_key = """
+# -----BEGIN PRIVATE KEY-----
+# ...
+# -----END PRIVATE KEY-----
+# """
+
+# App Store Server API origin. Empty uses Apple's host for the environment.
+# Default: "".
+# api_url = ""
+
+# Answer CONSUMPTION_REQUEST notifications with Send Consumption Information
+# v2 for customers who consented. Needs the key above. Default: false.
+# consumption_reporting = false
+
+# Google Play Billing. Map products to plans with each plan's
+# google_product_id, and push Real-time Developer Notifications from a Pub/Sub
+# subscription with authentication to {public_url}/webhooks/google.
+
+# [google]
+
+# The app's package name. Default: "".
+# package_name = "com.example.app"
+
+# Service account JSON key with access to the app in Play Console. Default: "".
+# service_account_json = ""
+
+# Service account email that signs the Pub/Sub push tokens. Required with
+# package_name. Default: "".
+# pubsub_service_account = "pubsub-push@project.iam.gserviceaccount.com"
+
+# Audience of the push tokens. Empty uses {public_url}/webhooks/google.
+# Default: "".
+# pubsub_audience = ""
+
+# Answer chargeback reviews through the Review Refund API. Default: false.
+# refund_review = false
 
 # Payroof crypto payments: USDC, USDT, and native coins (ETH, POL, BNB, and so
 # on) on the EVM chains your Payroof project watches. Set project and token,

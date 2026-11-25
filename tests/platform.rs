@@ -79,6 +79,14 @@ impl Test {
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
         }
+        // Administrator grants require an idempotency key: send a fresh one
+        // per call, as a well-behaved client does for each new grant.
+        if method == "POST"
+            && path.starts_with("/admin/api/accounts/")
+            && (path.ends_with("/credits") || path.ends_with("/subscriptions"))
+        {
+            req = req.header("idempotency-key", uuid::Uuid::new_v4().to_string());
+        }
         let mut req = req
             .body(if method == "GET" {
                 Body::empty()
@@ -123,6 +131,7 @@ fn meta() -> RequestMeta<'static> {
         kind: "llm",
         model: "test-model",
         ip: "127.0.0.1",
+        estimate: &Usage::NONE,
     }
 }
 const ADMIN: &str = "admin-test-secret-123456789";
@@ -449,7 +458,7 @@ async fn expired_credit_is_not_spendable() {
         .await
         .unwrap();
     let result = Meter::begin(&t.app, Some(t.identity(&k).await), meta()).await;
-    assert!(matches!(result,Err(e) if e.status.as_u16()==429));
+    assert!(matches!(result,Err(e) if e.status.as_u16()==402));
 }
 #[tokio::test]
 async fn redemption_is_atomic_under_retries() {
@@ -1044,7 +1053,7 @@ async fn payment_webhook_uses_snapshot_and_grants_only_once() {
     let k = t.key().await;
     t.app.config_mut().await.stripe.webhook_secret = "whsec_test".into();
     let aid = k["account_id"].as_str().unwrap();
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order1',?,'monthly','stripe',20000000,25000000,40,'cs_test',?)").bind(aid).bind(db::now()).execute(&t.app.db).await.unwrap();
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,months,external_id,created_at) VALUES('order1',?,'monthly','stripe','subscription',20000000,25000000,2,'cs_test',?)").bind(aid).bind(db::now()).execute(&t.app.db).await.unwrap();
     let mut event = json!({"id":"evt_one","type":"checkout.session.completed","data":{"object":{"id":"cs_test","client_reference_id":"order1","metadata":{"order_id":"order1"},"mode":"payment","currency":"usd","amount_total":2000,"payment_status":"paid"}}});
     for eid in ["evt_one", "evt_one", "evt_two"] {
         event["id"] = eid.into();
@@ -1067,15 +1076,18 @@ async fn payment_webhook_uses_snapshot_and_grants_only_once() {
         .await
         .unwrap();
     assert_eq!(n, 1);
+    // The order's snapshot (two months, $25 monthly quota) applies, not the
+    // plan's current terms.
     let days = (v["account"]["subscription"]["expires_at"].as_i64().unwrap() - db::now()) / 86400;
-    assert!((39..=40).contains(&days));
+    assert!((58..=62).contains(&days), "{days}");
+    assert_eq!(v["account"]["subscription"]["monthly_quota_usd"], "25");
 }
 #[tokio::test]
 async fn payment_amount_mismatch_rolls_back_event_and_credit() {
     let t = Test::new().await;
     let k = t.key().await;
     t.app.config_mut().await.stripe.webhook_secret = "whsec_test".into();
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order1',?,'monthly','stripe',20000000,20000000,30,'cs_test',?)").bind(k["account_id"].as_str()).bind(db::now()).execute(&t.app.db).await.unwrap();
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,months,external_id,created_at) VALUES('order1',?,'monthly','stripe','subscription',20000000,20000000,1,'cs_test',?)").bind(k["account_id"].as_str()).bind(db::now()).execute(&t.app.db).await.unwrap();
     let event=json!({"id":"evt_bad","type":"checkout.session.completed","data":{"object":{"id":"cs_test","client_reference_id":"order1","metadata":{"order_id":"order1"},"mode":"payment","currency":"usd","amount_total":1,"payment_status":"paid"}}}).to_string();
     let mut h = HeaderMap::new();
     h.insert(
@@ -1178,6 +1190,31 @@ fn starter_config_documents_every_option_and_validates() {
         "checkouts_per_hour",
         "redeem_failures_per_hour",
         "challenges_per_minute",
+        "new_account_hours",
+        "adaptive_pow",
+        "pow_max_number_ceiling",
+        "adaptive_pow_reset_minutes",
+        "new_account_daily_spend_pct",
+        // Billing holds and refunds, App Store, Google Play
+        "billing",
+        "default_max_output_tokens",
+        "min_hold_usd",
+        "refund_ip_block_days",
+        "refund_decline_pct",
+        "apple",
+        "bundle_id",
+        "app_apple_id",
+        "environment",
+        "issuer_id",
+        "key_id",
+        "private_key",
+        "consumption_reporting",
+        "google",
+        "package_name",
+        "service_account_json",
+        "pubsub_service_account",
+        "pubsub_audience",
+        "refund_review",
         "max_media_bytes",
         "trust_proxy",
         "cors_origin",

@@ -1,6 +1,6 @@
 [package]
 name = "reseller"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Self-hosted OpenAI-compatible API reseller: streaming proxy, images, metering, card and crypto billing, white-label dashboards"
@@ -14,6 +14,7 @@ include = ["src/**", "assets/**", "reseller.example.toml", "migrations/**", "Car
 [dependencies]
 anyhow = "1.0.105"
 async-stream = "0.3.6"
+aws-lc-rs = "1.19.0"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 bytes = "1.12.2"
@@ -40,8 +41,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.9"
 uuid = { version = "1.29.3", features = ["v4"] }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
 

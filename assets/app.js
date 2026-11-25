@@ -86,44 +86,48 @@ const percent = (part, whole) => whole > 0 ? `${((part / whole) * 100).toFixed(1
 /* Plan maths ---------------------------------------------------------------------
    Everything shown about a plan is derived from the API values (price, credit,
    duration), so operators can change the catalog without touching this file. */
-const MONTH_DAYS = 30.4;
 // Whole dollars drop the cents ($12), other amounts keep two ($16.67).
 const usdShort = n => {
   const r = Math.round(Number(n) * 100) / 100;
   return `$${Number.isInteger(r) ? r.toLocaleString() : r.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
+// Subscriptions have a monthly quota that resets; top-ups are extra usage that never expires.
 function planInfo(p) {
-  const price = Number(p.price_usd), credit = Number(p.credit_usd || 0);
-  const months = Math.max(1, Math.round(Number(p.duration_days) / MONTH_DAYS));
+  const price = Number(p.price_usd);
+  const topup = p.kind === 'topup';
+  const months = topup ? 0 : Math.max(1, Number(p.months) || 1);
+  const quota = topup ? 0 : Number(p.monthly_quota_usd || 0);
+  const credit = topup ? Number(p.credit_usd || 0) : 0;
   return {
-    price, credit, months, days: Number(p.duration_days),
-    perMonth: price / months,
-    creditPerMonth: credit / months,
-    bonus: credit > price ? credit - price : 0,
-    ratio: price > 0 ? credit / price : 0,
+    price, topup, months, quota, credit,
+    perMonth: topup ? price : price / months,
+    ratio: price > 0 ? (topup ? credit / price : (quota * months) / price) : 0,
   };
 }
-const billedLine = i => i.price <= 0 ? 'No charge' : `${usdShort(i.price)} one-time · ${i.months === 1 ? '1 month' : `${i.months} months`}`;
+const monthsLabel = n => n === 1 ? '1 month' : `${n} months`;
+const billedLine = i => i.topup ? `${usdShort(i.price)} one-time` : i.price <= 0 ? 'No charge' : `${usdShort(i.price)} for ${monthsLabel(i.months)}`;
 const perMonthLabel = i => i.price <= 0 ? 'Free' : usdShort(i.perMonth);
-// Best value: most credit per dollar paid, ties go to the longest plan. Shown only
-// when plans actually differ. "Most flexible" marks the one-month plan.
+const planTitle = p => p.kind === 'topup' ? `${p.name}: ${usdShort(p.credit_usd)} never expires` : `${p.name}: ${usdShort(p.monthly_quota_usd)}/month quota for ${monthsLabel(Math.max(1, Number(p.months) || 1))}`;
+// Best value: most usage per dollar paid, ties go to the longest plan. Shown only
+// when subscriptions actually differ. "Most flexible" marks the one-month plan.
 function planBadges(plans) {
   const badges = new Map();
-  if (plans.length < 2) return badges;
+  const subs = plans.filter(p => p.kind !== 'topup');
+  if (subs.length < 2) return badges;
   const key = p => Math.round(planInfo(p).ratio * 1e6);
-  const ranked = plans.slice().sort((a, b) => key(b) - key(a) || b.duration_days - a.duration_days);
+  const ranked = subs.slice().sort((a, b) => key(b) - key(a) || b.months - a.months);
   if (key(ranked[0]) > key(ranked[ranked.length - 1])) badges.set(ranked[0].code, 'Best value');
-  const monthly = plans.find(p => planInfo(p).months === 1 && !badges.has(p.code));
+  const monthly = subs.find(p => planInfo(p).months === 1 && !badges.has(p.code));
   if (monthly) badges.set(monthly.code, 'Most flexible');
   return badges;
 }
 const bestCode = plans => [...planBadges(plans)].find(([, label]) => label === 'Best value')?.[0];
-const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', confirmed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', late: 'warn', pending: 'info', redeemed: 'info', seen: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger', 'used up': 'muted' }));
-const METHOD_LABELS = { stripe: 'Card', crypto: 'Crypto' };
+const TONES = new Map(Object.entries({ active: 'ok', paid: 'ok', available: 'ok', completed: 'ok', confirmed: 'ok', blocked: 'warn', suspended: 'warn', expired: 'warn', late: 'warn', pending: 'info', redeemed: 'info', seen: 'info', revoked: 'danger', failed: 'danger', cancelled: 'danger', 'used up': 'muted', refunded: 'warn' }));
+const METHOD_LABELS = { stripe: 'Card', crypto: 'Crypto', app_store: 'App Store', google_play: 'Google Play' };
 const methodLabel = m => METHOD_LABELS[m] || m;
 const KIND_LABELS = { llm: 'Text', tts: 'Speech', stt: 'Transcription', image: 'Image' };
 const kindLabel = k => KIND_LABELS[k] || k || '-';
-const SOURCE_LABELS = { free: 'Trial credit', purchase: 'Purchase', admin: 'Operator grant', refund: 'Refund', subscription: 'Plan credit' };
+const SOURCE_LABELS = { free: 'Trial credit', purchase: 'Purchase', admin: 'Operator grant', refund: 'Refund', subscription: 'Plan quota', topup: 'Top-up' };
 const sourceLabel = s => SOURCE_LABELS[s] || s;
 const pill = (value, tone) => `<span class="pill tone-${tone || TONES.get(String(value).toLowerCase()) || 'muted'}">${esc(value)}</span>`;
 const requestPill = r => !r.finished ? pill('In progress', 'info') : r.status >= 400 ? pill(r.status, 'danger') : pill(r.status, 'ok');
@@ -237,6 +241,7 @@ const ERROR_HINTS = {
   pow_invalid: 'Human verification failed. Please try again.',
   pow_replayed: 'That verification was already used. Please try again.',
   signup_disabled: 'Self-service signup is currently disabled.',
+  product_id_in_use: 'That store product ID is already used by another plan.',
 };
 function apiError(r, v) {
   const code = v?.error?.code || v?.error?.type || '';
@@ -283,6 +288,7 @@ async function api(path, method = 'GET', data, options = {}) {
   const credential = options.token ?? token;
   if (credential) headers[admin ? 'x-admin-token' : 'authorization'] = admin ? credential : `Bearer ${credential}`;
   if (data !== undefined) headers['content-type'] = 'application/json';
+  Object.assign(headers, options.headers);
   const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data), signal: options.signal });
   // Proxies and crashes can return non-JSON bodies. Surface the status instead of a parse error.
   const v = await r.json().catch(() => null);
@@ -534,28 +540,29 @@ function planCard(p, badges, cta) {
   const i = planInfo(p);
   const badge = badges.get(p.code);
   const featured = badge === 'Best value';
-  return `<article class="card plan-card${featured ? ' featured' : ''}" aria-label="${esc(p.name)} plan">
+  return `<article class="card plan-card${featured ? ' featured' : ''}" aria-label="${esc(p.name)} ${p.kind === 'topup' ? 'top-up' : 'plan'}">
     <div class="plan-top"><h3 class="plan-name">${esc(p.name)}</h3>${badge ? `<span class="plan-flag${featured ? '' : ' soft'}">${esc(badge)}</span>` : ''}</div>
-    <div class="plan-price"><span class="plan-amount">${esc(perMonthLabel(i))}</span>${i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
+    <div class="plan-price"><span class="plan-amount">${esc(i.topup ? usdShort(i.price) : perMonthLabel(i))}</span>${!i.topup && i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
     <div class="plan-billed">${esc(billedLine(i))}</div>
-    ${i.credit ? `<ul class="plan-features">
-      <li>${CHECK}<span><strong>${esc(usdShort(i.credit))} API credit</strong>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}</span></li>
-      <li>${CHECK}<span>&asymp; ${esc(usdShort(i.creditPerMonth))} of usage per month</span></li>
-      <li>${CHECK}<span>Credit valid for ${esc(plural(i.days, 'day'))}</span></li>
-    </ul>` : '<ul class="plan-features"></ul>'}
-    <p class="plan-desc">${esc(p.description || 'Prepaid API credit.')}</p>
-    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/#billing/add">Choose plan</a>`}</div>
+    <ul class="plan-features">${i.topup
+      ? `<li>${CHECK}<span><strong>${esc(usdShort(i.credit))} extra usage</strong></span></li>
+      <li>${CHECK}<span>Never expires, carries over</span></li>
+      <li>${CHECK}<span>Used after your monthly quota</span></li>`
+      : `<li>${CHECK}<span><strong>${esc(usdShort(i.quota))} of usage per month</strong></span></li>
+      <li>${CHECK}<span>Quota resets every month</span></li>
+      <li>${CHECK}<span>${esc(monthsLabel(i.months))} prepaid, no auto-renewal</span></li>`}</ul>
+    <p class="plan-desc">${esc(p.description || (i.topup ? 'Extra usage that never expires.' : 'Monthly usage quota.'))}</p>
+    <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/#billing/add">${p.kind === 'topup' ? 'Add top-up' : 'Choose plan'}</a>`}</div>
   </article>`;
 }
 function planFaq(plans, methods) {
-  const terms = plans.map(p => `${p.name}: ${plural(p.duration_days, 'day')}`).join('; ');
   const faq = [
-    ['What is API credit?', `Credit is a prepaid USD balance. Each request is priced from its usage (tokens, characters, audio seconds, or images) and deducted from it. Every key on your account shares the balance.`],
-    ['What happens when my credit runs out?', 'Requests stop with a 429 insufficient_quota error that explains how to top up. Buy another plan, redeem a credit code, or add funds, and calls work again right away.'],
-    ['When does my credit expire?', `Plan credit expires when its plan ends (${terms}). Credit that expires soonest is spent first, so nothing is lost while you still have time left.`],
-    ['Can I pay as I go?', methods.includes('crypto')
-      ? 'Yes. Open Billing in your workspace and send stablecoins to your personal deposit address. Any amount is credited 1:1 in USD, with no plan needed.'
-      : 'Plans are prepaid packages. Ask the operator for a credit code to add a custom amount.'],
+    ['How does the monthly quota work?', 'A plan gives you a quota of usage each month. Each request is priced from its usage (tokens, characters, audio seconds, or images) and counted against the quota. The quota resets every month and unused quota does not carry over. Every key on your account shares it.'],
+    ['What happens when my quota runs out?', 'Requests stop with a 402 insufficient_quota error that explains your options. Add a top-up, redeem a code, or wait for the quota to reset, and calls work again right away.'],
+    ['Do top-ups expire?', 'No. A top-up is extra usage that never expires and carries over. Your monthly quota is used first, then your top-up balance.'],
+    ['Can I add usage without a plan?', methods.includes('crypto')
+      ? 'Yes. Buy a top-up, or open Billing in your workspace and send stablecoins to your personal deposit address. Any amount is added 1:1 in USD as usage that never expires.'
+      : 'Buy a top-up, or ask the operator for a code to add a custom amount.'],
   ];
   return `<div class="faq" role="list">${faq.map(([q, a]) => `<details role="listitem"><summary>${esc(q)}</summary><p>${esc(a)}</p></details>`).join('')}</div>`;
 }
@@ -566,10 +573,10 @@ function pricingSection(plans, methods = [], cta) {
   const badges = planBadges(plans);
   const paid = methodNames(methods);
   const assurances = [
-    'Credit stays valid until the plan ends',
-    paid.length ? `Pay by ${paid.join(' or ')}` : 'Redeem a credit code from the operator',
-    'One-time purchase, no auto-renewal',
-    'Usage-based: each request is deducted from credit',
+    'Monthly quota resets each month',
+    paid.length ? `Pay by ${paid.join(' or ')}` : 'Redeem a code from the operator',
+    'Card and crypto plans are prepaid and do not auto-renew',
+    'Top-ups never expire and are used after the quota',
   ];
   return `<div class="plans pricing" data-count="${plans.length}">${plans.map(p => planCard(p, badges, cta?.(p))).join('')}</div>
     <ul class="assurance">${assurances.map(a => `<li>${CHECK}${esc(a)}</li>`).join('')}</ul>
@@ -577,22 +584,23 @@ function pricingSection(plans, methods = [], cta) {
 }
 
 /* Checkout ---------------------------------------------------------------------
-   Choose plan -> Pay -> Credit added, in one dialog. Card payments hand off to
+   Choose plan -> Pay -> Plan active, in one dialog. Card payments hand off to
    Stripe. Crypto orders stay in the dialog and update while it is open. */
 let planCatalog = { plans: [], methods: [] };
-const expiryText = (i, paidAt) => paidAt
-  ? `Valid until ${day(paidAt + i.days * DAY, { dateStyle: 'medium' })}`
-  : `${plural(i.days, 'day')} from payment, until ${day(nowSeconds() + i.days * DAY, { dateStyle: 'medium' })}`;
 const tip = text => `<button type="button" class="tip" data-tip="${esc(text)}" aria-label="${esc(text)}">i</button>`;
 // Compact plan facts shared by checkout and the payment dialog.
 function planFacts(p, { paidAt } = {}) {
   const i = planInfo(p);
-  return facts([
+  return facts(i.topup ? [
+    ['Top-up', `<strong>${esc(p.name || p.code)}</strong>`],
+    ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">one-time</span>`],
+    ['Extra usage', `<strong>${esc(usdShort(i.credit))}</strong> <span class="muted">never expires</span>`],
+  ] : [
     ['Plan', `<strong>${esc(p.name || p.code)}</strong>`],
     ['Per month', esc(perMonthLabel(i))],
-    ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">${esc(i.months === 1 ? '1 month' : `${i.months} months`)}, one-time</span>`],
-    i.credit ? ['API credit', `<strong>${esc(usdShort(i.credit))}</strong>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}`] : null,
-    ['Credit validity', esc(expiryText(i, paidAt))],
+    ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">${esc(monthsLabel(i.months))}, prepaid</span>`],
+    ['Monthly quota', `<strong>${esc(usdShort(i.quota))}</strong> <span class="muted">resets each month</span>`],
+    ['Term', esc(`${monthsLabel(i.months)}, until ${day((paidAt || nowSeconds()) + i.months * 30.4 * DAY, { dateStyle: 'medium' })}`)],
   ]);
 }
 const METHOD_INFO = {
@@ -600,21 +608,21 @@ const METHOD_INFO = {
   crypto: ['Crypto', 'USDC, USDT or native coins'],
 };
 function checkout(plan, methods) {
-  if (!methods.length) return notice('Online payments are not enabled. Use a credit code.', true);
+  if (!methods.length) return notice('Online payments are not enabled. Use a code.', true);
   const i = planInfo(plan);
   modal(`Checkout`, `<div data-pay>
     <form class="checkout">
       <div class="co-plan">
-        <div><div class="label">Plan</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${esc(perMonthLabel(i))}${i.price > 0 ? ' per month' : ''} &middot; ${esc(i.months === 1 ? '1 month' : `${i.months} months`)}</div></div>
+        <div><div class="label">Plan</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${i.topup ? 'Top-up, never expires' : `${esc(perMonthLabel(i))}${i.price > 0 ? ' per month' : ''} &middot; ${esc(monthsLabel(i.months))}`}</div></div>
         <div class="co-total"><div class="label">Total</div><div class="co-price">${esc(usdShort(i.price))}</div></div>
       </div>
-      ${i.credit ? `<div class="co-credit"><span>You get <strong>${esc(usdShort(i.credit))}</strong> API credit</span>${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}</div>` : ''}
+      <div class="co-credit">${i.topup ? `<span>You get <strong>${esc(usdShort(i.credit))}</strong> of extra usage that never expires</span>` : `<span>You get <strong>${esc(usdShort(i.quota))}</strong> of usage every month</span>`}</div>
       <fieldset class="method-choice"><legend>Pay with</legend>
         ${methods.map((m, n) => `<label class="method"><input type="radio" name="method" value="${esc(m)}"${n === 0 ? ' checked' : ''}><span class="method-body"><strong>${esc(METHOD_INFO[m]?.[0] || m)}</strong><span class="hint">${esc(METHOD_INFO[m]?.[1] || '')}</span></span></label>`).join('')}
       </fieldset>
-      <details class="more"><summary>Plan details</summary>
+      <details class="more"><summary>Details</summary>
         ${planFacts(plan)}
-        <p class="hint">One-time purchase, it does not renew. Credit goes to the balance shared by all your keys.</p>
+        <p class="hint">${i.topup ? 'Top-ups never expire. The monthly quota is used first, then your top-up balance.' : 'Prepaid for the whole term, it does not auto-renew. The quota is shared by all your keys.'}</p>
       </details>
       <div class="actions sticky-actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary" data-submit>Continue</button></div>
     </form>
@@ -829,6 +837,7 @@ function keyForm() {
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
       <p class="field-help">${signedIn ? 'The new key shares your account balance.' : 'New accounts receive evaluation credit. Additional keys share the same balance.'}</p>
+      ${signedIn ? '' : '<label class="inline check-line"><input type="checkbox" name="consumption_consent"> Share usage data with Apple when I request a refund</label>'}
       <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
       <div class="actions"><button class="primary" type="submit">Create key</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
@@ -841,7 +850,7 @@ function keyForm() {
       if (signedIn) v = await api('/v1/keys', 'POST', b);
       else {
         pow.hidden = false;
-        v = await signup(b, p => { bar.value = Math.round(p * 100); }, ctl.signal);
+        v = await signup({ name: b.name, contact: b.contact, consumption_consent: b.consumption_consent === 'on' }, p => { bar.value = Math.round(p * 100); }, ctl.signal);
       }
     } finally {
       pow.hidden = true;
@@ -1007,7 +1016,6 @@ function manageAccount(aid) {
     const credits = v.credits || [];
     const series = v.usage?.series || [];
     const t = seriesTotals(series);
-    const activeLots = credits.filter(c => lotState(c) === 'active');
     return `
       <div class="entity-head">
         <div class="entity-title"><h3>${esc(a.contact || 'No contact')}</h3>${pill(a.status)}</div>
@@ -1015,10 +1023,10 @@ function manageAccount(aid) {
         ${a.note ? `<p class="entity-note">${esc(a.note)}</p>` : ''}
       </div>
       <div class="tiles">
-        ${metric('Balance', usd(a.balance_usd), isPositive(a.debt_usd) ? `Debt ${esc(usd(a.debt_usd))} settles from the next top-up` : `${esc(plural(activeLots.length, 'active credit lot'))}`, { tone: isPositive(a.debt_usd) ? 'warn' : '' })}
+        ${metric('Balance', usd(a.balance_usd), isPositive(a.debt_usd) ? `Debt ${esc(usd(a.debt_usd))} settles from the next top-up` : `${esc(usd(a.topup_remaining_usd))} top-up, ${esc(usd(a.quota_remaining_usd))} quota left`, { tone: isPositive(a.debt_usd) ? 'warn' : '' })}
         ${metric('Spent, all time', usd(a.billed_usd))}
         ${metric('Last 30 days', usd(t.cost), esc(`${plural(t.requests, 'request')}, ${count(t.tokens)} tokens`))}
-        ${metric('Plan', sub ? sub.plan_code : 'None', sub ? `Until ${esc(date(sub.expires_at))}` : 'No active plan')}
+        ${metric('Plan', sub ? sub.plan_code : 'None', sub ? `${esc(usd(sub.quota_remaining_usd))} of ${esc(usd(sub.monthly_quota_usd))} quota left, ${sub.auto_renew ? 'renews' : 'ends'} ${esc(date(sub.expires_at))}` : 'No active plan')}
       </div>
       <div class="quick-links">
         ${goButton('Requests', 'requests', { account: a.id })}
@@ -1031,7 +1039,7 @@ function manageAccount(aid) {
         <button type="button" class="small" data-edit>Edit</button>
         ${a.status === 'active' ? '<button type="button" class="danger small" data-suspend>Suspend</button>' : '<button type="button" class="small" data-activate>Reactivate</button>'}
       </div>
-      ${a.status === 'suspended' ? '<p class="callout warn">Suspended: its keys cannot call the API and workspace sign-in is blocked. Its credit is not counted as outstanding.</p>' : ''}
+      ${a.status === 'suspended' ? `<p class="callout warn">Suspended: its keys cannot call the API and workspace sign-in is blocked.${a.suspended_reason === 'refund' ? ' It was suspended after a store refund.' : ''} Its credit is not counted as outstanding.</p>` : ''}
       <section class="detail-section">${chart(series, { compact: true })}</section>
       <section class="detail-section">
         <div class="section-head"><h4>Keys by spend</h4><span class="hint">${count(keyTotal)} total</span></div>
@@ -1046,7 +1054,7 @@ function manageAccount(aid) {
       </section>
       ${series.length ? `<section class="detail-section"><h4>Spend by model, last 30 days</h4>${modelTable(series, { upstream: true })}</section>` : ''}
       <section class="detail-section">
-        <div class="section-head"><h4>Credit lots</h4><span class="hint">Spent soonest-expiring first</span></div>
+        <div class="section-head"><h4>Usage ledger</h4><span class="hint">Monthly quota is used first, then top-ups</span></div>
         ${creditTable(credits)}
       </section>
       <section class="detail-section"><h4>Settings</h4>${facts([
@@ -1089,10 +1097,13 @@ function creditTable(credits) {
     ['Remaining', c => `<span class="num">${esc(usd(c.remaining_usd))}</span>`, 'end'],
     ['State', c => pill(lotState(c))],
     ['Expires', c => c.expires_at ? esc(date(c.expires_at)) : '<span class="muted">Never</span>'],
-  ], credits, { empty: ['No credit yet', 'Credit lots appear after a top-up, plan, or grant.'] });
+    ['Note', c => c.note ? esc(c.note) : DASH, 'wrap'],
+  ], credits, { empty: ['No credit yet', 'Entries appear after a plan, top-up, or grant.'] });
 }
 
 function creditForm(aid, done) {
+  // One key per opened form: retries after a network error replay instead of double-crediting.
+  const idempotencyKey = crypto.randomUUID();
   modal('Add credit', `
     <form>
       <div class="form-grid">
@@ -1113,9 +1124,9 @@ function creditForm(aid, done) {
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     const payload = { amount_usd: b.amount_usd, source: b.source, note: b.note };
     if (b.expires_at) payload.expires_at = toUnix(b.expires_at);
-    await api(endpoint(`accounts/${aid}/credits`), 'POST', payload);
+    const v = await api(endpoint(`accounts/${aid}/credits`), 'POST', payload, { headers: { 'idempotency-key': idempotencyKey } });
     d.close();
-    notice('Credit added');
+    notice(v.credit?.replayed ? 'Already applied' : 'Credit added');
     done?.();
   }));
 }
@@ -1132,18 +1143,19 @@ async function grantForm(aid, done) {
     notice('No active plans to grant', true);
     return;
   }
+  const idempotencyKey = crypto.randomUUID();
   modal('Grant plan', `
     <form>
       <label for="grant-plan">Plan</label>
       <select id="grant-plan" name="plan_code" required>
-        ${plans.map(p => `<option value="${esc(p.code)}">${esc(p.name)}: ${esc(usd(p.credit_usd))} credit, ${count(p.duration_days)} days</option>`).join('')}
+        ${plans.map(p => `<option value="${esc(p.code)}">${esc(planTitle(p))}</option>`).join('')}
       </select>
-      <p class="field-help">Grants the plan's credit immediately. Existing subscriptions are not extended or renewed.</p>
+      <p class="field-help">Starts the plan or adds the top-up immediately.</p>
       <div class="actions"><button class="primary" type="submit">Grant plan</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
-    await api(endpoint(`accounts/${aid}/subscriptions`), 'POST', { plan_code: b.plan_code });
+    const v = await api(endpoint(`accounts/${aid}/subscriptions`), 'POST', { plan_code: b.plan_code }, { headers: { 'idempotency-key': idempotencyKey } });
     d.close();
-    notice('Plan granted');
+    notice(v.grant?.replayed ? 'Already applied' : 'Plan granted');
     done?.();
   }));
 }
@@ -1413,7 +1425,11 @@ const ENDPOINT_DOCS = [
   ['GET', '/v1/models/<id>', 'One model.'],
 ];
 const ACCOUNT_DOCS = [
-  ['GET', '/v1/account', 'Balance, debt, plan, credit lots, and top-up instructions.'],
+  ['GET', '/v1/account', 'Balance, monthly quota left, top-up balance, subscriptions, debt, and top-up instructions.'],
+  ['PATCH', '/v1/account', 'Update settings. Body {"consumption_consent": true|false} (share usage data with Apple on refund requests).'],
+  ['GET', '/v1/account/store', 'App account token and store products for in-app purchases.'],
+  ['POST', '/v1/account/store/apple', 'Verify an App Store purchase. Body {"signed_transaction"} or {"transaction_id"}.'],
+  ['POST', '/v1/account/store/google', 'Verify a Google Play purchase. Body {"product_id", "purchase_token"}.'],
   ['GET', '/v1/account/models', 'Models of the signed-in key. Also works with a dashboard token.'],
   ['GET', '/v1/account/usage?days=30', 'Daily usage per model (1 to 365 days). Add key=<id> for one key.'],
   ['GET', '/v1/account/requests?limit=20', 'Request history. Filters: key, model, kind, status (2xx, 4xx, 5xx).'],
@@ -1424,7 +1440,7 @@ const ACCOUNT_DOCS = [
   ['POST', '/v1/keys/<id>/rotate', 'Replace the secret. The old key stops working.'],
   ['POST', '/v1/account/redeem', 'Redeem a credit code. Body {"code"}.'],
   ['GET', '/v1/plans', 'Public plan catalog and enabled payment methods. No credential needed.'],
-  ['POST', '/v1/account/checkout', 'Start a card or crypto purchase. Body {"plan_code", "method"}.'],
+  ['POST', '/v1/account/checkout', 'Buy a plan or top-up by card or crypto. Body {"plan_code","method"}.'],
   ['GET', '/v1/account/payments', 'Your orders. Add /<id> for one order.'],
   ['GET', '/v1/account/apps', 'OAuth apps connected to your account.'],
   ['DELETE', '/v1/account/apps/<id>', 'Disconnect an app. Its access stops at once.'],
@@ -1437,7 +1453,7 @@ const ERROR_DOCS = [
   ['403', 'permission_error', 'account_suspended', 'The operator suspended the account.'],
   ['404', 'invalid_request_error', 'model_not_found', 'The model does not exist or the key may not use it.'],
   ['404', 'invalid_request_error', 'unknown_url', 'The path is not an API route.'],
-  ['429', 'insufficient_quota', 'insufficient_quota', 'The balance is empty. The message explains how to top up.'],
+  ['402', 'insufficient_quota', 'insufficient_quota', 'The monthly quota and top-up balance are used up. The message explains how to add usage.'],
   ['429', 'rate_limit_error', 'rate_limit_exceeded, request_limit_exceeded, token_limit_exceeded, spend_limit_exceeded, concurrency_limit_exceeded', 'A key or account limit was reached. Wait for Retry-After seconds.'],
   ['502, 504', 'server_error', 'upstream_error', 'The model provider failed or timed out. Nothing is billed for failed requests without usage.'],
 ];
@@ -1447,7 +1463,7 @@ const MCP_TOOL_DOCS = [
   ['transcribe_audio', 'API key', 'Transcribe audio to text.'],
   ['generate_image', 'API key', 'Generate images from a prompt.'],
   ['list_models', 'API key', 'Models the key may use.'],
-  ['account_overview', 'API key or token', 'Balance, debt, plan, and credit lots.'],
+  ['account_overview', 'API key or token', 'Balance, quota left, top-ups, and subscriptions.'],
   ['usage_summary', 'API key or token', 'Spending and tokens over the last N days.'],
   ['list_requests', 'API key or token', 'Request history with billed cost.'],
   ['list_keys', 'API key or token', 'Key names and prefixes, never secrets.'],
@@ -1455,7 +1471,7 @@ const MCP_TOOL_DOCS = [
   ['rotate_key', 'API key or token', 'Replace a key with a new secret.'],
   ['block_key', 'API key or token', 'Block a key.'],
   ['redeem_code', 'API key or token', 'Redeem a single-use credit code.'],
-  ['start_checkout', 'API key or token', 'Start a card or crypto purchase.'],
+  ['start_checkout', 'API key or token', 'Buy a plan or top-up by card or crypto.'],
   ['list_plans', 'None', 'The public plan catalog.'],
   ['signup_challenge', 'None', 'Get a proof-of-work challenge for a new account.'],
   ['create_account', 'None', 'Create an account from a solved challenge.'],
@@ -1624,11 +1640,11 @@ async function docs() {
         <section id="billing" class="doc-section">
           <h2>Billing and balance</h2>
           <ul class="doc-list">
-            <li>Usage is prepaid. Each request is priced from its reported usage (tokens, characters, audio seconds, or images) and deducted from the account balance.</li>
-            <li>Credit comes from plans, credit codes, card or crypto payments, and the trial grant. Credit that expires soonest is spent first.</li>
+            <li>Each request is priced from its reported usage (tokens, characters, audio seconds, or images) and counted against your monthly quota.</li>
+            <li>A plan gives a monthly quota that resets each month. Top-ups, codes, and the trial grant add usage on top. The quota is used first, then top-ups, which never expire.</li>
             <li>A request that runs past the remaining balance completes. The difference is recorded as debt and settled from the next top-up.</li>
-            <li>When the balance is empty, calls return <code>429 insufficient_quota</code> with top-up steps in the message.</li>
-            <li>Every charge is listed per request in the workspace under Requests, and <code>GET /v1/account</code> returns the balance.</li>
+            <li>When the quota and top-ups are used up, calls return <code>402 insufficient_quota</code> with next steps in the message.</li>
+            <li>Every charge is listed per request in the workspace under Requests, and <code>GET /v1/account</code> returns the quota and balance.</li>
           </ul>
         </section>
 
@@ -1753,15 +1769,15 @@ async function landing() {
     </section>
     <section class="section">
       <div class="row">
-        <div><div class="eyebrow">ROOM TO BUILD</div><h2>Choose your credit plan</h2></div>
-        <span class="muted">Simple, prepaid access.</span>
+        <div><div class="eyebrow">ROOM TO BUILD</div><h2>Choose your plan</h2></div>
+        <span class="muted">A monthly quota of usage.</span>
       </div>
       <div class="section" id="plans" aria-busy="true">${plansSkeleton()}</div>
     </section>
     <section class="steps section">
       <div class="card step"><div class="eyebrow">01 / CONNECT ONCE</div><p>Use your existing OpenAI SDK. Change the base URL and API key.</p></div>
       <div class="card step"><div class="eyebrow">02 / SEE EVERY REQUEST</div><p>Track tokens, request history, and spending in your workspace.</p></div>
-      <div class="card step"><div class="eyebrow">03 / STAY IN CONTROL</div><p>Rotate keys, add credit, and keep your applications running.</p></div>
+      <div class="card step"><div class="eyebrow">03 / STAY IN CONTROL</div><p>Rotate keys, add a top-up, and keep your applications running.</p></div>
     </section>`;
   document.querySelector('#create').onclick = keyForm;
   wireDocs(main);
@@ -1928,7 +1944,7 @@ const views = {
           ${metric('API revenue', usd(v.billed_cost_usd), `${esc(count(v.requests))} requests, ${esc(count(v.tokens))} tokens`)}
           ${metric('Upstream cost', usd(v.upstream_cost_usd), 'Paid to model providers')}
           ${metric('Gross margin', usd(v.margin_usd), `${percent(Number(v.margin_usd), billed)} of revenue`)}
-          ${metric('Outstanding credit', usd(v.outstanding_usd), isPositive(v.suspended_credit_usd) ? `Spendable by active accounts. ${esc(usd(v.suspended_credit_usd))} more is held by suspended accounts.` : 'Unexpired credit active accounts can spend')}
+          ${metric('Outstanding credit', usd(v.outstanding_usd), isPositive(v.suspended_credit_usd) ? `Spendable by active accounts. ${esc(usd(v.suspended_credit_usd))} more is held by suspended accounts.` : 'Unexpired usage active accounts can spend')}
         </div>
         <div class="card">
           <div class="card-head"><h3>Usage</h3>${goButton('Request log', 'requests')}</div>
@@ -1958,21 +1974,20 @@ const views = {
     const a = v.account;
     const sub = a.subscription;
     const t = seriesTotals(u.series);
-    const activeLots = v.credits.filter(c => lotState(c) === 'active');
     const empty = !isPositive(a.balance_usd);
     return `<div class="banner${empty ? ' warn' : ''}">
         <div>
-          <div class="label">Available balance</div>
+          <div class="label">Available usage</div>
           <div class="metric">${esc(usd(a.balance_usd))}</div>
-          <div class="hint">${isPositive(a.debt_usd) ? `Outstanding debt ${esc(usd(a.debt_usd))} settles from the next top-up.` : empty ? 'API calls are refused until you add credit.' : 'Shared by every key on this account.'}</div>
+          <div class="hint">${isPositive(a.debt_usd) ? `Outstanding debt ${esc(usd(a.debt_usd))} settles from the next top-up.` : empty ? 'API calls are refused until you get a plan or top-up.' : `${esc(usd(a.quota_remaining_usd))} monthly quota and ${esc(usd(a.topup_remaining_usd))} top-ups, shared by every key.`}</div>
         </div>
-        <div class="actions">${goButton('Add credit', 'billing', { sub: 'add' }, empty ? 'primary' : 'ghost')}<button type="button" class="${empty ? 'ghost' : 'primary'}" data-create>Create key</button></div>
+        <div class="actions">${goButton('Add usage', 'billing', { sub: 'add' }, empty ? 'primary' : 'ghost')}<button type="button" class="${empty ? 'ghost' : 'primary'}" data-create>Create key</button></div>
       </div>
       <div class="stats">
         ${metric('Spent, all time', usd(a.billed_usd))}
         ${metric('Last 30 days', usd(t.cost), esc(`${plural(t.requests, 'request')}, ${count(t.tokens)} tokens`))}
-        ${metric('Plan', sub ? sub.plan_code : 'None', sub ? `Until ${esc(date(sub.expires_at))}` : 'Pay as you go')}
-        ${metric('Active credit lots', count(activeLots.length), 'Soonest-expiring credit is spent first')}
+        ${metric('Plan', sub ? sub.plan_name || sub.plan_code : 'None', sub ? `${esc(usd(sub.quota_remaining_usd))} of ${esc(usd(sub.monthly_quota_usd))} quota left${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}` : 'No active plan')}
+        ${metric('Top-up balance', usd(a.topup_remaining_usd), 'Never expires, used after the quota')}
       </div>
       <div class="card">
         <div class="card-head"><h3>Your usage</h3>${goButton('Usage details', 'usage')}</div>
@@ -2075,16 +2090,19 @@ const views = {
   },
   async plans(signal) {
     const v = await get(endpoint('plans'), signal);
+    adminPlans = v.plans;
     const best = bestCode(v.plans.filter(p => p.active));
     return `${pageHead('Plans', 'Deactivate a plan to hide it from customers. Plans referenced by subscriptions, payments, or redeem codes cannot be deleted, only retired.', '<button type="button" class="primary" data-plan>Create plan</button>')}
       ${table([
         ['Plan', r => `<strong>${esc(r.name)}</strong><div class="hint"><code>${esc(r.code)}</code></div>`, 'wrap'],
         ['Price', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
-        ['Credit', r => `<span class="num">${esc(usd(r.credit_usd))}</span>`, 'end'],
-        ['Days', r => `<span class="num">${count(r.duration_days)}</span>`, 'end'],
+        ['Kind', r => pill(r.kind === 'topup' ? 'top-up' : 'subscription', r.kind === 'topup' ? 'info' : 'muted')],
+        ['Quota / credit', r => r.kind === 'topup' ? `<span class="num">${esc(usd(r.credit_usd))}</span><div class="hint">never expires</div>` : `<span class="num">${esc(usd(r.monthly_quota_usd))}</span><div class="hint">per month</div>`, 'end'],
+        ['Months', r => r.kind === 'topup' ? DASH : `<span class="num">${count(r.months)}</span>`, 'end'],
+        ['Store products', r => r.apple_product_id || r.google_product_id ? `${r.apple_product_id ? `<div class="hint">Apple <code>${esc(r.apple_product_id)}</code></div>` : ''}${r.google_product_id ? `<div class="hint">Google <code>${esc(r.google_product_id)}</code></div>` : ''}` : '<span class="muted">-</span>', 'wrap'],
         ['Status', r => r.active ? pill(r.code === best ? 'best value' : 'active', 'ok') : pill('inactive', 'muted')],
         ['', r => `<div class="actions">
-          <button type="button" class="small" data-edit-plan="${esc(r.code)}" data-plan-name="${esc(r.name)}" data-plan-price="${esc(r.price_usd)}" data-plan-credit="${esc(r.credit_usd)}" data-plan-days="${esc(r.duration_days)}" data-plan-active="${Boolean(r.active)}" data-plan-description="${esc(r.description)}">Edit</button>
+          <button type="button" class="small" data-edit-plan="${esc(r.code)}">Edit</button>
           <button type="button" class="small danger" data-delete-plan="${esc(r.code)}">Delete</button>
         </div>`, 'end'],
       ], v.plans)}`;
@@ -2113,22 +2131,22 @@ const views = {
     const v = await get(`${endpoint('payments')}?${params}`, signal);
     const toolbar = listToolbar('payments', state, {
       placeholder: 'Search order, account, plan, or provider',
-      statuses: [['pending', 'Pending'], ['paid', 'Paid']],
+      statuses: [['pending', 'Pending'], ['paid', 'Paid'], ['refunded', 'Refunded']],
       sorts: [['created', 'Created'], ['amount', 'Amount'], ['status', 'Status'], ['provider', 'Method'], ['account', 'Account'], ['plan', 'Plan']],
       groups: [['status', 'Group by status'], ['method', 'Group by method'], ['plan', 'Group by plan'], ['account', 'Group by account']],
     });
     const group = state.group ? { value: r => state.group === 'plan' ? r.plan_code : state.group === 'account' ? r.account_id : state.group === 'method' ? methodLabel(r.method) : r.status } : null;
     const scope = state.account ? `<div class="filter-chips">${filterChip('payments', 'account', 'Account', esc(shortId(state.account)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`)}</div>` : '';
-    return `${pageHead('Payments', `${esc(plural(v.total, 'card or crypto order'))}.`, '<button type="button" class="ghost" data-payroof>Crypto payments setup</button>')}
+    return `${pageHead('Payments', `${esc(plural(v.total, 'order'))} by card, crypto, App Store, or Google Play.`, '<button type="button" class="ghost" data-payroof>Crypto payments setup</button>')}
       ${toolbar}${scope}${table([
         ['Created', r => when(r.created_at)],
         ['Order', r => `<code title="${esc(r.id)}">${esc(shortId(r.id))}</code>`],
         ['Account', r => accountLink(r.account_id)],
-        ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
-        ['Method', r => esc(methodLabel(r.method))],
+        ['Plan', r => `<code>${esc(r.plan_code)}</code><div class="hint">${r.kind === 'topup' ? 'Top-up' : `${esc(monthsLabel(Number(r.months) || 1))}`}</div>`],
+        ['Method', r => `${esc(methodLabel(r.method))}${r.product_id ? `<div class="hint"><code>${esc(r.product_id)}</code></div>` : ''}`],
         ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
         ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`, 'end'],
-        ['Status', r => `${pill(r.status)}${r.paid_at ? `<div class="hint">${esc(date(r.paid_at))}</div>` : ''}`],
+        ['Status', r => `${pill(r.refunded_at ? 'refunded' : r.status)}${r.refunded_at ? `<div class="hint">${esc(date(r.refunded_at))}</div>` : r.paid_at ? `<div class="hint">${esc(date(r.paid_at))}</div>` : ''}`],
         ['', r => `<button type="button" class="small" data-payment="${esc(r.id)}">Details</button>`, 'end'],
       ], v.payments, { group, empty: ['No payments match', 'Orders appear when customers check out.'] })}${listPager('payments', state, Number(v.total || 0), v.payments.length)}`;
   },
@@ -2201,20 +2219,21 @@ const views = {
 };
 
 let billingData = null;
-const BILLING_LABELS = { overview: 'Overview', add: 'Add credit', history: 'History' };
+let adminPlans = [];
+const BILLING_LABELS = { overview: 'Overview', add: 'Plans and top-ups', history: 'History' };
 const billingTabs = () => `<div class="seg-tabs" role="tablist" aria-label="Billing sections">${BILLING_SUBS.map(k => `<button type="button" role="tab" data-bsub="${k}" aria-selected="${k === billingSub}" tabindex="${k === billingSub ? 0 : -1}">${esc(BILLING_LABELS[k])}</button>`).join('')}</div>`;
-// A short plan tile for the Add credit section: price first, details in a tooltip.
+// A short plan tile for the plans section: price first, details in a tooltip.
 function planTile(plan, badges, methods) {
   const i = planInfo(plan);
   const badge = badges.get(plan.code);
   const featured = badge === 'Best value';
-  const detail = `${plural(i.days, 'day')} of validity. ${plan.description || 'Prepaid API credit.'}`;
-  return `<article class="card plan-tile${featured ? ' featured' : ''}" aria-label="${esc(plan.name)} plan">
+  const detail = `${i.topup ? 'Never expires, used after your monthly quota.' : `${monthsLabel(i.months)}, prepaid, no auto-renewal. The quota resets each month.`} ${plan.description || ''}`.trim();
+  return `<article class="card plan-tile${featured ? ' featured' : ''}" aria-label="${esc(plan.name)} ${i.topup ? 'top-up' : 'plan'}">
     <div class="plan-top"><h4 class="plan-name">${esc(plan.name)}</h4>${badge ? `<span class="plan-flag${featured ? '' : ' soft'}">${esc(badge)}</span>` : ''}${tip(detail)}</div>
-    <div class="plan-price"><span class="plan-amount">${esc(perMonthLabel(i))}</span>${i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
+    <div class="plan-price"><span class="plan-amount">${esc(i.topup ? usdShort(i.price) : perMonthLabel(i))}</span>${!i.topup && i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
     <div class="plan-billed">${esc(billedLine(i))}</div>
-    ${i.credit ? `<div class="plan-credit"><strong>${esc(usdShort(i.credit))}</strong> credit${i.bonus ? `<span class="chip-bonus">+${esc(usdShort(i.bonus))} bonus</span>` : ''}</div>` : ''}
-    ${methods.length ? `<button type="button" class="${featured ? 'primary' : ''}" data-checkout="${esc(plan.code)}">Choose ${esc(plan.name)}</button>` : ''}
+    <div class="plan-credit">${i.topup ? `<strong>${esc(usdShort(i.credit))}</strong> extra usage, never expires` : `<strong>${esc(usdShort(i.quota))}</strong> usage per month`}</div>
+    ${methods.length ? `<button type="button" class="${featured ? 'primary' : ''}" data-checkout="${esc(plan.code)}">${i.topup ? 'Buy' : 'Choose'} ${esc(plan.name)}</button>` : ''}
   </article>`;
 }
 function renderBilling() {
@@ -2226,10 +2245,9 @@ function renderBilling() {
   const trial = lots.filter(c => c.source === 'free');
   const trialLeft = trial.reduce((sum, c) => sum + Number(c.remaining_usd), 0);
   const trialEnds = Math.min(...trial.map(c => c.expires_at || Infinity));
-  const nextExpiry = lots.filter(c => c.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
+  const subs = a.subscriptions || (a.subscription ? [a.subscription] : []);
   const sub = a.subscription;
-  const subPlan = sub && p.plans.find(x => x.code === sub.plan_code);
-  const daysLeft = sub ? Math.max(0, Math.ceil((sub.expires_at - nowSeconds()) / DAY)) : 0;
+  const refunded = a.status === 'suspended' && a.suspended_reason === 'refund';
   const empty = !isPositive(a.balance_usd);
   const debt = isPositive(a.debt_usd);
   const planName = code => p.plans.find(x => x.code === code)?.name || code;
@@ -2237,15 +2255,15 @@ function renderBilling() {
   let body;
   if (billingSub === 'add') {
     body = `<div class="bill-section">
-        <div class="section-head"><h3>Choose a plan</h3><span class="hint">One-time, no auto-renewal</span></div>
+        <div class="section-head"><h3>Choose a plan</h3><span class="hint">Card and crypto plans are prepaid and do not auto-renew</span></div>
         ${p.plans.length ? `<div class="plan-tiles" data-count="${p.plans.length}">${p.plans.map(x => planTile(x, badges, methods)).join('')}</div>` : emptyState('No plans yet', 'An operator has not published any plans.')}
-        ${methods.length ? '' : '<p class="hint">Online payments are not enabled. Redeem a credit code instead.</p>'}
+        ${methods.length ? '' : '<p class="hint">Online payments are not enabled. Redeem a code instead.</p>'}
       </div>
       <div class="bill-section">
-        <div class="section-head"><h3>Other ways to add credit</h3></div>
+        <div class="section-head"><h3>Other ways to add usage</h3></div>
         <div class="ways">
-          ${hasTopUp ? `<div class="card way"><div><strong>Top up with stablecoins</strong> ${tip('Send USDC or USDT to your personal address. Any amount, credited 1:1 in USD, no plan needed.')}</div><p>Any amount, no plan needed.</p><button type="button" class="small" data-topup-open>Show my address</button></div>` : ''}
-          <div class="card way"><div><strong>Redeem a code</strong> ${tip('Apply a single-use credit code from the operator. Credit is available immediately.')}</div><p>Have a credit code?</p><button type="button" class="small" data-redeem>Redeem a code</button></div>
+          ${hasTopUp ? `<div class="card way"><div><strong>Top up with stablecoins</strong> ${tip('Send USDC or USDT to your personal address. Any amount is added 1:1 in USD as usage that never expires, no plan needed.')}</div><p>Any amount, no plan needed.</p><button type="button" class="small" data-topup-open>Show my address</button></div>` : ''}
+          <div class="card way"><div><strong>Redeem a code</strong> ${tip('Apply a single-use code from the operator. The usage is available immediately.')}</div><p>Have a code?</p><button type="button" class="small" data-redeem>Redeem a code</button></div>
         </div>
       </div>
       <details class="more faq-more"><summary>Common questions</summary>${planFaq(p.plans, methods)}</details>`;
@@ -2255,37 +2273,46 @@ function renderBilling() {
         <div class="section-head"><h3>Payments</h3><span class="hint">${esc(plural(orders.payments.length, 'payment'))}</span></div>
         ${table([
           ['Date', r => when(r.created_at)],
-          ['Plan', r => `<strong>${esc(planName(r.plan_code))}</strong><div class="hint">${esc(methodLabel(r.method))} &middot; ${esc(usd(r.credit_usd))} credit</div>`],
+          ['Plan', r => `<strong>${esc(planName(r.plan_code))}</strong><div class="hint">${esc(methodLabel(r.method))} &middot; ${r.kind === 'topup' ? 'Top-up' : `${esc(monthsLabel(Number(r.months) || 1))}`}</div>`],
           ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
-          ['Status', r => pill(r.status)],
+          ['Status', r => pill(r.refunded_at ? 'refunded' : r.status)],
           ['', r => `<div class="actions">${r.method === 'crypto' && r.status === 'pending' ? `<button type="button" class="small primary" data-order="${esc(r.id)}">Pay</button>` : ''}<button type="button" class="small" data-receipt="${esc(r.id)}" aria-label="Details of payment ${esc(shortId(r.id))}">Details</button></div>`, 'end'],
         ], orders.payments, { empty: ['No payments yet', 'Plan purchases appear here with their status and a receipt.'] })}
       </div>
-      <details class="more"><summary>Credit lots (${count(v.credits.length)})</summary>
-        <p class="hint">Each top-up, plan, or grant is one lot with its own expiry. The lot that expires first is spent first.</p>
+      <details class="more"><summary>Usage ledger (${count(v.credits.length)})</summary>
+        <p class="hint">Your monthly quota resets each month. Top-ups never expire. The quota is used first, then top-ups.</p>
         ${creditTable(v.credits)}
       </details>
       ${dep.length ? `<details class="more"><summary>Stablecoin deposits (${count(dep.length)})</summary>${depositsTable(dep)}</details>` : ''}`;
   } else {
     const line = debt ? `Outstanding debt of ${usd(a.debt_usd)} is repaid from your next top-up.`
-      : empty ? 'Your balance is empty. API calls are refused until you add credit.'
+      : empty ? 'Nothing left. API calls are refused until you get a plan or top-up.'
       : 'Shared by every key on your account.';
     const notes = [
-      trialLeft > 0 && `Includes ${usd(trialLeft)} of trial credit${Number.isFinite(trialEnds) ? `, valid until ${date(trialEnds)}` : ''}.`,
-      nextExpiry && nextExpiry !== trial[0] && `Next credit expiry: ${usd(nextExpiry.remaining_usd)} on ${date(nextExpiry.expires_at)}. Credit that expires first is spent first.`,
+      `Monthly quota left: ${usd(a.quota_remaining_usd)}. It resets each month and unused quota does not carry over.`,
+      `Top-up balance: ${usd(a.topup_remaining_usd)}. Top-ups never expire and are used after the quota.`,
+      trialLeft > 0 && `Includes ${usd(trialLeft)} of trial usage${Number.isFinite(trialEnds) ? `, valid until ${date(trialEnds)}` : ''}.`,
       `Spent so far: ${usd(a.billed_usd)} across all keys.`,
-      `${plural(lots.length, 'active credit lot')}.`,
     ].filter(Boolean);
-    body = `<section class="card balance-hero${empty || debt ? ' warn' : ''}" aria-labelledby="balance-label">
+    const subLine = s => {
+      const left = `${usd(s.quota_remaining_usd)} of ${usd(s.monthly_quota_usd)} monthly quota left${s.quota_resets_at ? `, resets ${date(s.quota_resets_at)}` : ''}`;
+      const term = `${s.auto_renew ? 'Renews' : 'Ends'} ${date(s.expires_at)}${s.provider === 'app_store' ? ' (App Store)' : s.provider === 'google_play' ? ' (Google Play)' : ''}`;
+      return `<div class="sub-line"><strong>${esc(s.plan_name || s.plan_code)}</strong> ${s.status && s.status !== 'active' ? pill(s.status) : ''}<div class="hint">${esc(left)}. ${esc(term)}.</div></div>`;
+    };
+    body = `${refunded ? '<div class="callout warn"><p><strong>Account suspended.</strong> This account was suspended after a refund through the App Store or Google Play. Contact the operator to restore access.</p></div>' : ''}
+      <section class="card balance-hero${empty || debt ? ' warn' : ''}" aria-labelledby="balance-label">
         <div class="balance-main">
-          <div class="label" id="balance-label">Available balance</div>
+          <div class="label" id="balance-label">Available usage</div>
           <div class="metric balance-amount">${esc(usd(a.balance_usd))}</div>
           <p class="balance-line${empty || debt ? ' warn' : ''}">${esc(line)}</p>
         </div>
-        <div class="actions"><button type="button" class="primary" data-bsub-go="add">Add credit</button></div>
+        <div class="actions"><button type="button" class="primary" data-bsub-go="add">${sub ? 'Add a top-up' : 'Get a plan'}</button></div>
       </section>
-      <div class="plan-chip-row"><span class="plan-chip${sub ? ' active' : ''}">${sub ? `${esc(subPlan?.name || sub.plan_code)} plan &middot; until ${esc(date(sub.expires_at))}` : 'No active plan &middot; pay as you go'}</span>${sub ? `<span class="hint">${esc(plural(daysLeft, 'day'))} left</span>` : ''}</div>
-      <details class="more"><summary>Balance details</summary><ul class="balance-notes">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></details>`;
+      <div class="plan-chip-row"><span class="plan-chip${sub ? ' active' : ''}">${sub ? `${esc(sub.plan_name || sub.plan_code)} plan &middot; ${esc(usd(sub.quota_remaining_usd))} of ${esc(usd(sub.monthly_quota_usd))} quota left${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}` : 'No active plan'}</span>${sub ? `<span class="hint">${sub.auto_renew ? 'Renews' : 'Ends'} ${esc(date(sub.expires_at))}</span>` : ''}</div>
+      ${subs.length > 1 ? `<div class="bill-section">${subs.map(subLine).join('')}</div>` : ''}
+      <details class="more"><summary>Balance details</summary><ul class="balance-notes">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></details>
+      <div class="bill-section"><label class="inline check-line"><input type="checkbox" data-consent${a.consumption_consent ? ' checked' : ''}> Share usage data with Apple when you request a refund</label>
+        <p class="hint">Lets the operator tell Apple how much of a purchase was used when you ask for a refund.</p></div>`;
   }
   return `${billingTabs()}<div class="bill-body">${body}</div>`;
 }
@@ -2317,12 +2344,39 @@ async function requestModels(signal) {
 
 function planForm(initial = {}) {
   const editing = Boolean(initial.code);
-  modal(editing ? `Edit plan: ${initial.code}` : 'Create plan', `<form><div class="form-grid"><div><label for="plan-code">Code</label><input id="plan-code" name="code" value="${esc(initial.code || '')}" placeholder="starter" maxlength="80" pattern="[A-Za-z0-9_-]+" ${editing ? 'readonly' : 'required'}></div><div><label for="plan-name">Name</label><input id="plan-name" name="name" value="${esc(initial.name || '')}" placeholder="Starter" required></div><div><label for="plan-price">Price (USD)</label><input id="plan-price" name="price_usd" type="number" min="0.50" step="0.01" value="${esc(initial.price_usd || '10')}" required></div><div><label for="plan-credit">API credit (USD)</label><input id="plan-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="${esc(initial.credit_usd || '10')}" required></div><div><label for="plan-days">Duration (days)</label><input id="plan-days" name="duration_days" type="number" min="1" max="3650" value="${esc(initial.duration_days || 30)}" required></div></div><label for="plan-description">Description</label><input id="plan-description" name="description" value="${esc(initial.description || '')}" maxlength="4096" placeholder="Thirty days of API credit"><label class="inline check-line"><input type="checkbox" name="active"${initial.active !== false ? ' checked' : ''}> Visible to customers</label><div class="actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Create plan'}</button></div></form>`, d => bindForm(d.querySelector('form'), async b => {
-    await api(endpoint('plans'), 'POST', { ...b, duration_days: Number(b.duration_days), active: b.active === 'on' });
-    d.close();
-    notice(editing ? 'Plan updated' : 'Plan created');
-    await load();
-  }), 'wide');
+  const kind = initial.kind === 'topup' ? 'topup' : 'subscription';
+  modal(editing ? `Edit plan: ${initial.code}` : 'Create plan', `<form><div class="form-grid">
+    <div><label for="plan-code">Code</label><input id="plan-code" name="code" value="${esc(initial.code || '')}" placeholder="starter" maxlength="80" pattern="[A-Za-z0-9_-]+" ${editing ? 'readonly' : 'required'}></div>
+    <div><label for="plan-name">Name</label><input id="plan-name" name="name" value="${esc(initial.name || '')}" placeholder="Starter" required></div>
+    <div><label for="plan-kind">Kind</label><select id="plan-kind" name="kind"><option value="subscription"${kind === 'subscription' ? ' selected' : ''}>Subscription (monthly quota)</option><option value="topup"${kind === 'topup' ? ' selected' : ''}>Top-up (never expires)</option></select></div>
+    <div><label for="plan-price">Price (USD)</label><input id="plan-price" name="price_usd" type="number" min="0.50" step="0.01" value="${esc(initial.price_usd || '10')}" required></div>
+    <div data-kind="subscription"><label for="plan-months">Months</label><input id="plan-months" name="months" type="number" min="1" max="12" step="1" value="${esc(initial.months || 1)}" required></div>
+    <div data-kind="subscription"><label for="plan-quota">Monthly quota (USD)</label><input id="plan-quota" name="monthly_quota_usd" type="number" min="0.000001" step="0.000001" value="${esc(initial.monthly_quota_usd || '10')}" required></div>
+    <div data-kind="topup"><label for="plan-credit">Extra usage (USD)</label><input id="plan-credit" name="credit_usd" type="number" min="0.000001" step="0.000001" value="${esc(initial.credit_usd || '10')}" required></div>
+    <div><label for="plan-apple">Apple product ID (optional)</label><input id="plan-apple" name="apple_product_id" value="${esc(initial.apple_product_id || '')}" maxlength="200" autocomplete="off"></div>
+    <div><label for="plan-google">Google product ID (optional)</label><input id="plan-google" name="google_product_id" value="${esc(initial.google_product_id || '')}" maxlength="200" autocomplete="off"></div>
+  </div><label for="plan-description">Description</label><input id="plan-description" name="description" value="${esc(initial.description || '')}" maxlength="4096" placeholder="Monthly usage quota"><label class="inline check-line"><input type="checkbox" name="active"${initial.active !== false ? ' checked' : ''}> Visible to customers</label><div class="actions"><button class="primary" type="submit">${editing ? 'Save changes' : 'Create plan'}</button></div></form>`, d => {
+    const form = d.querySelector('form');
+    // Show only the fields of the chosen kind and disable the others so they are neither validated nor sent.
+    const sync = () => {
+      for (const el of form.querySelectorAll('[data-kind]')) {
+        const on = el.dataset.kind === form.elements.kind.value;
+        el.hidden = !on;
+        el.querySelectorAll('input').forEach(input => { input.disabled = !on; });
+      }
+    };
+    form.elements.kind.onchange = sync;
+    sync();
+    bindForm(form, async b => {
+      const payload = { code: b.code, name: b.name, kind: b.kind, price_usd: b.price_usd, description: b.description, active: b.active === 'on', apple_product_id: b.apple_product_id?.trim() || null, google_product_id: b.google_product_id?.trim() || null };
+      if (b.kind === 'topup') payload.credit_usd = b.credit_usd;
+      else Object.assign(payload, { months: Number(b.months), monthly_quota_usd: b.monthly_quota_usd });
+      await api(endpoint('plans'), 'POST', payload);
+      d.close();
+      notice(editing ? 'Plan updated' : 'Plan created');
+      await load();
+    });
+  }, 'wide');
 }
 
 function showIssuedCodes(v) {
@@ -2745,7 +2799,16 @@ function transfersTable(o) {
 }
 const planOfOrder = o => {
   const known = planCatalog.plans.find(p => p.code === o.plan_code);
-  return { code: o.plan_code, name: known?.name || o.plan_code, price_usd: o.price_usd, credit_usd: o.credit_usd, duration_days: o.duration_days };
+  return {
+    code: o.plan_code, name: known?.name || o.plan_code, price_usd: o.price_usd,
+    kind: o.kind || known?.kind || 'subscription', months: o.months ?? known?.months,
+    monthly_quota_usd: known?.monthly_quota_usd, credit_usd: o.credit_usd ?? known?.credit_usd,
+  };
+};
+// What an order gives, in words.
+const orderGrant = o => {
+  const i = planInfo(planOfOrder(o));
+  return i.topup ? `${usd(i.credit)} of extra usage that never expires` : `${usd(i.quota)} of usage per month for ${monthsLabel(i.months)}`;
 };
 // pending, confirming, underpaid, review, paid, expired, or failed.
 function orderState(o) {
@@ -2772,7 +2835,7 @@ function orderMessage(o, state, i) {
     case 'confirming': return ['Payment detected', `The network has seen your transfer. Waiting for ${confirmations ? plural(confirmations, 'confirmation') : 'network confirmations'}. You can close this window: credit is added automatically.`];
     case 'underpaid': return ['Payment received, but it is not enough yet', `${usd(received)} of ${usd(price)} has been confirmed. Send the remaining ${usd(Math.max(0, price - received))} in any listed token to finish the order.${tolerance && Number(tolerance) > 0 ? ` Shortfalls up to ${tolerance}% are accepted.` : ''}${o.status === 'expired' ? ' The quote has expired: stablecoin transfers still count, native coin transfers need the operator.' : ''}`];
     case 'review': return ['A transfer needs review', `${flagged ? `${noteLabel(flagged.note)}. ` : ''}It was not counted towards this order. Contact the operator with the transaction hash shown below.`];
-    case 'paid': return ['Payment confirmed', `${usdShort(i.credit || i.price)} of API credit was added. ${expiryText(i, o.paid_at)}.${received > price + 0.01 ? ` You sent ${usd(received)}: the plan credit is granted once, so ask the operator about the extra ${usd(received - price)}.` : ''}`];
+    case 'paid': return ['Payment confirmed', `${i.topup ? `${usdShort(i.credit)} of extra usage was added. It never expires.` : `Your plan is active with ${usdShort(i.quota)} of usage per month for ${monthsLabel(i.months)}.`}${received > price + 0.01 ? ` You sent ${usd(received)}: the purchase is applied once, so ask the operator about the extra ${usd(received - price)}.` : ''}`];
     case 'expired': return ['This quote expired', 'Quotes are valid for a limited time. If you already sent a stablecoin it is still counted once it confirms. Otherwise start a new payment to get fresh amounts.'];
     default: return ['Payment not completed', 'This order was cancelled or failed. Contact the operator if you already sent funds.'];
   }
@@ -2901,7 +2964,7 @@ function runOrder(d, initial) {
     box.innerHTML = cryptoView(order, sel);
     wireCopies(box);
     box.querySelector('[data-pay-done]')?.addEventListener('click', () => {
-      if (order.status !== 'paid' && order.status !== 'expired' && order.status !== 'failed') notice('Thanks. Credit is added automatically once the payment is confirmed.');
+      if (order.status !== 'paid' && order.status !== 'expired' && order.status !== 'failed') notice('Thanks. Your purchase is applied automatically once the payment is confirmed.');
       d.close();
     });
     box.querySelector('[data-pay-cancel]')?.addEventListener('click', () => d.close());
@@ -2939,7 +3002,7 @@ function runOrder(d, initial) {
       order = next;
       if (changed) draw();
       if (order.status === 'paid' && !wasPaid) {
-        notice('Payment confirmed, credit added');
+        notice('Payment confirmed');
         if (tab === 'billing') load();
       }
     } catch (e) {
@@ -2968,8 +3031,8 @@ async function receiptModal(id) {
   modal(`Payment ${shortId(o.id)}`, `
     <div class="tiles">
       ${metric('Price', usd(o.price_usd), `${esc(plan.name)}, ${esc(methodLabel(o.method))}`)}
-      ${metric('Received', usd(o.received_usd), o.status === 'paid' ? `Credit of ${esc(usd(o.credit_usd))} granted` : 'Counted so far')}
-      ${metric('Status', pill(o.status), o.paid_at ? `Paid ${esc(date(o.paid_at))}` : o.expires_at && o.status !== 'paid' ? `Quote ${o.status === 'expired' ? 'expired' : 'expires'} ${esc(date(o.expires_at))}` : `Created ${esc(date(o.created_at))}`, { html: true })}
+      ${metric('Received', usd(o.received_usd), o.status === 'paid' ? 'Applied to your account' : 'Counted so far')}
+      ${metric('Status', pill(o.refunded_at ? 'refunded' : o.status), o.refunded_at ? `Refunded ${esc(date(o.refunded_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}` : o.expires_at && o.status !== 'paid' ? `Quote ${o.status === 'expired' ? 'expired' : 'expires'} ${esc(date(o.expires_at))}` : `Created ${esc(date(o.created_at))}`, { html: true })}
     </div>
     <section class="detail-section"><h4>Receipt</h4>${facts([
       ['Payment ID', copyable(o.id, 'Payment ID')],
@@ -2977,8 +3040,10 @@ async function receiptModal(id) {
       ['Method', esc(methodLabel(o.method))],
       ['Created', esc(date(o.created_at))],
       o.paid_at && ['Paid', esc(date(o.paid_at))],
-      ['Credit', `${esc(usd(o.credit_usd))} for ${esc(plural(o.duration_days, 'day'))}`],
-      o.paid_at && ['Credit valid until', esc(date(o.paid_at + o.duration_days * DAY))],
+      ['Includes', esc(orderGrant(o))],
+      o.platform && ['Store', esc(methodLabel(o.method))],
+      o.refunded_at && ['Refunded', esc(date(o.refunded_at))],
+      o.kind !== 'topup' && o.paid_at && o.months && ['Prepaid until', esc(date(o.paid_at + o.months * 30.4 * DAY))],
     ])}</section>
     ${transfersTable(o)}
     ${payable ? '<div class="actions"><button type="button" class="primary" data-continue>Continue payment</button></div>' : ''}`, d => {
@@ -2995,8 +3060,8 @@ async function paymentDetails(id) {
   modal(`Payment ${shortId(o.id)}`, `
     <div class="tiles">
       ${metric('Price', usd(o.price_usd), `${esc(o.plan_code)}, ${esc(methodLabel(o.method))}`)}
-      ${metric('Received', usd(o.received_usd), `Grants ${esc(usd(o.credit_usd))} for ${esc(plural(o.duration_days, 'day'))}`)}
-      ${metric('Status', pill(o.status), o.paid_at ? `Paid ${esc(date(o.paid_at))}${o.paid_by ? ` by ${esc(o.paid_by)}` : ''}` : `Created ${esc(date(o.created_at))}`, { html: true })}
+      ${metric('Received', usd(o.received_usd), `Grants ${esc(orderGrant(o))}`)}
+      ${metric('Status', pill(o.refunded_at ? 'refunded' : o.status), o.refunded_at ? `Refunded ${esc(date(o.refunded_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}${o.paid_by ? ` by ${esc(o.paid_by)}` : ''}` : `Created ${esc(date(o.created_at))}`, { html: true })}
     </div>
     <section class="detail-section"><h4>Order</h4>${facts([
       ['Order ID', copyable(o.id, 'Order ID')],
@@ -3014,7 +3079,7 @@ async function paymentDetails(id) {
     ${payable ? `<div class="callout warn"><p>Use after verifying a late, underpaid, or otherwise flagged payment by hand. Credit is granted once.</p><div class="actions"><button type="button" class="primary" data-complete>Mark as paid and grant credit</button></div></div>` : ''}`, d => {
     wireCopies(d);
     d.querySelector('[data-complete]')?.addEventListener('click', async e => {
-      if (!(await confirmModal('Complete payment?', 'Grant this order\'s plan credit to the account now?', 'Grant credit'))) return;
+      if (!(await confirmModal('Complete payment?', 'Grant this order\'s plan or top-up to the account now?', 'Grant order'))) return;
       e.target.disabled = true;
       try {
         await api(endpoint(`payments/${encodeURIComponent(id)}/complete`), 'POST', {});
@@ -3172,6 +3237,7 @@ async function oauthConsent() {
             <label for="consent-contact">Contact (optional)</label>
             <input id="consent-contact" name="contact" type="email" placeholder="you@example.com" autocomplete="email">
             <p class="field-help">New accounts receive evaluation credit. No card needed.</p>
+            <label class="inline check-line"><input id="consent-share" type="checkbox"> Share usage data with Apple when I request a refund</label>
             <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span>Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
             <div class="actions"><button type="button" class="ghost" data-make-account>Create account</button></div>
           </div>
@@ -3267,7 +3333,7 @@ async function oauthConsent() {
     refresh();
     pow.hidden = false;
     try {
-      created = await signup({ name: form.querySelector('#consent-name').value.trim() || clientName.slice(0, 80), contact: form.querySelector('#consent-contact').value.trim() }, p => { bar.value = Math.round(p * 100); });
+      created = await signup({ name: form.querySelector('#consent-name').value.trim() || clientName.slice(0, 80), contact: form.querySelector('#consent-contact').value.trim(), consumption_consent: form.querySelector('#consent-share').checked }, p => { bar.value = Math.round(p * 100); });
       form.querySelector('[data-create-form]').hidden = true;
       form.querySelector('[data-created]').hidden = false;
       secrets(created, { embedded: true });
@@ -3362,6 +3428,21 @@ function wire(root) {
     };
   });
   root.querySelectorAll('[data-bsub-go]').forEach(b => b.onclick = () => showBilling(b.dataset.bsubGo));
+  root.querySelectorAll('[data-consent]').forEach(box => box.onchange = async () => {
+    const wanted = box.checked;
+    box.disabled = true;
+    try {
+      const v = await api('/v1/account', 'PATCH', { consumption_consent: wanted });
+      if (billingData && v.account) billingData.v.account = { ...billingData.v.account, ...v.account };
+      else if (billingData) billingData.v.account.consumption_consent = wanted;
+      notice(wanted ? 'Usage data sharing enabled' : 'Usage data sharing disabled');
+    } catch (e) {
+      box.checked = !wanted;
+      notice(e.message, true);
+    } finally {
+      box.disabled = false;
+    }
+  });
   root.querySelectorAll('[data-scroll]').forEach(b => b.onclick = () => {
     const target = document.getElementById(b.dataset.scroll);
     if (!target) return;
@@ -3422,15 +3503,7 @@ function wire(root) {
   });
   action('[data-edit-key]', async b => editKeyForm(b.dataset.editKey, b.dataset.keyName));
   action('[data-plan]', async () => planForm());
-  action('[data-edit-plan]', async b => planForm({
-    code: b.dataset.editPlan,
-    name: b.dataset.planName,
-    price_usd: b.dataset.planPrice,
-    credit_usd: b.dataset.planCredit,
-    duration_days: Number(b.dataset.planDays),
-    active: b.dataset.planActive === 'true',
-    description: b.dataset.planDescription,
-  }));
+  action('[data-edit-plan]', async b => planForm(adminPlans.find(x => x.code === b.dataset.editPlan) || { code: b.dataset.editPlan }));
   action('[data-delete-plan]', async b => {
     const code = b.dataset.deletePlan;
     if (!(await confirmModal('Delete plan?', `Delete "${code}"? This cannot be undone. Plans with subscriptions, payments, or codes can only be deactivated.`, 'Delete plan', true))) return;

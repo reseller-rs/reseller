@@ -1,5 +1,6 @@
-//! Image generation proxying, Payroof crypto payments, white-label branding,
-//! and nested settings, driven through the real router against local mocks.
+//! Image generation proxying, Payroof crypto payments, App Store and Google
+//! Play purchases, white-label branding, and nested settings, driven through
+//! the real router against local mocks.
 
 use axum::{
     Json, Router,
@@ -1158,7 +1159,7 @@ async fn models_list_requires_a_valid_key_and_a_balance() {
     let (s, v) = t
         .call("GET", "/v1/models", k["key"].as_str(), json!({}))
         .await;
-    assert_eq!(s, 429, "{v}");
+    assert_eq!(s, 402, "{v}");
     assert_eq!(error_keys(&v), ERROR_KEYS);
     assert_eq!(v["error"]["code"], "insufficient_quota");
     assert_eq!(v["error"]["type"], "insufficient_quota");
@@ -1186,7 +1187,7 @@ async fn empty_balance_blocks_chat_with_the_deposit_instructions() {
             json!({"messages": []}),
         )
         .await;
-    assert_eq!(s, 429, "{v}");
+    assert_eq!(s, 402, "{v}");
     assert_eq!(v["error"]["type"], "insufficient_quota");
     assert_eq!(v["error"]["code"], "insufficient_quota");
     let message = v["error"]["message"].as_str().unwrap();
@@ -1454,6 +1455,8 @@ async fn new_accounts_get_the_default_or_configured_trial_credit() {
     let t = Test::new().await;
     let k = t.key().await;
     assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.1");
+    // Halving is on by default; this test is about the configured amount only.
+    t.app.config_mut().await.signup.free_credit_halving = false;
     t.app.config_mut().await.signup.free_credit_usd = "0.75".into();
     let k = t.key().await;
     assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.75");
@@ -1503,6 +1506,8 @@ async fn halving_gives_each_further_signup_from_one_ip_half_the_trial() {
 #[tokio::test]
 async fn overview_splits_credit_and_keys_by_account_status() {
     let t = Test::new().await;
+    // Halving is on by default; both keys must get the full trial credit here.
+    t.app.config_mut().await.signup.free_credit_halving = false;
     let active = t.key().await;
     let suspended = t.key().await;
     let (s, v) = t
@@ -1669,8 +1674,8 @@ async fn dashboards_rank_spend_and_link_keys_accounts_and_requests() {
     // Payments filter by account.
     for (id, account) in [("o1", aid), ("o2", other["account_id"].as_str().unwrap())] {
         sqlx::query(
-            "INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,created_at) \
-             VALUES(?,?,'monthly','stripe',20000000,20000000,30,?)",
+            "INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,months,created_at) \
+             VALUES(?,?,'monthly','stripe','subscription',20000000,20000000,1,?)",
         )
         .bind(id)
         .bind(account)
@@ -1695,4 +1700,1655 @@ async fn docs_page_is_served() {
         assert_eq!(s, 200);
         assert!(body.contains("/assets/app.js"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// App Store and Google Play purchases
+// ---------------------------------------------------------------------------
+
+use aws_lc_rs::{
+    encoding::AsDer,
+    rsa::{KeyPair as RsaPair, KeySize},
+    signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair, RsaPublicKeyComponents},
+};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use reseller::payments::store::{apple, jose};
+
+const BUNDLE: &str = "com.example.app";
+const PACKAGE: &str = "com.example.app";
+const PUSH_EMAIL: &str = "push@project.iam.gserviceaccount.com";
+const PUSH_AUDIENCE: &str = "https://reseller.example/pubsub";
+
+/// A request the store mock received.
+#[derive(Clone, Debug)]
+struct Call {
+    method: String,
+    path: String,
+    auth: Option<String>,
+    body: Value,
+}
+
+/// Canned replies by `"METHOD /path"` and the calls received.
+#[derive(Default)]
+struct StoreMock {
+    replies: std::collections::HashMap<String, Value>,
+    calls: Vec<Call>,
+}
+
+type Mock = Arc<Mutex<StoreMock>>;
+
+fn reply(mock: &Mock, key: &str, body: Value) {
+    mock.lock().unwrap().replies.insert(key.to_owned(), body);
+}
+
+fn calls(mock: &Mock, method: &str, path_suffix: &str) -> Vec<Call> {
+    mock.lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| c.method == method && c.path.ends_with(path_suffix))
+        .cloned()
+        .collect()
+}
+
+/// One server for the App Store Server API, the Play Developer API, the
+/// Google token endpoint, and the JWKS.
+async fn mock_store() -> (String, Mock) {
+    let mock = Mock::default();
+    let state = mock.clone();
+    let router = Router::new().fallback(
+        move |method: axum::http::Method,
+              uri: axum::http::Uri,
+              headers: HeaderMap,
+              body: String| {
+            let state = state.clone();
+            async move {
+                let mut s = state.lock().unwrap();
+                let path = uri.path().to_owned();
+                s.calls.push(Call {
+                    method: method.to_string(),
+                    path: path.clone(),
+                    auth: headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned),
+                    body: serde_json::from_str(&body).unwrap_or(Value::String(body)),
+                });
+                match s.replies.get(&format!("{method} {path}")) {
+                    Some(v) => (axum::http::StatusCode::OK, Json(v.clone())),
+                    None => (axum::http::StatusCode::NOT_FOUND, Json(json!({}))),
+                }
+            }
+        },
+    );
+    (serve(router).await, mock)
+}
+
+fn pem(label: &str, der: &[u8]) -> String {
+    format!(
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+        STANDARD.encode(der)
+    )
+}
+
+fn rfc3339(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0).unwrap().to_rfc3339()
+}
+
+fn bal(balance: &str) -> f64 {
+    balance.parse().unwrap()
+}
+
+/// An Apple-shaped certificate chain and the leaf's PKCS#8 key.
+struct AppleChain {
+    der: Vec<Vec<u8>>,
+    key: Vec<u8>,
+}
+
+fn apple_chain(markers: bool) -> AppleChain {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CustomExtension, DnType, IsCa, Issuer, KeyPair,
+    };
+    let marker = |oid: &[u64]| CustomExtension::from_oid_content(oid, vec![0x05, 0x00]);
+    let ca = |name: &str| {
+        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.distinguished_name.push(DnType::CommonName, name);
+        p
+    };
+    let root_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let root_params = ca("Test Root");
+    let root = root_params.self_signed(&root_key).unwrap();
+    let root_issuer = Issuer::new(root_params, root_key);
+    let mid_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let mut mid_params = ca("Test Intermediate");
+    if markers {
+        mid_params
+            .custom_extensions
+            .push(marker(&[1, 2, 840, 113635, 100, 6, 2, 1]));
+    }
+    let mid = mid_params.signed_by(&mid_key, &root_issuer).unwrap();
+    let mid_issuer = Issuer::new(mid_params, mid_key);
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "Test Leaf");
+    if markers {
+        leaf_params
+            .custom_extensions
+            .push(marker(&[1, 2, 840, 113635, 100, 6, 11, 1]));
+    }
+    let leaf = leaf_params.signed_by(&leaf_key, &mid_issuer).unwrap();
+    AppleChain {
+        der: vec![leaf.der().to_vec(), mid.der().to_vec(), root.der().to_vec()],
+        key: leaf_key.serialize_der(),
+    }
+}
+
+/// Signs `payload` like StoreKit 2 does, with the chain in `x5c`.
+fn apple_jws(chain: &AppleChain, payload: &Value) -> String {
+    let x5c: Vec<String> = chain.der.iter().map(|c| STANDARD.encode(c)).collect();
+    jose::sign_es256(&chain.key, &json!({"alg": "ES256", "x5c": x5c}), payload).unwrap()
+}
+
+fn apple_tx(
+    token: &str,
+    id: &str,
+    original: &str,
+    product: &str,
+    kind: &str,
+    purchased: i64,
+    expires: Option<i64>,
+) -> Value {
+    json!({
+        "transactionId": id, "originalTransactionId": original, "bundleId": BUNDLE,
+        "productId": product, "type": kind, "purchaseDate": purchased * 1000,
+        "expiresDate": expires.map(|e| e * 1000), "signedDate": db::now() * 1000,
+        "quantity": 1, "appAccountToken": token, "environment": "Sandbox",
+    })
+}
+
+struct AppleEnv {
+    t: Test,
+    mock: Mock,
+    chain: AppleChain,
+    /// Public key of the App Store Server API key.
+    api_public: Vec<u8>,
+}
+
+/// Sets up plans with product ids and an App Store configuration pointing at
+/// the mock, trusting only a freshly generated root.
+async fn apple_env() -> AppleEnv {
+    let mut t = Test::new().await;
+    let chain = apple_chain(true);
+    t.app = t.app.clone().with_apple_roots(vec![chain.der[2].clone()]);
+    store_plans(&t).await;
+    let (base, mock) = mock_store().await;
+    let api_key = EcdsaKeyPair::generate_pkcs8(
+        &ECDSA_P256_SHA256_FIXED_SIGNING,
+        &aws_lc_rs::rand::SystemRandom::new(),
+    )
+    .unwrap();
+    let api_public = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, api_key.as_ref())
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .to_vec();
+    {
+        let mut c = t.app.config_mut().await;
+        c.apple.bundle_id = BUNDLE.into();
+        c.apple.app_apple_id = Some(123);
+        c.apple.environment = reseller::config::AppleEnvironment::Sandbox;
+        c.apple.issuer_id = "issuer-1".into();
+        c.apple.key_id = "KEY123".into();
+        c.apple.private_key = pem("PRIVATE KEY", api_key.as_ref());
+        c.apple.api_url = base;
+        c.apple.consumption_reporting = true;
+    }
+    AppleEnv {
+        t,
+        mock,
+        chain,
+        api_public,
+    }
+}
+
+/// Gives the `monthly` plan and a new `topup10` plan store product ids.
+async fn store_plans(t: &Test) {
+    sqlx::query("UPDATE plans SET apple_product_id='pro.monthly',google_product_id='pro.monthly' WHERE code='monthly'")
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO plans(code,name,kind,price_micro,credit_micro,apple_product_id,google_product_id) \
+         VALUES('topup10','Top up $10','topup',10000000,10000000,'credits.10','credits.10')",
+    )
+    .execute(&t.app.db)
+    .await
+    .unwrap();
+}
+
+/// A new account's key, id, and store token.
+async fn store_account(t: &Test) -> (String, String, String) {
+    let k = t.key().await;
+    let key = k["key"].as_str().unwrap().to_owned();
+    let (s, v) = t
+        .call("GET", "/v1/account/store", Some(&key), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    (
+        key,
+        k["account_id"].as_str().unwrap().to_owned(),
+        v["app_account_token"].as_str().unwrap().to_owned(),
+    )
+}
+
+async fn apple_post(e: &AppleEnv, key: &str, tx: &Value) -> (u16, Value) {
+    e.t.call(
+        "POST",
+        "/v1/account/store/apple",
+        Some(key),
+        json!({"signed_transaction": apple_jws(&e.chain, tx)}),
+    )
+    .await
+}
+
+/// Delivers a signed App Store Server Notification V2.
+async fn apple_notify(
+    e: &AppleEnv,
+    kind: &str,
+    subtype: &str,
+    uuid: &str,
+    tx: &Value,
+) -> (u16, Value) {
+    apple_notify_for(e, kind, subtype, uuid, tx, BUNDLE, "Sandbox").await
+}
+
+async fn apple_notify_for(
+    e: &AppleEnv,
+    kind: &str,
+    subtype: &str,
+    uuid: &str,
+    tx: &Value,
+    bundle: &str,
+    environment: &str,
+) -> (u16, Value) {
+    let payload = json!({
+        "notificationType": kind, "subtype": subtype, "notificationUUID": uuid,
+        "signedDate": db::now() * 1000,
+        "data": {"appAppleId": 123, "bundleId": bundle, "environment": environment,
+                 "signedTransactionInfo": apple_jws(&e.chain, tx)},
+    });
+    let body = json!({"signedPayload": apple_jws(&e.chain, &payload)});
+    e.t.call("POST", "/webhooks/apple", None, body).await
+}
+
+/// JWS verification trusts only the configured root and rejects tampering.
+#[tokio::test]
+async fn apple_jws_verification_accepts_the_test_chain_and_rejects_forgeries() {
+    let e = apple_env().await;
+    let payload = json!({"signedDate": db::now() * 1000, "transactionId": "1"});
+    let jws = apple_jws(&e.chain, &payload);
+    assert_eq!(
+        apple::verify_signed(&e.t.app, &jws).unwrap()["transactionId"],
+        "1"
+    );
+
+    // Tampered payload.
+    let parts: Vec<&str> = jws.split('.').collect();
+    let forged_payload = json!({"signedDate": db::now() * 1000, "transactionId": "2"});
+    let forged = format!(
+        "{}.{}.{}",
+        parts[0],
+        jose::b64url(forged_payload.to_string().as_bytes()),
+        parts[2]
+    );
+    assert!(apple::verify_signed(&e.t.app, &forged).is_err());
+
+    // A chain that does not end in a trusted root: production trusts only
+    // Apple's pinned root.
+    let production = App::new(e.t.app.db.clone(), (*e.t.app.config().await).clone()).unwrap();
+    assert!(apple::verify_signed(&production, &jws).is_err());
+    let other = apple_chain(true);
+    let foreign = apple_jws(&other, &payload);
+    assert!(apple::verify_signed(&e.t.app, &foreign).is_err());
+
+    // A chain without Apple's marker extensions.
+    let unmarked = apple_chain(false);
+    let app =
+        e.t.app
+            .clone()
+            .with_apple_roots(vec![unmarked.der[2].clone()]);
+    assert!(apple::verify_signed(&app, &apple_jws(&unmarked, &payload)).is_err());
+
+    // Wrong algorithm and a missing chain.
+    let hs = jose::b64url(br#"{"alg":"HS256"}"#);
+    let unsigned = format!("{hs}.{}.{}", parts[1], parts[2]);
+    assert!(apple::verify_signed(&e.t.app, &unsigned).is_err());
+    assert!(apple::verify_signed(&e.t.app, "garbage").is_err());
+}
+
+/// A verified transaction credits once, is bound to its account, and is
+/// refused when revoked, of the wrong type, or for another app.
+#[tokio::test]
+async fn apple_verify_credits_once_and_binds_the_account() {
+    let e = apple_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let (other_key, _, other_token) = store_account(&e.t).await;
+    assert_ne!(token, other_token);
+    let now = db::now();
+    let before = bal(&e.t.balance(&aid).await);
+
+    let tx = apple_tx(
+        &token,
+        "3001",
+        "3001",
+        "credits.10",
+        "Consumable",
+        now,
+        None,
+    );
+    let (s, v) = apple_post(&e, &key, &tx).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["purchase"]["credited"], true);
+    let order = v["purchase"]["order_id"].clone();
+    assert_eq!(
+        bal(v["account"]["balance_usd"].as_str().unwrap()) - before,
+        10.0
+    );
+
+    let (s, v) = apple_post(&e, &key, &tx).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (
+            v["purchase"]["credited"].clone(),
+            v["purchase"]["order_id"].clone()
+        ),
+        (json!(false), order)
+    );
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 10.0);
+
+    // Another account cannot claim the same transaction, and a missing or
+    // foreign appAccountToken is refused.
+    let (s, v) = apple_post(&e, &other_key, &tx).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("store_account_mismatch"))
+    );
+    let mut foreign = apple_tx(
+        &other_token,
+        "3002",
+        "3002",
+        "credits.10",
+        "Consumable",
+        now,
+        None,
+    );
+    let (s, _) = apple_post(&e, &key, &foreign).await;
+    assert_eq!(s, 403);
+    foreign["appAccountToken"] = Value::Null;
+    assert_eq!(apple_post(&e, &key, &foreign).await.0, 403);
+
+    // Quantity scales a top-up.
+    let mut two = apple_tx(
+        &token,
+        "3003",
+        "3003",
+        "credits.10",
+        "Consumable",
+        now,
+        None,
+    );
+    two["quantity"] = 2.into();
+    let (s, v) = apple_post(&e, &key, &two).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 30.0);
+
+    // Revoked, wrong type, unknown product, another app, expired.
+    let mut revoked = apple_tx(
+        &token,
+        "3004",
+        "3004",
+        "credits.10",
+        "Consumable",
+        now,
+        None,
+    );
+    revoked["revocationDate"] = (now * 1000).into();
+    let (s, v) = apple_post(&e, &key, &revoked).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("purchase_revoked"))
+    );
+    let wrong = apple_tx(
+        &token,
+        "3005",
+        "3005",
+        "credits.10",
+        "Auto-Renewable Subscription",
+        now,
+        Some(now + 3600),
+    );
+    assert_eq!(apple_post(&e, &key, &wrong).await.0, 400);
+    let unknown = apple_tx(&token, "3006", "3006", "nope", "Consumable", now, None);
+    assert_eq!(apple_post(&e, &key, &unknown).await.0, 400);
+    let mut elsewhere = apple_tx(
+        &token,
+        "3007",
+        "3007",
+        "credits.10",
+        "Consumable",
+        now,
+        None,
+    );
+    elsewhere["bundleId"] = "com.other".into();
+    assert_eq!(apple_post(&e, &key, &elsewhere).await.0, 400);
+    let expired = apple_tx(
+        &token,
+        "3008",
+        "3008",
+        "pro.monthly",
+        "Auto-Renewable Subscription",
+        now - 7200,
+        Some(now - 3600),
+    );
+    let (s, v) = apple_post(&e, &key, &expired).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("subscription_expired"))
+    );
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 30.0);
+
+    // Garbage and a missing payload.
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/apple",
+            Some(&key),
+            json!({"signed_transaction": "x.y.z"}),
+        )
+        .await;
+    assert_eq!(s, 400);
+    let (s, _) =
+        e.t.call("POST", "/v1/account/store/apple", Some(&key), json!({}))
+            .await;
+    assert_eq!(s, 400);
+}
+
+/// A transaction id is looked up with the Server API (signed with the .p8
+/// key); without the key the lookup is unavailable.
+#[tokio::test]
+async fn apple_verify_by_transaction_id_calls_the_server_api() {
+    let e = apple_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let before = bal(&e.t.balance(&aid).await);
+    let tx = apple_tx(
+        &token,
+        "4001",
+        "4001",
+        "credits.10",
+        "Consumable",
+        db::now(),
+        None,
+    );
+    reply(
+        &e.mock,
+        "GET /inApps/v1/transactions/4001",
+        json!({"signedTransactionInfo": apple_jws(&e.chain, &tx)}),
+    );
+    let (s, v) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/apple",
+            Some(&key),
+            json!({"transaction_id": "4001"}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 10.0);
+
+    let call = calls(&e.mock, "GET", "/inApps/v1/transactions/4001").remove(0);
+    let bearer = call.auth.unwrap();
+    let jws = jose::split(bearer.strip_prefix("Bearer ").unwrap()).unwrap();
+    assert_eq!(jws.header["alg"], "ES256");
+    assert_eq!(jws.header["kid"], "KEY123");
+    assert_eq!(jws.payload["iss"], "issuer-1");
+    assert_eq!(jws.payload["aud"], "appstoreconnect-v1");
+    assert_eq!(jws.payload["bid"], BUNDLE);
+    let (iat, exp) = (
+        jws.payload["iat"].as_i64().unwrap(),
+        jws.payload["exp"].as_i64().unwrap(),
+    );
+    assert!(exp > iat && exp - iat <= 3600);
+    jose::verify_es256(&e.api_public, &jws).unwrap();
+
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/apple",
+            Some(&key),
+            json!({"transaction_id": "../x"}),
+        )
+        .await;
+    assert_eq!(s, 400);
+    e.t.app.config_mut().await.apple.private_key.clear();
+    let (s, v) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/apple",
+            Some(&key),
+            json!({"transaction_id": "4002"}),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (503, Some("payments_unavailable"))
+    );
+}
+
+/// The store endpoint hands out a stable token and the sellable plans;
+/// consent can be set and withdrawn.
+#[tokio::test]
+async fn account_store_info_and_consumption_consent() {
+    let e = apple_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let (s, v) =
+        e.t.call("GET", "/v1/account/store", Some(&key), json!({}))
+            .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["app_account_token"], token.as_str());
+    assert_eq!(v["obfuscated_account_id"], token.as_str());
+    assert_eq!(uuid::Uuid::parse_str(&token).unwrap().get_version_num(), 4);
+    assert_eq!(
+        v["apple"],
+        json!({"enabled": true, "bundle_id": BUNDLE, "environment": "Sandbox"})
+    );
+    assert_eq!(v["google"]["enabled"], false);
+    let codes: Vec<&str> = v["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["monthly", "topup10"]);
+    assert_eq!(v["plans"][1]["apple_product_id"], "credits.10");
+
+    let (s, v) =
+        e.t.call(
+            "PATCH",
+            "/v1/account",
+            Some(&key),
+            json!({"consumption_consent": true}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let (consent, at): (bool, Option<i64>) =
+        sqlx::query_as("SELECT consumption_consent,consent_at FROM accounts WHERE id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert!(consent && at.is_some());
+    let (s, _) =
+        e.t.call(
+            "PATCH",
+            "/v1/account",
+            Some(&key),
+            json!({"consumption_consent": false}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (consent, at): (bool, Option<i64>) =
+        sqlx::query_as("SELECT consumption_consent,consent_at FROM accounts WHERE id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert!(!consent && at.is_none());
+    let (s, _) =
+        e.t.call(
+            "PATCH",
+            "/v1/account",
+            Some(&key),
+            json!({"consumption_consent": "yes"}),
+        )
+        .await;
+    assert_eq!(s, 400);
+}
+
+/// A renewal notification grants the new month's quota exactly once, even
+/// when delivered twice or under a second notification id.
+#[tokio::test]
+async fn apple_renewal_extends_and_grants_the_quota_once() {
+    let e = apple_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let now = db::now();
+    let before = bal(&e.t.balance(&aid).await);
+    let first = apple_tx(
+        &token,
+        "5001",
+        "5001",
+        "pro.monthly",
+        "Auto-Renewable Subscription",
+        now - 3600,
+        Some(now + 1800),
+    );
+    let (s, v) = apple_post(&e, &key, &first).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 20.0);
+
+    let renewal = apple_tx(
+        &token,
+        "5002",
+        "5001",
+        "pro.monthly",
+        "Auto-Renewable Subscription",
+        now,
+        Some(now + 30 * 86400),
+    );
+    let (s, v) = apple_notify(&e, "DID_RENEW", "", "uuid-renew-1", &renewal).await;
+    assert_eq!((s, v.clone()), (200, json!({"received": true})));
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 40.0);
+    let (s, v) = apple_notify(&e, "DID_RENEW", "", "uuid-renew-1", &renewal).await;
+    assert_eq!((s, v), (200, json!({"received": true, "duplicate": true})));
+    let (s, _) = apple_notify(&e, "DID_RENEW", "", "uuid-renew-2", &renewal).await;
+    assert_eq!(s, 200);
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 40.0);
+
+    let (subs, expires): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*),MAX(expires_at) FROM subscriptions WHERE account_id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!((subs, expires), (1, now + 30 * 86400));
+    let payments: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM payments WHERE account_id=? AND provider='apple' AND status='paid'",
+    )
+    .bind(&aid)
+    .fetch_one(&e.t.app.db)
+    .await
+    .unwrap();
+    assert_eq!(payments, 2);
+
+    // Auto-renew follows the status notifications.
+    let auto = || async {
+        sqlx::query_scalar::<_, bool>("SELECT auto_renew FROM subscriptions WHERE account_id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap()
+    };
+    assert!(auto().await);
+    apple_notify(
+        &e,
+        "DID_CHANGE_RENEWAL_STATUS",
+        "AUTO_RENEW_DISABLED",
+        "uuid-off",
+        &renewal,
+    )
+    .await;
+    assert!(!auto().await);
+    apple_notify(
+        &e,
+        "DID_CHANGE_RENEWAL_STATUS",
+        "AUTO_RENEW_ENABLED",
+        "uuid-on",
+        &renewal,
+    )
+    .await;
+    assert!(auto().await);
+
+    // Another app or environment is acknowledged and ignored.
+    let next = apple_tx(
+        &token,
+        "5003",
+        "5001",
+        "pro.monthly",
+        "Auto-Renewable Subscription",
+        now,
+        Some(now + 60 * 86400),
+    );
+    for (bundle, environment) in [("com.other", "Sandbox"), (BUNDLE, "Production")] {
+        let (s, v) =
+            apple_notify_for(&e, "DID_RENEW", "", "uuid-x", &next, bundle, environment).await;
+        assert_eq!((s, v), (200, json!({"received": true})));
+    }
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 40.0);
+
+    // An unsigned or forged notification is refused.
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/webhooks/apple",
+            None,
+            json!({"signedPayload": "a.b.c"}),
+        )
+        .await;
+    assert_eq!(s, 400);
+}
+
+/// A refund zeroes the balance, suspends the account, blocks its keys, and
+/// records the identifiers that may not return.
+#[tokio::test]
+async fn apple_refund_zeroes_suspends_and_blocks() {
+    let e = apple_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let now = db::now();
+    let tx = apple_tx(
+        &token,
+        "6001",
+        "6000",
+        "pro.monthly",
+        "Auto-Renewable Subscription",
+        now,
+        Some(now + 30 * 86400),
+    );
+    assert_eq!(apple_post(&e, &key, &tx).await.0, 200);
+    let topup = apple_tx(
+        &token,
+        "6002",
+        "6002",
+        "credits.10",
+        "Consumable",
+        now,
+        None,
+    );
+    assert_eq!(apple_post(&e, &key, &topup).await.0, 200);
+    assert!(bal(&e.t.balance(&aid).await) >= 30.0);
+
+    let (s, v) = apple_notify(&e, "REFUND", "", "uuid-refund", &tx).await;
+    assert_eq!((s, v), (200, json!({"received": true})));
+    assert_eq!(bal(&e.t.balance(&aid).await), 0.0);
+    let (status, reason): (String, String) =
+        sqlx::query_as("SELECT status,suspended_reason FROM accounts WHERE id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!((status.as_str(), reason.as_str()), ("suspended", "refund"));
+    let active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE account_id=? AND status='active'")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(active, 0);
+    let blocks: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind,value FROM refund_blocks WHERE account_id=? ORDER BY kind")
+            .bind(&aid)
+            .fetch_all(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        blocks,
+        [
+            ("apple_original_transaction".to_owned(), "6000".to_owned()),
+            ("ip".to_owned(), "127.0.0.1".to_owned())
+        ]
+    );
+    let refunded: Vec<String> = sqlx::query_scalar(
+        "SELECT external_id FROM payments WHERE account_id=? AND status='refunded'",
+    )
+    .bind(&aid)
+    .fetch_all(&e.t.app.db)
+    .await
+    .unwrap();
+    assert_eq!(refunded, ["6001"]);
+    // The key no longer works.
+    let (s, _) = e.t.call("GET", "/v1/models", Some(&key), json!({})).await;
+    assert_ne!(s, 200);
+
+    // Same refund again: nothing more happens.
+    let (s, v) = apple_notify(&e, "REFUND", "", "uuid-refund", &tx).await;
+    assert_eq!((s, v["duplicate"].clone()), (200, json!(true)));
+
+    // Reversal is only logged: the account stays suspended.
+    let (s, _) = apple_notify(&e, "REFUND_REVERSED", "", "uuid-reversed", &tx).await;
+    assert_eq!(s, 200);
+    let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id=?")
+        .bind(&aid)
+        .fetch_one(&e.t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "suspended");
+}
+
+/// REVOKE (Family Sharing) ends the subscription and its quota but does not
+/// block the account.
+#[tokio::test]
+async fn apple_revoke_ends_the_subscription_without_blocking() {
+    let e = apple_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let now = db::now();
+    let before = bal(&e.t.balance(&aid).await);
+    let tx = apple_tx(
+        &token,
+        "7001",
+        "7001",
+        "pro.monthly",
+        "Auto-Renewable Subscription",
+        now,
+        Some(now + 30 * 86400),
+    );
+    assert_eq!(apple_post(&e, &key, &tx).await.0, 200);
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 20.0);
+    let (s, _) = apple_notify(&e, "REVOKE", "", "uuid-revoke", &tx).await;
+    assert_eq!(s, 200);
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 0.0);
+    let sub: String = sqlx::query_scalar("SELECT status FROM subscriptions WHERE account_id=?")
+        .bind(&aid)
+        .fetch_one(&e.t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(sub, "refunded");
+    let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id=?")
+        .bind(&aid)
+        .fetch_one(&e.t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "active");
+    let blocks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM refund_blocks")
+        .fetch_one(&e.t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(blocks, 0);
+}
+
+/// Consumption data goes to Apple only for customers who consented.
+#[tokio::test]
+async fn apple_consumption_request_needs_consent_and_sends_the_v2_body() {
+    let e = apple_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let now = db::now();
+    let tx = apple_tx(
+        &token,
+        "8001",
+        "8001",
+        "credits.10",
+        "Consumable",
+        now,
+        None,
+    );
+    assert_eq!(apple_post(&e, &key, &tx).await.0, 200);
+    sqlx::query("UPDATE credits SET remaining_micro=amount_micro*7/10 WHERE payment_id IN (SELECT id FROM payments WHERE external_id='8001')")
+        .execute(&e.t.app.db)
+        .await
+        .unwrap();
+    let path = "/inApps/v2/transactions/consumption/8001";
+    reply(&e.mock, &format!("PUT {path}"), json!({}));
+
+    // No consent, nothing is sent.
+    let (s, v) = apple_notify(&e, "CONSUMPTION_REQUEST", "", "uuid-c1", &tx).await;
+    assert_eq!((s, v), (200, json!({"received": true})));
+    assert!(calls(&e.mock, "PUT", path).is_empty());
+
+    // Consent: the exact v2 body, signed with the API key.
+    let (s, _) =
+        e.t.call(
+            "PATCH",
+            "/v1/account",
+            Some(&key),
+            json!({"consumption_consent": true}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (s, v) = apple_notify(&e, "CONSUMPTION_REQUEST", "", "uuid-c2", &tx).await;
+    assert_eq!((s, v), (200, json!({"received": true})));
+    let sent = calls(&e.mock, "PUT", path);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].body,
+        json!({"customerConsented": true, "consumptionPercentage": 30000, "deliveryStatus": "DELIVERED",
+               "refundPreference": "GRANT_PRORATED", "sampleContentProvided": true})
+    );
+    let jws = jose::split(
+        sent[0]
+            .auth
+            .as_deref()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .unwrap(),
+    )
+    .unwrap();
+    jose::verify_es256(&e.api_public, &jws).unwrap();
+    // The same notification again is a duplicate and sends nothing more.
+    let (_, v) = apple_notify(&e, "CONSUMPTION_REQUEST", "", "uuid-c2", &tx).await;
+    assert_eq!(v["duplicate"], true);
+    assert_eq!(calls(&e.mock, "PUT", path).len(), 1);
+
+    // Mostly consumed: decline. Unused: grant in full.
+    sqlx::query("UPDATE credits SET remaining_micro=amount_micro/4 WHERE account_id=? AND payment_id IS NOT NULL").bind(&aid).execute(&e.t.app.db).await.unwrap();
+    apple_notify(&e, "CONSUMPTION_REQUEST", "", "uuid-c3", &tx).await;
+    sqlx::query("UPDATE credits SET remaining_micro=amount_micro WHERE account_id=? AND payment_id IS NOT NULL").bind(&aid).execute(&e.t.app.db).await.unwrap();
+    apple_notify(&e, "CONSUMPTION_REQUEST", "", "uuid-c4", &tx).await;
+    let sent = calls(&e.mock, "PUT", path);
+    assert_eq!(sent[1].body["refundPreference"], "DECLINE");
+    assert_eq!(sent[1].body["consumptionPercentage"], 75000);
+    assert_eq!(sent[2].body["refundPreference"], "GRANT_FULL");
+    assert_eq!(sent[2].body["consumptionPercentage"], 0);
+
+    // Withdrawn consent and disabled reporting send nothing.
+    e.t.call(
+        "PATCH",
+        "/v1/account",
+        Some(&key),
+        json!({"consumption_consent": false}),
+    )
+    .await;
+    apple_notify(&e, "CONSUMPTION_REQUEST", "", "uuid-c5", &tx).await;
+    e.t.call(
+        "PATCH",
+        "/v1/account",
+        Some(&key),
+        json!({"consumption_consent": true}),
+    )
+    .await;
+    e.t.app.config_mut().await.apple.consumption_reporting = false;
+    apple_notify(&e, "CONSUMPTION_REQUEST", "", "uuid-c6", &tx).await;
+    assert_eq!(calls(&e.mock, "PUT", path).len(), 3);
+}
+
+struct GoogleEnv {
+    t: Test,
+    mock: Mock,
+    /// PKCS#8 key of the Pub/Sub token signer.
+    push_key: Vec<u8>,
+    /// Public key of the service account.
+    account_public: RsaPublicKeyComponents<Vec<u8>>,
+}
+
+/// Sets up plans and a Google Play configuration pointing at the mock.
+async fn google_env() -> GoogleEnv {
+    let t = Test::new().await;
+    store_plans(&t).await;
+    let (base, mock) = mock_store().await;
+    let push = RsaPair::generate(KeySize::Rsa2048).unwrap();
+    let account = RsaPair::generate(KeySize::Rsa2048).unwrap();
+    reply(&mock, "GET /certs", {
+        let c = RsaPublicKeyComponents::<Vec<u8>>::from(push.public_key());
+        json!({"keys": [{"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
+                         "n": URL_SAFE_NO_PAD.encode(&c.n), "e": URL_SAFE_NO_PAD.encode(&c.e)}]})
+    });
+    reply(
+        &mock,
+        "POST /token",
+        json!({"access_token": "ya29.test", "expires_in": 3600, "token_type": "Bearer"}),
+    );
+    let account_key = json!({
+        "type": "service_account", "client_email": "play@project.iam.gserviceaccount.com",
+        "private_key": pem("PRIVATE KEY", account.as_der().unwrap().as_ref()),
+        "token_uri": format!("{base}/token"),
+    });
+    {
+        let mut c = t.app.config_mut().await;
+        c.google.package_name = PACKAGE.into();
+        c.google.service_account_json = account_key.to_string();
+        c.google.pubsub_audience = PUSH_AUDIENCE.into();
+        c.google.pubsub_service_account = PUSH_EMAIL.into();
+        c.google.refund_review = true;
+        c.google.api_url = base.clone();
+        c.google.certs_url = format!("{base}/certs");
+    }
+    GoogleEnv {
+        t,
+        mock,
+        push_key: push.as_der().unwrap().as_ref().to_vec(),
+        account_public: RsaPublicKeyComponents::<Vec<u8>>::from(account.public_key()),
+    }
+}
+
+fn push_token(e: &GoogleEnv, edit: impl FnOnce(&mut Value)) -> String {
+    let now = db::now();
+    let mut claims = json!({
+        "iss": "https://accounts.google.com", "aud": PUSH_AUDIENCE, "email": PUSH_EMAIL,
+        "email_verified": true, "iat": now, "exp": now + 3600, "sub": "1234",
+    });
+    edit(&mut claims);
+    jose::sign_rs256(
+        &e.push_key,
+        &json!({"alg": "RS256", "kid": "k1", "typ": "JWT"}),
+        &claims,
+    )
+    .unwrap()
+}
+
+/// Delivers a Pub/Sub push of a developer notification with a valid token.
+async fn google_push(e: &GoogleEnv, message_id: &str, note: Value) -> (u16, Value) {
+    let token = push_token(e, |_| {});
+    google_push_with(e, Some(&token), message_id, note).await
+}
+
+async fn google_push_with(
+    e: &GoogleEnv,
+    token: Option<&str>,
+    message_id: &str,
+    note: Value,
+) -> (u16, Value) {
+    let body = json!({
+        "message": {"data": STANDARD.encode(note.to_string()), "messageId": message_id},
+        "subscription": "projects/p/subscriptions/s",
+    });
+    e.t.call("POST", "/webhooks/google", token, body).await
+}
+
+fn play_sub(state: &str, order: &str, account: &str, expiry: i64, ack: &str) -> Value {
+    json!({
+        "subscriptionState": state, "acknowledgementState": ack, "latestSuccessfulOrderId": order,
+        "startTime": rfc3339(db::now()),
+        "lineItems": [{"productId": "pro.monthly", "expiryTime": rfc3339(expiry),
+                       "autoRenewingPlan": {"autoRenewEnabled": true}}],
+        "externalAccountIdentifiers": {"obfuscatedExternalAccountId": account},
+    })
+}
+
+const SUB_PATH: &str =
+    "/androidpublisher/v3/applications/com.example.app/purchases/subscriptionsv2/tokens/";
+const PRODUCT_PATH: &str =
+    "/androidpublisher/v3/applications/com.example.app/purchases/products/credits.10/tokens/";
+const ACTIVE: &str = "SUBSCRIPTION_STATE_ACTIVE";
+const PENDING_ACK: &str = "ACKNOWLEDGEMENT_STATE_PENDING";
+const ACKED: &str = "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED";
+
+fn sub_note(kind: i64, token: &str) -> Value {
+    json!({"version": "1.0", "packageName": PACKAGE, "eventTimeMillis": "1",
+           "subscriptionNotification": {"version": "1.0", "notificationType": kind,
+                                         "purchaseToken": token, "subscriptionId": "pro.monthly"}})
+}
+
+/// Pub/Sub pushes need Google's OIDC token for the configured audience and
+/// service account.
+#[tokio::test]
+async fn google_push_requires_a_valid_oidc_token() {
+    let e = google_env().await;
+    let note =
+        json!({"version": "1.0", "packageName": PACKAGE, "testNotification": {"version": "1.0"}});
+    let (s, v) = google_push_with(&e, None, "m0", note.clone()).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (401, Some("invalid_push_token"))
+    );
+    for bad in ["garbage", "a.b.c"] {
+        assert_eq!(
+            google_push_with(&e, Some(bad), "m0", note.clone()).await.0,
+            401
+        );
+    }
+    let now = db::now();
+    type Edit = Box<dyn Fn(&mut Value)>;
+    let variants: Vec<Edit> = vec![
+        Box::new(|c| c["aud"] = "https://evil.example".into()),
+        Box::new(|c| c["email"] = "other@project.iam.gserviceaccount.com".into()),
+        Box::new(|c| c["email_verified"] = false.into()),
+        Box::new(|c| c["iss"] = "https://evil.example".into()),
+        Box::new(move |c| c["exp"] = (now - 600).into()),
+        Box::new(move |c| c["iat"] = (now + 600).into()),
+    ];
+    for edit in variants {
+        let token = push_token(&e, edit);
+        assert_eq!(
+            google_push_with(&e, Some(&token), "m0", note.clone())
+                .await
+                .0,
+            401
+        );
+    }
+    // A token from a key Google does not publish.
+    let rogue = RsaPair::generate(KeySize::Rsa2048).unwrap();
+    let claims = json!({"iss": "accounts.google.com", "aud": PUSH_AUDIENCE, "email": PUSH_EMAIL,
+                        "email_verified": true, "iat": now, "exp": now + 3600});
+    let forged = jose::sign_rs256(
+        rogue.as_der().unwrap().as_ref(),
+        &json!({"alg": "RS256", "kid": "k1"}),
+        &claims,
+    )
+    .unwrap();
+    assert_eq!(
+        google_push_with(&e, Some(&forged), "m0", note.clone())
+            .await
+            .0,
+        401
+    );
+    let unknown = jose::sign_rs256(
+        rogue.as_der().unwrap().as_ref(),
+        &json!({"alg": "RS256", "kid": "zz"}),
+        &claims,
+    )
+    .unwrap();
+    assert_eq!(
+        google_push_with(&e, Some(&unknown), "m0", note.clone())
+            .await
+            .0,
+        401
+    );
+
+    // The right token works, with either spelling of the issuer.
+    assert_eq!(
+        google_push(&e, "m1", note.clone()).await,
+        (200, json!({"received": true}))
+    );
+    let token = push_token(&e, |c| c["iss"] = "accounts.google.com".into());
+    assert_eq!(google_push_with(&e, Some(&token), "m2", note).await.0, 200);
+    assert_eq!(calls(&e.mock, "GET", "/certs").len(), 1, "keys are cached");
+}
+
+/// A Play subscription credits once, is bound to its account, and is
+/// acknowledged after it is credited.
+#[tokio::test]
+async fn google_subscription_verify_credits_once_and_acknowledges() {
+    let e = google_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let (_, _, other) = store_account(&e.t).await;
+    let before = bal(&e.t.balance(&aid).await);
+    let expiry = db::now() + 30 * 86400;
+    let body = json!({"product_id": "pro.monthly", "purchase_token": "tok-sub-1"});
+    let path = format!("{SUB_PATH}tok-sub-1");
+
+    reply(
+        &e.mock,
+        &format!("GET {path}"),
+        play_sub(ACTIVE, "GPA.1001", &other, expiry, PENDING_ACK),
+    );
+    let (s, v) =
+        e.t.call("POST", "/v1/account/store/google", Some(&key), body.clone())
+            .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("store_account_mismatch"))
+    );
+    assert!(calls(&e.mock, "POST", ":acknowledge").is_empty());
+
+    reply(
+        &e.mock,
+        &format!("GET {path}"),
+        play_sub(ACTIVE, "GPA.1001", &token, expiry, PENDING_ACK),
+    );
+    let (s, v) =
+        e.t.call("POST", "/v1/account/store/google", Some(&key), body.clone())
+            .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["purchase"]["credited"], true);
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 20.0);
+    let ack = calls(
+        &e.mock,
+        "POST",
+        "/purchases/subscriptions/pro.monthly/tokens/tok-sub-1:acknowledge",
+    );
+    assert_eq!(ack.len(), 1);
+    assert_eq!(ack[0].auth.as_deref(), Some("Bearer ya29.test"));
+    let (order, ext): (String, String) =
+        sqlx::query_as("SELECT id,external_id FROM payments WHERE account_id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        (v["purchase"]["order_id"].as_str(), ext.as_str()),
+        (Some(order.as_str()), "GPA.1001")
+    );
+
+    // Repeat: credited false, balance unchanged.
+    reply(
+        &e.mock,
+        &format!("GET {path}"),
+        play_sub(ACTIVE, "GPA.1001", &token, expiry, ACKED),
+    );
+    let (s, v) =
+        e.t.call("POST", "/v1/account/store/google", Some(&key), body.clone())
+            .await;
+    assert_eq!((s, v["purchase"]["credited"].clone()), (200, json!(false)));
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 20.0);
+    assert_eq!(calls(&e.mock, "POST", ":acknowledge").len(), 1);
+
+    // The service account assertion was a valid RS256 JWT for the scope.
+    let exchange = calls(&e.mock, "POST", "/token");
+    assert_eq!(exchange.len(), 1, "the access token is cached");
+    let form = exchange[0].body.as_str().unwrap();
+    assert!(
+        form.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"),
+        "{form}"
+    );
+    let assertion = form.split("assertion=").nth(1).unwrap();
+    let jws = jose::split(assertion).unwrap();
+    jose::verify_rs256(&e.account_public.n, &e.account_public.e, &jws).unwrap();
+    assert_eq!(
+        jws.payload["scope"],
+        "https://www.googleapis.com/auth/androidpublisher"
+    );
+    assert_eq!(jws.payload["iss"], "play@project.iam.gserviceaccount.com");
+
+    // Not active, wrong product, unknown product, missing fields.
+    reply(
+        &e.mock,
+        &format!("GET {path}"),
+        play_sub(
+            "SUBSCRIPTION_STATE_EXPIRED",
+            "GPA.1001",
+            &token,
+            expiry,
+            ACKED,
+        ),
+    );
+    let (s, v) =
+        e.t.call("POST", "/v1/account/store/google", Some(&key), body)
+            .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("subscription_not_active"))
+    );
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key),
+            json!({"product_id": "nope", "purchase_token": "t"}),
+        )
+        .await;
+    assert_eq!(s, 400);
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key),
+            json!({"product_id": "pro.monthly"}),
+        )
+        .await;
+    assert_eq!(s, 400);
+    e.t.app
+        .config_mut()
+        .await
+        .google
+        .service_account_json
+        .clear();
+    let (s, v) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key),
+            json!({"product_id": "pro.monthly", "purchase_token": "x"}),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (503, Some("payments_unavailable"))
+    );
+}
+
+/// A one-time purchase credits its quantity once and is consumed.
+#[tokio::test]
+async fn google_one_time_verify_credits_quantity_and_consumes() {
+    let e = google_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let before = bal(&e.t.balance(&aid).await);
+    let body = json!({"product_id": "credits.10", "purchase_token": "tok-one-1"});
+    let path = format!("{PRODUCT_PATH}tok-one-1");
+    let purchase = |state: i64, consumption: i64| {
+        json!({
+            "purchaseState": state, "consumptionState": consumption, "acknowledgementState": 0,
+            "orderId": "GPA.2001", "purchaseTimeMillis": "1", "quantity": 2, "obfuscatedExternalAccountId": token,
+        })
+    };
+
+    reply(&e.mock, &format!("GET {path}"), purchase(2, 0));
+    let (s, v) =
+        e.t.call("POST", "/v1/account/store/google", Some(&key), body.clone())
+            .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (409, Some("purchase_pending"))
+    );
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 0.0);
+
+    reply(&e.mock, &format!("GET {path}"), purchase(0, 0));
+    let (s, v) =
+        e.t.call("POST", "/v1/account/store/google", Some(&key), body.clone())
+            .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["purchase"]["credited"], true);
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 20.0);
+    assert_eq!(
+        calls(
+            &e.mock,
+            "POST",
+            "/purchases/products/credits.10/tokens/tok-one-1:consume"
+        )
+        .len(),
+        1
+    );
+
+    reply(&e.mock, &format!("GET {path}"), purchase(0, 1));
+    let (s, v) =
+        e.t.call("POST", "/v1/account/store/google", Some(&key), body)
+            .await;
+    assert_eq!((s, v["purchase"]["credited"].clone()), (200, json!(false)));
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 20.0);
+    assert_eq!(calls(&e.mock, "POST", ":consume").len(), 1);
+
+    // Without an order id the token identifies the charge.
+    let mut no_order = purchase(0, 0);
+    no_order.as_object_mut().unwrap().remove("orderId");
+    reply(&e.mock, &format!("GET {PRODUCT_PATH}tok-one-2"), no_order);
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key),
+            json!({"product_id": "credits.10", "purchase_token": "tok-one-2"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let ext: String =
+        sqlx::query_scalar("SELECT external_id FROM payments WHERE purchase_token='tok-one-2'")
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(ext, "token:tok-one-2");
+}
+
+/// Renewal notifications extend the subscription once per purchase and the
+/// same Pub/Sub message is never applied twice; cancellation stops renewal;
+/// notifications for another package are ignored.
+#[tokio::test]
+async fn google_renewal_notifications_grant_once_and_dedupe_messages() {
+    let e = google_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let before = bal(&e.t.balance(&aid).await);
+    let path = format!("{SUB_PATH}tok-sub-2");
+    let first = db::now() + 3600;
+    reply(
+        &e.mock,
+        &format!("GET {path}"),
+        play_sub(ACTIVE, "GPA.3001", &token, first, ACKED),
+    );
+    let (s, v) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key),
+            json!({"product_id": "pro.monthly", "purchase_token": "tok-sub-2"}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 20.0);
+
+    let renewed = db::now() + 30 * 86400;
+    reply(
+        &e.mock,
+        &format!("GET {path}"),
+        play_sub(ACTIVE, "GPA.3001..0", &token, renewed, PENDING_ACK),
+    );
+    assert_eq!(
+        google_push(&e, "msg-1", sub_note(2, "tok-sub-2")).await,
+        (200, json!({"received": true}))
+    );
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 40.0);
+    assert_eq!(
+        calls(&e.mock, "POST", ":acknowledge").len(),
+        1,
+        "a pending renewal is acknowledged"
+    );
+    assert_eq!(
+        google_push(&e, "msg-1", sub_note(2, "tok-sub-2")).await,
+        (200, json!({"received": true, "duplicate": true}))
+    );
+    // Another message for the same order credits nothing more.
+    assert_eq!(
+        google_push(&e, "msg-2", sub_note(2, "tok-sub-2")).await.0,
+        200
+    );
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 40.0);
+    let (subs, end): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*),MAX(expires_at) FROM subscriptions WHERE account_id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!((subs, end), (1, renewed));
+
+    // Canceled: access continues, renewal stops.
+    assert_eq!(
+        google_push(&e, "msg-3", sub_note(3, "tok-sub-2")).await.0,
+        200
+    );
+    let auto: bool = sqlx::query_scalar("SELECT auto_renew FROM subscriptions WHERE account_id=?")
+        .bind(&aid)
+        .fetch_one(&e.t.app.db)
+        .await
+        .unwrap();
+    assert!(!auto);
+
+    // Another package, a test ping, and ignorable types change nothing.
+    let mut elsewhere = sub_note(4, "tok-sub-2");
+    elsewhere["packageName"] = "com.other".into();
+    assert_eq!(
+        google_push(&e, "msg-4", elsewhere).await,
+        (200, json!({"received": true}))
+    );
+    assert_eq!(
+        google_push(&e, "msg-5", sub_note(13, "tok-sub-2")).await.0,
+        200
+    );
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 40.0);
+}
+
+/// A purchase upgrade ends the subscription it replaces without blocking.
+#[tokio::test]
+async fn google_linked_purchase_token_ends_the_old_subscription() {
+    let e = google_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    let expiry = db::now() + 30 * 86400;
+    for (name, order) in [("old", "GPA.4001"), ("new", "GPA.4002")] {
+        let mut sub = play_sub(ACTIVE, order, &token, expiry, ACKED);
+        if name == "new" {
+            sub["linkedPurchaseToken"] = "old".into();
+        }
+        reply(&e.mock, &format!("GET {SUB_PATH}{name}"), sub);
+        let (s, v) =
+            e.t.call(
+                "POST",
+                "/v1/account/store/google",
+                Some(&key),
+                json!({"product_id": "pro.monthly", "purchase_token": name}),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT purchase_token,status FROM subscriptions WHERE account_id=? ORDER BY purchase_token").bind(&aid).fetch_all(&e.t.app.db).await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("new".to_owned(), "active".to_owned()),
+            ("old".to_owned(), "refunded".to_owned())
+        ]
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id=?")
+        .bind(&aid)
+        .fetch_one(&e.t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "active");
+}
+
+/// A one-time purchase notification credits and consumes the purchase.
+#[tokio::test]
+async fn google_one_time_notification_credits_once() {
+    let e = google_env().await;
+    let (_, aid, token) = store_account(&e.t).await;
+    let before = bal(&e.t.balance(&aid).await);
+    reply(
+        &e.mock,
+        &format!("GET {PRODUCT_PATH}tok-one-3"),
+        json!({
+            "purchaseState": 0, "consumptionState": 0, "orderId": "GPA.5001", "quantity": 1,
+            "obfuscatedExternalAccountId": token,
+        }),
+    );
+    let note = json!({"version": "1.0", "packageName": PACKAGE, "eventTimeMillis": "1",
+        "oneTimeProductNotification": {"version": "1.0", "notificationType": 1, "purchaseToken": "tok-one-3", "sku": "credits.10"}});
+    assert_eq!(google_push(&e, "msg-a", note.clone()).await.0, 200);
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 10.0);
+    assert_eq!(calls(&e.mock, "POST", ":consume").len(), 1);
+    assert_eq!(google_push(&e, "msg-b", note).await.0, 200);
+    assert_eq!(bal(&e.t.balance(&aid).await) - before, 10.0);
+}
+
+/// Voided purchases and revocations zero the account and block it.
+#[tokio::test]
+async fn google_voided_purchase_blocks_the_account() {
+    let e = google_env().await;
+    let (key, aid, token) = store_account(&e.t).await;
+    // A second account is opened first: a refund blocks new signups from the address.
+    let (key2, aid2, token2) = store_account(&e.t).await;
+    reply(
+        &e.mock,
+        &format!("GET {SUB_PATH}tok-sub-9"),
+        play_sub(ACTIVE, "GPA.6002", &token2, db::now() + 86400, ACKED),
+    );
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key2),
+            json!({"product_id": "pro.monthly", "purchase_token": "tok-sub-9"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    reply(
+        &e.mock,
+        &format!("GET {PRODUCT_PATH}tok-one-4"),
+        json!({
+            "purchaseState": 0, "consumptionState": 0, "orderId": "GPA.6001", "quantity": 1,
+            "obfuscatedExternalAccountId": token,
+        }),
+    );
+    let (s, v) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key),
+            json!({"product_id": "credits.10", "purchase_token": "tok-one-4"}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(bal(&e.t.balance(&aid).await) >= 10.0);
+
+    let note = json!({"version": "1.0", "packageName": PACKAGE, "eventTimeMillis": "1",
+        "voidedPurchaseNotification": {"purchaseToken": "tok-one-4", "orderId": "GPA.6001", "productType": 2, "refundType": 1}});
+    assert_eq!(
+        google_push(&e, "msg-v1", note.clone()).await,
+        (200, json!({"received": true}))
+    );
+    assert_eq!(bal(&e.t.balance(&aid).await), 0.0);
+    let (status, reason): (String, String) =
+        sqlx::query_as("SELECT status,suspended_reason FROM accounts WHERE id=?")
+            .bind(&aid)
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!((status.as_str(), reason.as_str()), ("suspended", "refund"));
+    let blocks: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM refund_blocks WHERE account_id=?")
+            .bind(&aid)
+            .fetch_all(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(blocks, ["ip"]);
+    let payment: String =
+        sqlx::query_scalar("SELECT status FROM payments WHERE external_id='GPA.6001'")
+            .fetch_one(&e.t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(payment, "refunded");
+    assert_eq!(google_push(&e, "msg-v1", note).await.1["duplicate"], true);
+
+    // A revoked subscription blocks as well.
+    assert_eq!(
+        google_push(&e, "msg-v2", sub_note(12, "tok-sub-9")).await.0,
+        200
+    );
+    assert_eq!(bal(&e.t.balance(&aid2).await), 0.0);
+    let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id=?")
+        .bind(&aid2)
+        .fetch_one(&e.t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "suspended");
+}
+
+/// A pending chargeback review is answered with the consumption share.
+#[tokio::test]
+async fn google_pending_refund_review_posts_the_review() {
+    let e = google_env().await;
+    let (key, _, token) = store_account(&e.t).await;
+    reply(
+        &e.mock,
+        &format!("GET {PRODUCT_PATH}tok-one-5"),
+        json!({
+            "purchaseState": 0, "consumptionState": 0, "orderId": "GPA.7001", "quantity": 1,
+            "obfuscatedExternalAccountId": token,
+        }),
+    );
+    let (s, _) =
+        e.t.call(
+            "POST",
+            "/v1/account/store/google",
+            Some(&key),
+            json!({"product_id": "credits.10", "purchase_token": "tok-one-5"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    sqlx::query("UPDATE credits SET remaining_micro=amount_micro*7/10 WHERE payment_id IN (SELECT id FROM payments WHERE external_id='GPA.7001')").execute(&e.t.app.db).await.unwrap();
+    let review = |reason: i64| {
+        json!({"version": "1.0", "packageName": PACKAGE, "eventTimeMillis": "1",
+        "pendingRefundReviewNotification": {"pendingRefundToken": "prt-1", "orderId": "GPA.7001",
+                                             "refundReason": reason, "obfuscatedAccountId": token}})
+    };
+    let path = "/orders/GPA.7001:reviewrefund";
+    reply(
+        &e.mock,
+        &format!("POST /androidpublisher/v3/applications/com.example.app{path}"),
+        json!({}),
+    );
+
+    // Only chargebacks are answered.
+    assert_eq!(google_push(&e, "msg-r0", review(1)).await.0, 200);
+    assert!(calls(&e.mock, "POST", path).is_empty());
+    assert_eq!(
+        google_push(&e, "msg-r1", review(7)).await,
+        (200, json!({"received": true}))
+    );
+    let sent = calls(&e.mock, "POST", path);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].body,
+        json!({"pendingRefundToken": "prt-1", "sampleContentProvided": true,
+               "refundPreference": "NEUTRAL", "consumptionPercentageMilliunits": 30000})
+    );
+    assert_eq!(sent[0].auth.as_deref(), Some("Bearer ya29.test"));
+
+    // Mostly consumed: decline. Unused: approve.
+    for (message, remaining, preference) in [("msg-r2", 3, "DECLINE"), ("msg-r3", 10, "APPROVE")] {
+        sqlx::query(
+            "UPDATE credits SET remaining_micro=amount_micro*?/10 WHERE payment_id IS NOT NULL",
+        )
+        .bind(remaining)
+        .execute(&e.t.app.db)
+        .await
+        .unwrap();
+        assert_eq!(google_push(&e, message, review(7)).await.0, 200);
+        assert_eq!(
+            calls(&e.mock, "POST", path).last().unwrap().body["refundPreference"],
+            preference
+        );
+    }
+    // The same message again is a duplicate.
+    assert_eq!(
+        google_push(&e, "msg-r3", review(7)).await.1["duplicate"],
+        true
+    );
+    assert_eq!(calls(&e.mock, "POST", path).len(), 3);
 }

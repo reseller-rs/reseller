@@ -60,27 +60,23 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             keys::create(app, Requester::Admin { account: aid }, ip, &body).await
         }
         (["accounts", aid, "credits"], "POST") => {
+            let key = billing::idempotency_key(idempotency_header(&req))?.to_owned();
             let body = object(req).await?;
-            let mut tx = db::write(&app.db).await?;
-            billing::credit(
-                &mut tx,
+            billing::admin_credit(
+                app,
                 aid,
+                &key,
                 money::value(&body["amount_usd"])?,
                 text_or(&body, "source", "admin")?,
                 expiry(&body["expires_at"])?,
                 text_or(&body, "note", "")?,
             )
-            .await?;
-            tx.commit().await?;
-            billing::account(app, aid).await
+            .await
         }
         (["accounts", aid, "subscriptions"], "POST") => {
+            let key = billing::idempotency_key(idempotency_header(&req))?.to_owned();
             let body = object(req).await?;
-            billing::account(app, aid).await?; // 404 for unknown accounts
-            let mut tx = db::write(&app.db).await?;
-            billing::grant(&mut tx, aid, text(&body, "plan_code")?).await?;
-            tx.commit().await?;
-            billing::account(app, aid).await
+            billing::admin_grant(app, aid, &key, text(&body, "plan_code")?).await
         }
 
         (["plans"], "GET") => billing::plans(app, false).await,
@@ -113,6 +109,13 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             "Unknown administrator endpoint",
         )),
     }
+}
+
+/// The `Idempotency-Key` request header, if present and valid UTF-8.
+fn idempotency_header(req: &Request<Body>) -> Option<&str> {
+    req.headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
 }
 
 async fn list_accounts(app: &App, q: &Query) -> Result<Value> {
@@ -150,7 +153,7 @@ async fn list_accounts(app: &App, q: &Query) -> Result<Value> {
            COALESCE((SELECT SUM(k.billed_micro) FROM api_keys k WHERE k.account_id=a.id),0) AS billed_micro,\
            COALESCE((SELECT SUM(u.billed_micro) FROM usage_buckets u WHERE u.account_id=a.id \
              AND u.hour>=?),0) AS usage_30d_micro,\
-           (SELECT s.plan_code FROM subscriptions s WHERE s.account_id=a.id AND s.expires_at>? \
+           (SELECT s.plan_code FROM subscriptions s WHERE s.account_id=a.id AND s.status='active' AND s.expires_at>? \
              ORDER BY s.expires_at DESC LIMIT 1) AS plan_code \
          FROM accounts a WHERE {FILTER} ORDER BY {order} {},id DESC LIMIT ? OFFSET ?",
         direction(q)
@@ -226,6 +229,12 @@ async fn patch_account(app: &App, aid: &str, b: &Value) -> Result<Value> {
     billing::account(app, aid).await
 }
 
+/// Creates or replaces a plan.
+///
+/// Body: `code`, `name`, `kind` (`subscription` or `topup`), `price_usd`,
+/// `monthly_quota_usd` and `months` (1-12) for a subscription or
+/// `credit_usd` for a top-up, optional `apple_product_id` and
+/// `google_product_id` (null clears them), `active`, and `description`.
 async fn save_plan(app: &App, b: &Value) -> Result<Value> {
     let code = text(b, "code")?;
     if code.is_empty()
@@ -236,29 +245,65 @@ async fn save_plan(app: &App, b: &Value) -> Result<Value> {
     {
         return Err(Error::bad("Invalid plan code"));
     }
+    let kind = text_or(b, "kind", billing::SUBSCRIPTION)?;
     let price = money::value(&b["price_usd"])?;
-    let credit = money::value(&b["credit_usd"])?;
-    let days = b["duration_days"].as_i64().unwrap_or(0);
-    if price <= 0 || credit <= 0 || !(1..=3650).contains(&days) {
+    let (credit, months) = match kind {
+        billing::SUBSCRIPTION => {
+            let months = b["months"].as_i64().unwrap_or(0);
+            if !(1..=12).contains(&months) {
+                return Err(Error::bad("A subscription runs for 1-12 months").with_param("months"));
+            }
+            (money::value(&b["monthly_quota_usd"])?, Some(months))
+        }
+        billing::TOPUP => (money::value(&b["credit_usd"])?, None),
+        _ => return Err(Error::bad("kind must be subscription or topup").with_param("kind")),
+    };
+    if price <= 0 || credit <= 0 {
         return Err(Error::bad(
-            "Positive price, credit, and duration of 1-3650 days required",
+            "Positive price and credit (or monthly quota) required",
         ));
     }
-    sqlx::query(
-        "INSERT INTO plans(code,name,price_micro,credit_micro,duration_days,active,description) \
-         VALUES(?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,\
-         price_micro=excluded.price_micro,credit_micro=excluded.credit_micro,\
-         duration_days=excluded.duration_days,active=excluded.active,description=excluded.description",
+    let product = |field: &'static str| -> Result<Option<&str>> {
+        match &b[field] {
+            Value::Null => Ok(None),
+            Value::String(id) if !id.is_empty() && id.len() <= 255 => Ok(Some(id.as_str())),
+            _ => Err(
+                Error::bad(format!("{field} must be a non-empty string or null")).with_param(field),
+            ),
+        }
+    };
+    let saved = sqlx::query(
+        "INSERT INTO plans(code,name,kind,price_micro,credit_micro,months,apple_product_id,\
+         google_product_id,active,description) VALUES(?,?,?,?,?,?,?,?,?,?) \
+         ON CONFLICT(code) DO UPDATE SET name=excluded.name,kind=excluded.kind,\
+         price_micro=excluded.price_micro,credit_micro=excluded.credit_micro,months=excluded.months,\
+         apple_product_id=excluded.apple_product_id,google_product_id=excluded.google_product_id,\
+         active=excluded.active,description=excluded.description",
     )
     .bind(code)
     .bind(text(b, "name")?)
+    .bind(kind)
     .bind(price)
     .bind(credit)
-    .bind(days)
+    .bind(months)
+    .bind(product("apple_product_id")?)
+    .bind(product("google_product_id")?)
     .bind(b["active"].as_bool().unwrap_or(true))
     .bind(text_or(b, "description", "")?)
     .execute(&app.db)
-    .await?;
+    .await;
+    match saved {
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(Error::new(
+                StatusCode::CONFLICT,
+                "product_id_in_use",
+                "Another plan already uses this App Store or Google Play product id",
+            ));
+        }
+        other => {
+            other?;
+        }
+    }
     billing::plans(app, false).await
 }
 

@@ -4,7 +4,9 @@
 //! A challenge is `hex(sha256(salt + number))` for a random `number` in
 //! `[0, maxnumber]`. The client finds the number by brute force.
 //!
-//! The salt carries its own expiry (`<hex>?expires=<unix>`). The server signs
+//! The salt carries its own expiry and difficulty
+//! (`<hex>?expires=<unix>&max=<maxnumber>`), bound to the challenge hash, so
+//! a client cannot lower either. The server signs
 //! each challenge with HMAC-SHA256 under a key derived from the pepper. This
 //! keeps the server stateless until a solution is redeemed. A redeemed
 //! solution is single use, and the caller records it in `pow_spent`.
@@ -51,6 +53,8 @@ pub struct Verified {
     /// Unix time after which the solution can no longer be replayed (and the
     /// spent record may be purged).
     pub expires: i64,
+    /// The difficulty (`maxnumber`) the challenge was issued with.
+    pub difficulty: u64,
 }
 
 /// Derives the HMAC signing key from the pepper and the domain label.
@@ -87,7 +91,7 @@ pub fn create(pepper: &str, max_number: u32, ttl_seconds: u32, now: i64) -> Chal
     let mut random = [0u8; 20];
     getrandom::fill(&mut random).expect("operating system random source is available");
     let salt = format!(
-        "{}?expires={}",
+        "{}?expires={}&max={max_number}",
         hex::encode(&random[..12]),
         now + i64::from(ttl_seconds)
     );
@@ -124,11 +128,11 @@ pub fn encode(challenge: &Challenge, number: u64) -> String {
     STANDARD.encode(serde_json::to_vec(&solution).expect("solution is serializable"))
 }
 
-/// Parses the `expires` Unix time from the salt's query string.
-fn expires(salt: &str) -> Option<i64> {
+/// Parses an integer parameter (`expires`, `max`) from the salt's query string.
+fn salt_param<T: std::str::FromStr>(salt: &str, name: &str) -> Option<T> {
     let (_, query) = salt.split_once('?')?;
     url::form_urlencoded::parse(query.as_bytes())
-        .find(|(k, _)| k == "expires")
+        .find(|(k, _)| k == name)
         .and_then(|(_, v)| v.parse().ok())
 }
 
@@ -144,7 +148,8 @@ fn invalid(message: &str) -> Error {
 /// 1. The algorithm name.
 /// 2. The signature over the challenge.
 /// 3. The expiry in the salt.
-/// 4. The number, which must not exceed `max_number`.
+/// 4. The difficulty in the salt, which must not exceed `max_number`, and the
+///    number, which must not exceed that difficulty.
 /// 5. The hash of the salt and number.
 ///
 /// This does not check for replays. The caller records `Verified::challenge`.
@@ -164,11 +169,14 @@ pub fn verify(pepper: &str, payload: &str, max_number: u32, now: i64) -> Result<
     if !equal(&sign(pepper, &solution.challenge), &solution.signature) {
         return Err(invalid("Proof of work signature is invalid"));
     }
-    let expires = expires(&solution.salt).ok_or_else(|| invalid("Challenge has no expiry"))?;
+    let expires: i64 =
+        salt_param(&solution.salt, "expires").ok_or_else(|| invalid("Challenge has no expiry"))?;
+    let difficulty: u64 =
+        salt_param(&solution.salt, "max").ok_or_else(|| invalid("Challenge has no difficulty"))?;
     if expires <= now {
         return Err(invalid("Challenge expired. Request a new one"));
     }
-    if solution.number > u64::from(max_number) {
+    if difficulty > u64::from(max_number) || solution.number > difficulty {
         return Err(invalid("Proof of work number is out of range"));
     }
     if !equal(
@@ -180,6 +188,7 @@ pub fn verify(pepper: &str, payload: &str, max_number: u32, now: i64) -> Result<
     Ok(Verified {
         challenge: solution.challenge,
         expires,
+        difficulty,
     })
 }
 
@@ -199,7 +208,7 @@ mod tests {
         let c = create(PEPPER, 500, 300, NOW);
         assert_eq!(c.algorithm, "SHA-256");
         assert_eq!(c.maxnumber, 500);
-        assert!(c.salt.ends_with(&format!("?expires={}", NOW + 300)));
+        assert!(c.salt.ends_with(&format!("?expires={}&max=500", NOW + 300)));
         let n = solve(&c).expect("solvable");
         assert!(n <= 500);
         let ok = verify(PEPPER, &encode(&c, n), 500, NOW).unwrap();

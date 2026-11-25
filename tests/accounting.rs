@@ -1014,3 +1014,221 @@ async fn discovery_lists_mcp_and_signup() {
     assert_eq!(v["mcp"], "/mcp");
     assert_eq!(v["signup"], "/v1/signup");
 }
+
+/// Prices only output tokens, at 10 USD per 1M, so a request's hold is
+/// exactly `max_tokens * 0.00001` USD.
+fn output_priced() -> Price {
+    price("0", "10")
+}
+
+/// An upstream that holds every response until `open` turns true, then
+/// reports `output` completion tokens.
+fn gated(open: tokio::sync::watch::Receiver<bool>, output: i64) -> Router {
+    fixed(move |_| {
+        let mut open = open.clone();
+        async move {
+            let _ = open.wait_for(|o| *o).await;
+            json_response(
+                json!({"usage":{"prompt_tokens":0,"completion_tokens":output,"total_tokens":output}}),
+            )
+        }
+    })
+}
+
+/// Concurrent requests cannot overdraw the balance: each one holds its
+/// worst-case cost at admission, so with $0.10 and $0.03 holds only three
+/// run at once. The others get a short 429 (the balance is reserved, not
+/// spent), and nothing ends up as debt.
+#[tokio::test]
+async fn concurrent_requests_cannot_overdraw_the_balance() {
+    let mut t = Test::new(&[("m", output_priced())]).await;
+    let (open, gate) = tokio::sync::watch::channel(false);
+    t.mock(llm_upstream, gated(gate, 3000)).await;
+    let body = json!({"model":"m","max_tokens":3000,"messages":[{"role":"user","content":"hi"}]});
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let request = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", t.addr))
+            .bearer_auth(t.token())
+            .json(&body);
+        tasks.push(tokio::spawn(async move { request.send().await.unwrap() }));
+    }
+    // The three admitted requests wait upstream; the rest answer at once.
+    for _ in 0..200 {
+        if tasks.iter().filter(|task| task.is_finished()).count() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let held: i64 = sqlx::query_scalar("SELECT SUM(hold_micro) FROM requests WHERE finished=0")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(held, 90_000, "three holds of 0.03 USD");
+    open.send(true).unwrap();
+    let mut statuses = Vec::new();
+    for task in tasks {
+        let response = task.await.unwrap();
+        let status = response.status().as_u16();
+        if status == 429 {
+            assert_eq!(response.headers()["retry-after"], "1");
+            let error: Value = response.json().await.unwrap();
+            assert_eq!(error["error"]["code"], "balance_reserved");
+        }
+        statuses.push(status);
+    }
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 200, 200, 429, 429, 429]);
+    t.settled(3).await;
+    assert_eq!(t.balance().await, "0.01");
+    let debt: i64 = sqlx::query_scalar("SELECT debt_micro FROM accounts")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(debt, 0);
+}
+
+/// A request whose worst-case cost exceeds the whole balance is a 402
+/// `insufficient_quota` without a retry hint, like an empty balance.
+#[tokio::test]
+async fn unaffordable_and_empty_balances_are_402_without_retry_after() {
+    let mut t = Test::new(&[("m", output_priced())]).await;
+    t.mock(
+        llm_upstream,
+        fixed(|_| async { json_response(json!({"usage":{"total_tokens":1}})) }),
+    )
+    .await;
+    // 20000 output tokens hold 0.20 USD; the trial credit is 0.10.
+    let r = t
+        .post(
+            "/v1/chat/completions",
+            &json!({"model":"m","max_tokens":20000,"messages":[]}),
+        )
+        .await;
+    assert_eq!(r.status(), 402);
+    assert!(r.headers().get("retry-after").is_none());
+    let error: Value = r.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "insufficient_quota");
+    assert_eq!(error["error"]["type"], "insufficient_quota");
+    assert!(error["error"]["message"].as_str().unwrap().contains("0.2"));
+
+    sqlx::query("UPDATE credits SET remaining_micro=0")
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let r = t
+        .post("/v1/chat/completions", &json!({"model":"m","messages":[]}))
+        .await;
+    assert_eq!(r.status(), 402);
+    assert!(r.headers().get("retry-after").is_none());
+}
+
+/// Usage windows answer with the time until enough settled usage leaves the
+/// window, and tell SDKs not to retry right away. Request-rate throttles
+/// keep a short, exact retry and allow the SDK's own retry.
+#[tokio::test]
+async fn limit_errors_carry_exact_retry_hints() {
+    let mut t = Test::new(&[("m", output_priced())]).await;
+    t.mock(
+        llm_upstream,
+        fixed(|_| async {
+            json_response(json!({"usage":{"completion_tokens":3000,"total_tokens":3000}}))
+        }),
+    )
+    .await;
+    sqlx::query("UPDATE api_keys SET limits=?")
+        .bind(json!({"spend":{"max_usd":"0.05","window_hours":24}}).to_string())
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let body = json!({"model":"m","max_tokens":3000,"messages":[]});
+    assert_eq!(t.post("/v1/chat/completions", &body).await.status(), 200);
+    t.settled(1).await;
+    // 0.03 settled + 0.03 held > 0.05.
+    let r = t.post("/v1/chat/completions", &body).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.headers()["x-should-retry"], "false");
+    let wait: i64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The settled spend sits in the current hour bucket, which leaves the
+    // 24-hour window one hour after the window would otherwise end.
+    let hour = db::now() / 3600 * 3600;
+    let expected = hour + 3600 + 24 * 3600 - db::now();
+    assert!(
+        (expected - 2..=expected + 2).contains(&wait),
+        "{wait} vs {expected}"
+    );
+    let error: Value = r.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "spend_limit_exceeded");
+    assert_eq!(error["error"]["type"], "rate_limit_error");
+
+    sqlx::query("UPDATE api_keys SET limits=?")
+        .bind(json!({"rpm":1}).to_string())
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    let small = json!({"model":"m","max_tokens":10,"messages":[]});
+    let r = t.post("/v1/chat/completions", &small).await;
+    assert_eq!(
+        r.status(),
+        429,
+        "the earlier request still counts this minute"
+    );
+    assert!(r.headers().get("x-should-retry").is_none());
+    let wait: u64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    let error: Value = r.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+}
+
+/// A new account may spend at most `new_account_daily_spend_pct` of its
+/// paid allowance per day during its first `new_account_hours`, so one
+/// evening cannot burn a purchase that is then refunded.
+#[tokio::test]
+async fn new_accounts_have_a_daily_spending_cap() {
+    let mut t = Test::new(&[("m", output_priced())]).await;
+    t.mock(
+        llm_upstream,
+        fixed(|_| async {
+            json_response(json!({"usage":{"completion_tokens":3000,"total_tokens":3000}}))
+        }),
+    )
+    .await;
+    // A purchased $1 top-up: the cap is 20% of it, $0.20 per day.
+    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    billing::credit(&mut tx, t.account(), 1_000_000, "purchase", None, "")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let body = json!({"model":"m","max_tokens":3000,"messages":[]});
+    for _ in 0..6 {
+        assert_eq!(t.post("/v1/chat/completions", &body).await.status(), 200);
+    }
+    t.settled(6).await;
+    // 0.18 spent + 0.03 held > 0.20.
+    let r = t.post("/v1/chat/completions", &body).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.headers()["x-should-retry"], "false");
+    let wait: i64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=48 * 3600).contains(&wait), "{wait}");
+    let error: Value = r.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "new_account_daily_limit");
+    // Once the account is 48 hours old the cap no longer applies.
+    sqlx::query("UPDATE accounts SET created_at=?")
+        .bind(db::now() - 49 * 3600)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(t.post("/v1/chat/completions", &body).await.status(), 200);
+}

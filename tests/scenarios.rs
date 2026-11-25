@@ -40,10 +40,17 @@ impl Test {
                 ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
+                // Halving is on by default; these tests expect full trial credit.
+                free_credit_halving: false,
                 ..Default::default()
             },
             keys: reseller::config::KeyPolicy {
                 rotate_cooldown_seconds: 0,
+                ..Default::default()
+            },
+            // The new-account spending cap has its own tests (security.rs).
+            rate_limits: reseller::config::RateLimits {
+                new_account_hours: 0,
                 ..Default::default()
             },
             ..Config::default()
@@ -78,6 +85,14 @@ impl Test {
             .header("content-type", "application/json");
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
+        }
+        // Administrator grants require an idempotency key: send a fresh one
+        // per call, as a well-behaved client does for each new grant.
+        if method == "POST"
+            && path.starts_with("/admin/api/accounts/")
+            && (path.ends_with("/credits") || path.ends_with("/subscriptions"))
+        {
+            req = req.header("idempotency-key", uuid::Uuid::new_v4().to_string());
         }
         let mut req = req
             .body(if method == "GET" {
@@ -280,7 +295,7 @@ async fn expired_free_credit_blocks_proxy_until_admin_topup() {
             json!({"messages":[]}),
         )
         .await;
-    assert_eq!(s, 429, "{v}");
+    assert_eq!(s, 402, "{v}");
     assert_eq!(v["error"]["code"], "insufficient_quota");
 
     let (s, v) = t
@@ -322,7 +337,7 @@ async fn redeem_code_is_single_use_and_rejects_expired_or_deactivated_plan() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"monthly","name":"Monthly","price_usd":"20","credit_usd":"20","duration_days":30,"active":false}),
+            json!({"code":"monthly","name":"Monthly","price_usd":"20","kind":"subscription","monthly_quota_usd":"20","months":1,"active":false}),
         )
         .await;
     assert_eq!(s, 200);
@@ -332,7 +347,7 @@ async fn redeem_code_is_single_use_and_rejects_expired_or_deactivated_plan() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"monthly","name":"Monthly","price_usd":"20","credit_usd":"20","duration_days":30,"active":true}),
+            json!({"code":"monthly","name":"Monthly","price_usd":"20","kind":"subscription","monthly_quota_usd":"20","months":1,"active":true}),
         )
         .await;
     assert_eq!(s, 200);
@@ -408,19 +423,18 @@ async fn repeat_plan_grants_have_independent_expiry_windows() {
     assert_eq!(balance(&t, &aid).await, "19");
 }
 
-/// Full billing scenario: a customer holds $10 of perpetual credit, buys a
-/// Yearly plan, then buys a $5 plan that expires after 30 days. The admin tries
-/// to delete the Yearly plan while the customer is subscribed, then deactivates
-/// it instead, and time passes.
+/// Full billing scenario: a customer holds a $10 top-up (never expires) and
+/// subscribes to the Yearly plan ($12.50 monthly quota for 12 months) and a
+/// one-month $5 plan. The admin tries to delete the Yearly plan while the
+/// customer is subscribed, then deactivates it instead, and months pass.
 ///
-/// Grants are decoupled from the plan catalog: deleting or deactivating a plan
-/// never changes customer credit, because `credits` rows are the ledger and
-/// plans are only templates. Deletion is refused while any subscription,
-/// payment, or redeem code references the plan. Expired remainders leave the
-/// spendable balance but stay in the ledger for audit, and the perpetual lot
-/// survives both windows.
+/// Grants are decoupled from the plan catalog: editing or deactivating a plan
+/// never changes a running subscription, because subscriptions snapshot the
+/// quota and `credits` rows are the ledger. Each month grants a fresh quota
+/// lot that expires at the end of that month, so unused quota does not carry
+/// over, while the top-up survives every reset.
 #[tokio::test]
-async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
+async fn subscription_quota_resets_monthly_and_topups_carry_over() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap().to_owned();
@@ -436,46 +450,47 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["account"]["balance_usd"], "10");
 
-    // 2) Yearly plan (seeded as $150 of credit over 365 days).
+    // 2) Yearly plan: the first month's $12.50 quota is granted at once.
     let code = issue_plan_code(&t, "year").await;
     let (s, v) = redeem(&t, &token, &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "160");
-    assert_eq!(v["account"]["subscription"]["plan_code"], "year");
+    assert_eq!(v["account"]["balance_usd"], "22.5");
+    assert_eq!(v["account"]["quota_remaining_usd"], "12.5");
+    assert_eq!(v["account"]["topup_remaining_usd"], "10");
+    let sub = &v["account"]["subscription"];
+    assert_eq!(sub["plan_code"], "year");
+    assert_eq!(sub["monthly_quota_usd"], "12.5");
+    assert_eq!(sub["months"], 12);
+    let year_end = sub["expires_at"].as_i64().unwrap();
+    assert!((db::now() + 364 * 86400..=db::now() + 366 * 86400).contains(&year_end));
+    // The month's quota lot expires after one calendar month, not a year.
+    let quota_exp: i64 = sqlx::query_scalar("SELECT expires_at FROM credits WHERE note='year'")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert!((db::now() + 28 * 86400..=db::now() + 31 * 86400).contains(&quota_exp));
+    assert_eq!(sub["quota_resets_at"], quota_exp);
 
-    // 3) A $5 plan expiring after 30 days.
+    // 3) A one-month $5 plan stacks its own quota.
     let (s, _) = t
         .admin(
             "POST",
             "plans",
-            json!({"code":"trial5","name":"Trial 5","price_usd":"5","credit_usd":"5","duration_days":30,"description":"Thirty days"}),
+            json!({"code":"trial5","name":"Trial 5","price_usd":"5","kind":"subscription","monthly_quota_usd":"5","months":1,"description":"One month"}),
         )
         .await;
     assert_eq!(s, 200);
     let code = issue_plan_code(&t, "trial5").await;
     let (s, v) = redeem(&t, &token, &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "165");
-
-    // Each grant carries its own window. The yearly plan is 365 days, the trial plan 30.
-    let year_exp: i64 = sqlx::query_scalar("SELECT expires_at FROM credits WHERE note='year'")
-        .fetch_one(&t.app.db)
-        .await
-        .unwrap();
-    let trial_exp: i64 = sqlx::query_scalar("SELECT expires_at FROM credits WHERE note='trial5'")
-        .fetch_one(&t.app.db)
-        .await
-        .unwrap();
-    assert!((db::now() + 365 * 86400 - 5..=db::now() + 365 * 86400).contains(&year_exp));
-    assert!((db::now() + 30 * 86400 - 5..=db::now() + 30 * 86400).contains(&trial_exp));
+    assert_eq!(v["account"]["balance_usd"], "27.5");
+    assert_eq!(v["account"]["subscriptions"].as_array().unwrap().len(), 2);
 
     // 4) Admin deletes the Yearly plan while the subscription is live: refused.
-    // Deactivating it instead must not touch granted credit or the subscription.
+    // Editing and deactivating it must not touch the running subscription.
     let (s, v) = t.admin("DELETE", "plans/year", json!({})).await;
     assert_eq!(s, 409, "{v}");
     assert_eq!(v["error"]["code"], "plan_in_use");
-    // Even a direct SQL delete is refused by the foreign key, so a referenced
-    // plan can never be torn out from under a subscription or payment.
     assert!(
         sqlx::query("DELETE FROM plans WHERE code='year'")
             .execute(&t.app.db)
@@ -486,78 +501,77 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"year","name":"Yearly","price_usd":"144","credit_usd":"150","duration_days":365,"active":false}),
+            json!({"code":"year","name":"Yearly","price_usd":"144","kind":"subscription","monthly_quota_usd":"150","months":12,"active":false}),
         )
         .await;
     assert_eq!(s, 200);
-    assert_eq!(balance(&t, &aid).await, "165");
+    assert_eq!(balance(&t, &aid).await, "27.5");
+    let (s, _) = t.admin("POST", "codes", json!({"plan_code":"year"})).await;
+    assert_eq!(s, 400, "a deactivated plan accepts no new codes");
+
+    // 5) Spending $14 drains the monthly quotas (soonest expiry first) before
+    // the top-up.
+    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    billing::debit(&mut tx, &aid, 14_000_000).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(balance(&t, &aid).await, "13.5");
+    let topup: i64 =
+        sqlx::query_scalar("SELECT remaining_micro FROM credits WHERE expires_at IS NULL")
+            .fetch_one(&t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(topup, 10_000_000, "the top-up is spent last");
+
+    // 6) A month later: last month's unused quota expires, the next month's
+    // quota is granted once (at the snapshot $12.50, not the edited $150),
+    // the one-month plan has ended, and the top-up is untouched.
+    let month_ago = db::now() - 31 * 86400;
+    sqlx::query("UPDATE credits SET expires_at=? WHERE subscription_id IS NOT NULL")
+        .bind(db::now() - 1)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE subscriptions SET period_start=?,started_at=? WHERE plan_code='year'")
+        .bind(month_ago)
+        .bind(month_ago)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE subscriptions SET period_start=?,started_at=?,expires_at=? WHERE plan_code='trial5'",
+    )
+    .bind(month_ago)
+    .bind(month_ago)
+    .bind(db::now() - 1)
+    .execute(&t.app.db)
+    .await
+    .unwrap();
+    billing::grant_all_due(&t.app).await.unwrap();
+    billing::grant_all_due(&t.app).await.unwrap();
     let (s, v) = t.customer("GET", "account", &token, json!({})).await;
     assert_eq!(s, 200);
-    assert_eq!(v["account"]["balance_usd"], "165");
-    assert_eq!(v["account"]["subscription"]["plan_code"], "year");
-    assert_eq!(
-        v["account"]["subscription"]["expires_at"].as_i64().unwrap(),
-        year_exp
-    );
-    // The deactivated plan accepts neither new codes nor new checkouts.
-    let (s, _) = t.admin("POST", "codes", json!({"plan_code":"year"})).await;
-    assert_eq!(s, 400);
-
-    // 5) Spending $3 drains the soonest-expiring lot first.
-    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
-    billing::debit(&mut tx, &aid, 3_000_000).await.unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(balance(&t, &aid).await, "162");
-    let trial_left: i64 =
-        sqlx::query_scalar("SELECT remaining_micro FROM credits WHERE note='trial5'")
-            .fetch_one(&t.app.db)
-            .await
-            .unwrap();
-    let year_left: i64 =
-        sqlx::query_scalar("SELECT remaining_micro FROM credits WHERE note='year'")
-            .fetch_one(&t.app.db)
-            .await
-            .unwrap();
-    assert_eq!((trial_left, year_left), (2_000_000, 150_000_000));
-
-    // 6) One month later the $5 lot's remainder expires out of the spendable
-    // balance. The yearly window and the perpetual $10 are untouched, and the
-    // ledger still shows the expired remainder for audit.
-    sqlx::query("UPDATE credits SET expires_at=? WHERE note='trial5'")
-        .bind(db::now() - 1)
-        .execute(&t.app.db)
+    assert_eq!(v["account"]["balance_usd"], "22.5");
+    assert_eq!(v["account"]["quota_remaining_usd"], "12.5");
+    assert_eq!(v["account"]["subscriptions"].as_array().unwrap().len(), 1);
+    let year_lots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credits WHERE note='year'")
+        .fetch_one(&t.app.db)
         .await
         .unwrap();
-    // The credit lot and the subscription row share the same expiry instant.
-    sqlx::query("UPDATE subscriptions SET expires_at=? WHERE plan_code='trial5'")
-        .bind(db::now() - 1)
-        .execute(&t.app.db)
-        .await
-        .unwrap();
-    assert_eq!(balance(&t, &aid).await, "160");
-    let v = billing::account(&t.app, &aid).await.unwrap();
-    let expired = v["credits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["source"] == "subscription" && c["remaining_usd"] == "2")
-        .expect("expired remainder is kept in the ledger");
-    assert!(expired["expires_at"].as_i64().unwrap() < db::now());
+    assert_eq!(year_lots, 2, "one quota lot per month, kept for audit");
 
-    // 7) Around one year later the yearly lot expires too: only the perpetual
-    // $10 remains, the subscription badge disappears, and the account can still
-    // proxy and spend.
-    sqlx::query("UPDATE credits SET expires_at=? WHERE note='year'")
-        .bind(db::now() - 1)
-        .execute(&t.app.db)
-        .await
-        .unwrap();
-    // The credit lot and the subscription row share the same expiry instant.
+    // 7) After the year ends only the top-up remains, and it still pays for
+    // requests.
     sqlx::query("UPDATE subscriptions SET expires_at=? WHERE plan_code='year'")
         .bind(db::now() - 1)
         .execute(&t.app.db)
         .await
         .unwrap();
+    sqlx::query("UPDATE credits SET expires_at=? WHERE subscription_id IS NOT NULL")
+        .bind(db::now() - 1)
+        .execute(&t.app.db)
+        .await
+        .unwrap();
+    billing::grant_all_due(&t.app).await.unwrap();
     assert_eq!(balance(&t, &aid).await, "10");
     let (s, v) = t.customer("GET", "account", &token, json!({})).await;
     assert_eq!(s, 200);
@@ -573,61 +587,6 @@ async fn yearly_plan_catalog_changes_leave_granted_credit_intact() {
         .await;
     assert_eq!(s, 200, "{v}");
     task.abort();
-    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
-    billing::debit(&mut tx, &aid, 4_000_000).await.unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(balance(&t, &aid).await, "6");
-    let lots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credits")
-        .fetch_one(&t.app.db)
-        .await
-        .unwrap();
-    assert_eq!(lots, 3, "every lot is kept as an audit record");
-    let debt: i64 = sqlx::query_scalar("SELECT debt_micro FROM accounts WHERE id=?")
-        .bind(&aid)
-        .fetch_one(&t.app.db)
-        .await
-        .unwrap();
-    assert_eq!(debt, 0);
-
-    // 8) A plan that only left history behind (redeemed code, expired grant) is
-    // still undeletable. A never-referenced plan deletes normally.
-    let (s, v) = t.admin("DELETE", "plans/trial5", json!({})).await;
-    assert_eq!(s, 409, "{v}");
-    let (s, _) = t
-        .admin(
-            "POST",
-            "plans",
-            json!({"code":"ghost","name":"Ghost","price_usd":"1","credit_usd":"1","duration_days":1}),
-        )
-        .await;
-    assert_eq!(s, 200);
-    let (s, v) = t.admin("DELETE", "plans/ghost", json!({})).await;
-    assert_eq!(s, 200, "{v}");
-    assert!(
-        !v["plans"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["code"] == "ghost")
-    );
-
-    // 9) An in-flight Stripe order pins its plan too.
-    let (s, _) = t
-        .admin(
-            "POST",
-            "plans",
-            json!({"code":"pending","name":"Pending","price_usd":"20","credit_usd":"20","duration_days":30}),
-        )
-        .await;
-    assert_eq!(s, 200);
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order_pending',?,'pending','stripe',20000000,20000000,30,'cs_pending',?)")
-        .bind(&aid)
-        .bind(db::now())
-        .execute(&t.app.db)
-        .await
-        .unwrap();
-    let (s, v) = t.admin("DELETE", "plans/pending", json!({})).await;
-    assert_eq!(s, 409, "{v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -974,7 +933,7 @@ async fn account_key_cap_counts_active_keys_and_rotation_respects_it() {
     let (s, v) = t
         .customer("POST", "keys", token, json!({"name":"third"}))
         .await;
-    assert_eq!(s, 429, "{v}");
+    assert_eq!(s, 403, "{v}");
     assert_eq!(v["error"]["code"], "account_key_limit");
 
     let (s, _) = t
@@ -1052,7 +1011,7 @@ async fn child_key_limit_applies_to_api_keys_and_resets_on_rotation() {
             json!({"name":"child2"}),
         )
         .await;
-    assert_eq!(s, 429, "{v}");
+    assert_eq!(s, 403, "{v}");
     assert_eq!(v["error"]["code"], "child_key_limit");
     // The dashboard token creates account keys without the per-key child cap.
     let (s, _) = t
@@ -1246,7 +1205,8 @@ async fn key_expiry_blocks_proxy_but_keeps_workspace_and_can_be_cleared() {
 // Limits and metering
 // ---------------------------------------------------------------------------
 
-/// Spend limits accumulate across completed requests and stop the next one.
+/// Spend limits count settled spend plus the holds of requests in flight, so
+/// a request is admitted only while its worst-case cost still fits.
 #[tokio::test]
 async fn spend_limit_accumulates_across_completed_requests() {
     let t = Test::new().await;
@@ -1256,10 +1216,11 @@ async fn spend_limit_accumulates_across_completed_requests() {
         .admin(
             "PATCH",
             &format!("keys/{kid}"),
-            json!({"limits":{"spend":{"max_usd":"0.02","window_hours":24}}}),
+            json!({"limits":{"spend":{"max_usd":"0.03","window_hours":24}}}),
         )
         .await;
     assert_eq!(s, 200);
+    // Each request holds the $0.01 minimum and is billed 0.013.
     let task = mock_llm(&t, "0.01", 30).await;
     for expected in [200, 200] {
         let (s, v) = t
@@ -1272,6 +1233,7 @@ async fn spend_limit_accumulates_across_completed_requests() {
             .await;
         assert_eq!(s, expected, "{v}");
     }
+    // 0.026 settled + 0.01 held would exceed 0.03.
     let (s, v) = t
         .customer(
             "POST",
@@ -1330,33 +1292,50 @@ async fn request_and_token_windows_count_usage() {
         .admin(
             "PATCH",
             &format!("keys/{}", token_key["id"].as_str().unwrap()),
-            json!({"limits":{"tokens":{"max":10,"window_hours":24}}}),
+            json!({"limits":{"tokens":{"max":12,"window_hours":24}}}),
         )
         .await;
     assert_eq!(s, 200);
+    // Each request holds 1 input token ("abcd") plus max_tokens 4, and the
+    // upstream reports 5 tokens.
+    let small = json!({"messages":[{"role":"user","content":"abcd"}],"max_tokens":4});
     for expected in [200, 200] {
         assert_eq!(
             t.customer(
                 "POST",
                 "chat/completions",
                 token_key["key"].as_str().unwrap(),
-                json!({"messages":[]})
+                small.clone()
             )
             .await
             .0,
             expected
         );
     }
+    // 10 settled + 5 held would exceed 12.
     let (s, v) = t
         .customer(
             "POST",
             "chat/completions",
             token_key["key"].as_str().unwrap(),
-            json!({"messages":[]}),
+            small.clone(),
         )
         .await;
     assert_eq!(s, 429, "{v}");
     assert_eq!(v["error"]["code"], "token_limit_exceeded");
+    // Without max_tokens the request holds the default 4096 output tokens,
+    // which can never fit a 12-token limit: a 400, not a retryable 429.
+    let (s, v) = t
+        .customer(
+            "POST",
+            "chat/completions",
+            token_key["key"].as_str().unwrap(),
+            json!({"messages":[{"role":"user","content":"abcd"}]}),
+        )
+        .await;
+    assert_eq!(s, 400, "{v}");
+    assert_eq!(v["error"]["code"], "token_limit_exceeded");
+    assert_eq!(v["error"]["param"], "max_tokens");
     task.abort();
 }
 
@@ -1644,7 +1623,7 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
     t.app.config_mut().await.stripe.webhook_secret = "whsec_test".into();
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order_snap',?,'monthly','stripe',20000000,25000000,40,'cs_snap',?)")
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,months,external_id,created_at) VALUES('order_snap',?,'monthly','stripe','subscription',20000000,25000000,2,'cs_snap',?)")
         .bind(aid)
         .bind(db::now())
         .execute(&t.app.db)
@@ -1656,7 +1635,7 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"monthly","name":"Monthly","price_usd":"20","credit_usd":"5","duration_days":10,"active":false}),
+            json!({"code":"monthly","name":"Monthly","price_usd":"20","kind":"subscription","monthly_quota_usd":"5","months":1,"active":false}),
         )
         .await;
     assert_eq!(s, 200);
@@ -1687,8 +1666,8 @@ async fn stripe_webhook_grants_checkout_snapshot_once() {
             - db::now())
             / 86400;
     assert!(
-        (39..=40).contains(&days),
-        "snapshot duration must win: {days}"
+        (58..=62).contains(&days),
+        "snapshot duration (two months) must win: {days}"
     );
     let status: String = sqlx::query_scalar("SELECT status FROM payments WHERE id='order_snap'")
         .fetch_one(&t.app.db)
@@ -2060,7 +2039,7 @@ async fn live_http_settles_buffered_json_responses() {
 /// The fresh-schema seed ships a 12 months plan at $144 (with $150 credit) for 365 days, and the
 /// plan redeems into a credit lot with the matching expiry window.
 #[tokio::test]
-async fn year_plan_is_seeded_at_144_usd_for_365_days() {
+async fn year_plan_is_seeded_as_a_12_month_subscription_with_a_monthly_quota() {
     let t = Test::new().await;
     let plans = t.call("GET", "/v1/plans", None, json!({})).await.1;
     let year = plans["plans"]
@@ -2071,17 +2050,20 @@ async fn year_plan_is_seeded_at_144_usd_for_365_days() {
         .expect("year plan is seeded");
     assert_eq!(year["name"], "12 months");
     assert_eq!(year["price_usd"], "144");
-    assert_eq!(year["credit_usd"], "150");
-    assert_eq!(year["duration_days"], 365);
+    assert_eq!(year["kind"], "subscription");
+    assert_eq!(year["monthly_quota_usd"], "12.5");
+    assert_eq!(year["months"], 12);
     assert_eq!(year["active"], true);
 
     let code = issue_plan_code(&t, "year").await;
     let k = t.key().await;
     let (s, v) = redeem(&t, k["dashboard_token"].as_str().unwrap(), &code).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["account"]["balance_usd"], "150.1");
+    // Trial credit plus the first month's quota, not the whole year's.
+    assert_eq!(v["account"]["balance_usd"], "12.6");
+    assert_eq!(v["account"]["quota_remaining_usd"], "12.5");
     let days = (v["account"]["subscription"]["expires_at"].as_i64().unwrap() - db::now()) / 86400;
-    assert!((364..=365).contains(&days), "year plan expiry: {days} days");
+    assert!((364..=366).contains(&days), "year plan expiry: {days} days");
 }
 
 // ---------------------------------------------------------------------------
@@ -2203,7 +2185,8 @@ async fn overspend_via_proxy_creates_debt_settled_by_admin_topup() {
             json!({"messages":[]}),
         )
         .await;
-    assert_eq!(s, 429, "{v}");
+    assert_eq!(s, 402, "{v}");
+    assert_eq!(v["error"]["code"], "insufficient_quota");
     let (s, _) = t
         .admin(
             "POST",
@@ -2458,7 +2441,7 @@ async fn checkout_validates_configuration_and_plan_pricing() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"tiny","name":"Tiny","price_usd":"0.40","credit_usd":"0.40","duration_days":10,"active":true}),
+            json!({"code":"tiny","name":"Tiny","price_usd":"0.40","kind":"subscription","monthly_quota_usd":"0.40","months":1,"active":true}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2477,7 +2460,7 @@ async fn checkout_validates_configuration_and_plan_pricing() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"odd","name":"Odd","price_usd":"2.005","credit_usd":"2","duration_days":10,"active":true}),
+            json!({"code":"odd","name":"Odd","price_usd":"2.005","kind":"subscription","monthly_quota_usd":"2","months":1,"active":true}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2497,7 +2480,7 @@ async fn checkout_validates_configuration_and_plan_pricing() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"monthly","name":"Monthly","price_usd":"20","credit_usd":"20","duration_days":30,"active":false}),
+            json!({"code":"monthly","name":"Monthly","price_usd":"20","kind":"subscription","monthly_quota_usd":"20","months":1,"active":false}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2557,7 +2540,7 @@ async fn webhook_ignores_unpaid_and_unknown_orders_without_side_effects() {
     assert_eq!(events, 0);
     assert_eq!(balance(&t, aid).await, "0.1");
 
-    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,price_micro,credit_micro,duration_days,external_id,created_at) VALUES('order_async',?,'monthly','stripe',20000000,10000000,15,'cs_async',?)")
+    sqlx::query("INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,months,external_id,created_at) VALUES('order_async',?,'monthly','stripe','subscription',20000000,10000000,1,'cs_async',?)")
         .bind(aid)
         .bind(db::now())
         .execute(&t.app.db)
@@ -2583,7 +2566,7 @@ async fn admin_cannot_grant_inactive_plan() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"monthly","name":"Monthly","price_usd":"20","credit_usd":"20","duration_days":30,"active":false}),
+            json!({"code":"monthly","name":"Monthly","price_usd":"20","kind":"subscription","monthly_quota_usd":"20","months":1,"active":false}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2599,7 +2582,7 @@ async fn admin_cannot_grant_inactive_plan() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"monthly","name":"Monthly","price_usd":"20","credit_usd":"20","duration_days":30,"active":true}),
+            json!({"code":"monthly","name":"Monthly","price_usd":"20","kind":"subscription","monthly_quota_usd":"20","months":1,"active":true}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2857,7 +2840,7 @@ async fn plan_lifecycle_edits_retires_and_deletes_safely() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"starter","name":"Starter","price_usd":"10","credit_usd":"10","duration_days":30,"active":true,"description":"first"}),
+            json!({"code":"starter","name":"Starter","price_usd":"10","kind":"subscription","monthly_quota_usd":"10","months":1,"active":true,"description":"first"}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2865,7 +2848,7 @@ async fn plan_lifecycle_edits_retires_and_deletes_safely() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"starter","name":"Starter v2","price_usd":"12","credit_usd":"11","duration_days":31,"active":true,"description":"second"}),
+            json!({"code":"starter","name":"Starter v2","price_usd":"12","kind":"subscription","monthly_quota_usd":"11","months":1,"active":true,"description":"second"}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2877,8 +2860,8 @@ async fn plan_lifecycle_edits_retires_and_deletes_safely() {
         .unwrap();
     assert_eq!(starter["name"], "Starter v2");
     assert_eq!(starter["price_usd"], "12");
-    assert_eq!(starter["credit_usd"], "11");
-    assert_eq!(starter["duration_days"], 31);
+    assert_eq!(starter["monthly_quota_usd"], "11");
+    assert_eq!(starter["months"], 1);
 
     // Unreferenced: deletion succeeds.
     let (s, v) = t.admin("DELETE", "plans/starter", json!({})).await;
@@ -2896,7 +2879,7 @@ async fn plan_lifecycle_edits_retires_and_deletes_safely() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"starter","name":"Starter","price_usd":"10","credit_usd":"10","duration_days":30,"active":true,"description":""}),
+            json!({"code":"starter","name":"Starter","price_usd":"10","kind":"subscription","monthly_quota_usd":"10","months":1,"active":true,"description":""}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2927,7 +2910,7 @@ async fn plan_lifecycle_edits_retires_and_deletes_safely() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"starter","name":"Starter","price_usd":"10","credit_usd":"10","duration_days":30,"active":true,"description":""}),
+            json!({"code":"starter","name":"Starter","price_usd":"10","kind":"subscription","monthly_quota_usd":"10","months":1,"active":true,"description":""}),
         )
         .await;
     assert_eq!(s, 200);
@@ -2944,7 +2927,7 @@ async fn plan_lifecycle_edits_retires_and_deletes_safely() {
         .admin(
             "POST",
             "plans",
-            json!({"code":"starter","name":"Starter","price_usd":"10","credit_usd":"10","duration_days":30,"active":false,"description":""}),
+            json!({"code":"starter","name":"Starter","price_usd":"10","kind":"subscription","monthly_quota_usd":"10","months":1,"active":false,"description":""}),
         )
         .await;
     assert_eq!(s, 200);
@@ -3518,4 +3501,91 @@ async fn rotation_carries_usage_windows_and_oauth_grants() {
         .unwrap();
     assert_eq!(bound, new["id"].as_str().unwrap());
     task.abort();
+}
+
+/// Posts an administrator grant with an explicit `Idempotency-Key` (or none).
+async fn admin_keyed(t: &Test, path: &str, key: Option<&str>, body: Value) -> (u16, Value) {
+    let router = reseller::web::router(t.app.clone()).await;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/api/{path}"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {ADMIN}"));
+    if let Some(key) = key {
+        req = req.header("idempotency-key", key);
+    }
+    let mut req = req.body(Body::from(body.to_string())).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:9000".parse::<SocketAddr>().unwrap()));
+    let r = router.oneshot(req).await.unwrap();
+    let status = r.status().as_u16();
+    let b = to_bytes(r.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&b).unwrap())
+}
+
+/// A retried administrator top-up credits once: the same key and body is
+/// answered with the original lot (`replayed`), the same key with another
+/// body is a 422, a missing key is a 400, and concurrent retries race safely.
+#[tokio::test]
+async fn admin_top_ups_are_idempotent_by_key() {
+    let t = Test::new().await;
+    let k = t.key().await;
+    let aid = k["account_id"].as_str().unwrap().to_owned();
+    let path = format!("accounts/{aid}/credits");
+    let body = json!({"amount_usd":"5","note":"support refund"});
+
+    let (s, v) = admin_keyed(&t, &path, None, body.clone()).await;
+    assert_eq!(s, 400, "{v}");
+    assert_eq!(v["error"]["code"], "idempotency_key_required");
+
+    let (s, first) = admin_keyed(&t, &path, Some("topup-1"), body.clone()).await;
+    assert_eq!(s, 200, "{first}");
+    assert_eq!(first["credit"]["replayed"], false);
+    assert_eq!(first["account"]["balance_usd"], "5.1");
+    let (s, again) = admin_keyed(&t, &path, Some("topup-1"), body.clone()).await;
+    assert_eq!(s, 200, "{again}");
+    assert_eq!(again["credit"]["replayed"], true);
+    assert_eq!(again["credit"]["id"], first["credit"]["id"]);
+    assert_eq!(again["account"]["balance_usd"], "5.1");
+
+    let (s, v) = admin_keyed(&t, &path, Some("topup-1"), json!({"amount_usd":"6"})).await;
+    assert_eq!(s, 422, "{v}");
+    assert_eq!(v["error"]["code"], "idempotency_key_reused");
+
+    // Eight concurrent deliveries of one new top-up add one lot.
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (app, path) = (t.app.clone(), path.clone());
+        tasks.push(tokio::spawn(async move {
+            let t = Test {
+                app,
+                _dir: tempfile::tempdir().unwrap(),
+            };
+            admin_keyed(&t, &path, Some("topup-2"), json!({"amount_usd":"1"})).await
+        }));
+    }
+    let mut fresh = 0;
+    for task in tasks {
+        let (s, v) = task.await.unwrap();
+        assert_eq!(s, 200, "{v}");
+        fresh += usize::from(v["credit"]["replayed"] == false);
+    }
+    assert_eq!(fresh, 1);
+    assert_eq!(balance(&t, &aid).await, "6.1");
+
+    // Plan grants follow the same rules.
+    let grants = format!("accounts/{aid}/subscriptions");
+    let plan = json!({"plan_code":"monthly"});
+    let (s, v) = admin_keyed(&t, &grants, Some("grant-1"), plan.clone()).await;
+    assert_eq!((s, &v["grant"]["replayed"]), (200, &json!(false)), "{v}");
+    let (s, v) = admin_keyed(&t, &grants, Some("grant-1"), plan).await;
+    assert_eq!((s, &v["grant"]["replayed"]), (200, &json!(true)), "{v}");
+    let (s, _) = admin_keyed(&t, &grants, Some("grant-1"), json!({"plan_code":"year"})).await;
+    assert_eq!(s, 422);
+    let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(subs, 1);
+    assert_eq!(balance(&t, &aid).await, "26.1");
 }

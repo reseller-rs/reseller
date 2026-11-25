@@ -292,7 +292,7 @@ pub(super) fn definitions() -> Vec<Value> {
         tool(
             "account_overview",
             "Account overview",
-            "Show the account balance, debt, active subscription and credit lots.",
+            "Show the account balance (monthly subscription quota and non-expiring top-ups), debt, active subscriptions and credit lots.",
             object(json!({}), &[]),
             hints(true, false, true, false),
         ),
@@ -368,7 +368,7 @@ pub(super) fn definitions() -> Vec<Value> {
         tool(
             "list_plans",
             "List plans",
-            "List purchasable plans and available payment methods.",
+            "List purchasable plans (subscriptions with a monthly usage quota, and top-ups that never expire) and available payment methods.",
             object(json!({}), &[]),
             hints(true, false, true, false),
         ),
@@ -385,8 +385,8 @@ pub(super) fn definitions() -> Vec<Value> {
         tool(
             "start_checkout",
             "Start checkout",
-            "Start buying a plan. Returns a payment URL (card) or crypto payment instructions; \
-             the credit arrives once the payment is confirmed.",
+            "Start buying a plan or top-up. Returns a payment URL (card) or crypto payment instructions; \
+             the quota or credit arrives once the payment is confirmed.",
             object(
                 json!({
                     "plan": {"type": "string", "minLength": 1, "maxLength": 100, "description": "Plan code from list_plans."},
@@ -423,9 +423,9 @@ pub(super) fn instructions(config: &Config) -> String {
          - Any credential: account_overview, usage_summary, list_requests, list_keys, create_key, rotate_key, \
          block_key, list_plans, redeem_code, start_checkout.\n\
          \n\
-         Pricing: usage is billed in USD against prepaid credit. Every generation result reports its \
+         Pricing: usage is billed in USD against the monthly subscription quota, then top-ups. Every generation result reports its \
          billed cost, tokens and the remaining balance. {signup} Use list_plans and start_checkout to add credit; \
-         insufficient_quota errors mean the balance is exhausted. Rate limits return an error with a retry delay.",
+         insufficient_quota errors mean the balance is exhausted or smaller than the request may cost (lower max_tokens). Rate limits return an error with a retry delay.",
         name = config.branding.name,
     )
 }

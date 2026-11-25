@@ -332,6 +332,56 @@ pub fn estimate_input_tokens(body: &Value, body_bytes: usize) -> i64 {
     }
 }
 
+/// Largest `n` (choices or images) a request may ask for in a hold.
+const MAX_HOLD_COUNT: i64 = 128;
+
+/// Worst-case usage of a JSON request, priced into its admission hold.
+///
+/// LLM routes hold the input estimate plus the largest output the request
+/// allows (`max_completion_tokens`, `max_tokens`, or `max_output_tokens`,
+/// else `default_output`) for each of its `n` choices. Embeddings hold their
+/// input, image routes their `n` images, and speech its input characters.
+/// Other routes hold nothing beyond the configured minimum.
+pub fn worst_case(path: &str, body: &Value, body_bytes: usize, default_output: i64) -> Usage {
+    let count = |key: &str| body[key].as_i64().unwrap_or(1).clamp(1, MAX_HOLD_COUNT);
+    match path {
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" => {
+            let input = estimate_input_tokens(body, body_bytes);
+            let limit = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
+                .iter()
+                .find_map(|k| body[*k].as_i64().filter(|n| *n > 0))
+                .unwrap_or(default_output)
+                .min(1_000_000_000);
+            let output = limit.saturating_mul(count("n"));
+            Usage {
+                input,
+                output,
+                total: input.saturating_add(output),
+                ..Usage::default()
+            }
+        }
+        "/v1/embeddings" => {
+            let input = estimate_input_tokens(body, body_bytes);
+            Usage {
+                input,
+                total: input,
+                ..Usage::default()
+            }
+        }
+        "/v1/images/generations" | "/v1/images/edits" | "/v1/images/variations" => Usage {
+            images: count("n"),
+            ..Usage::default()
+        },
+        "/v1/audio/speech" => Usage {
+            characters: body["input"]
+                .as_str()
+                .map_or(0, |s| i64::try_from(s.chars().count()).unwrap_or(i64::MAX)),
+            ..Usage::default()
+        },
+        _ => Usage::default(),
+    }
+}
+
 /// Characters of text in a string or an array of `{text}` content parts.
 fn text_chars(v: &Value) -> i64 {
     match v {

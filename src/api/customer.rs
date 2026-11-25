@@ -40,7 +40,15 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
                 Some(Value::String(s)) => Some(s.as_str()),
                 Some(_) => return Err(Error::bad("altcha must be a string")),
             };
-            return keys::create(app, Requester::Signup { altcha }, ip, &body).await;
+            let created = keys::create(app, Requester::Signup { altcha }, ip, &body).await;
+            match &created {
+                Ok(_) => security::record_signup_success(app, ip),
+                Err(e) if security::is_business_failure(e) => {
+                    security::record_business_failure(app, ip).await;
+                }
+                Err(_) => {}
+            }
+            return created;
         }
         _ => {}
     }
@@ -72,6 +80,22 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             overview["top_up"] =
                 payments::deposits::top_up(app, &*app.config().await, account).await;
             Ok(overview)
+        }
+        (["account"], "PATCH") => {
+            let body = object(req).await?;
+            let consent = body["consumption_consent"]
+                .as_bool()
+                .ok_or_else(|| Error::bad("consumption_consent must be true or false"))?;
+            payments::store::set_consent(app, account, consent).await
+        }
+        (["account", "store"], "GET") => payments::store::account_info(app, account).await,
+        (["account", "store", "apple"], "POST") => {
+            me.require_active()?;
+            payments::store::apple::verify_purchase(app, account, &object(req).await?).await
+        }
+        (["account", "store", "google"], "POST") => {
+            me.require_active()?;
+            payments::store::google::verify_purchase(app, account, &object(req).await?).await
         }
         (["account", "redeem"], "POST") => {
             let body = object(req).await?;
@@ -126,7 +150,7 @@ async fn signup_challenge(app: &App, ip: &str) -> Result<Value> {
     security::challenge(app, ip).await?;
     Ok(serde_json::to_value(pow::create(
         &config.key_pepper,
-        config.signup.pow_max_number,
+        security::pow_difficulty(app, ip).await,
         config.signup.pow_ttl_seconds,
         crate::db::now(),
     ))?)

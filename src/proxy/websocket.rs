@@ -9,7 +9,7 @@ use crate::{
     config::{Config, Policy, Upstream},
     error::{Error, Result},
     identity::Identity,
-    meter::{Meter, RequestMeta},
+    meter::{Meter, RequestMeta, Usage},
 };
 use axum::{
     body::Body,
@@ -97,6 +97,9 @@ pub(super) async fn relay(
             kind: Kind::of(&path).as_str(),
             model: &model,
             ip: &ip,
+            // A realtime session's usage is unknown up front: it holds the
+            // configured minimum.
+            estimate: &Usage::NONE,
         },
         !resolved,
     )

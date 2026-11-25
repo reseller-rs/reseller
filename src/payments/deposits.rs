@@ -14,6 +14,7 @@ use crate::{
     config::{Config, Payroof},
     db::{self, now},
     error::{Error, Result},
+    money,
 };
 use axum::http::Method;
 use serde_json::{Value, json};
@@ -321,6 +322,17 @@ fn chain_name<'a>(assets: &'a [Asset], chain: &str) -> &'a str {
 pub fn quota_error(config: &Config) -> Error {
     Error::insufficient_quota(format!(
         "You exceeded your current quota. Your balance is empty. Top up at {}.",
+        workspace_url(config)
+    ))
+}
+
+/// 402 for a request whose worst-case cost (`hold`) exceeds the whole
+/// balance, even with nothing else in flight.
+pub fn hold_error(config: &Config, hold: i64, balance: i64) -> Error {
+    Error::insufficient_quota(format!(
+        "This request may cost up to {} but your balance is {}. Lower max_tokens or top up at {}.",
+        money::display(hold),
+        money::display(balance),
         workspace_url(config)
     ))
 }

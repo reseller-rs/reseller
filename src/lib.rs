@@ -11,7 +11,8 @@
 //! - [`oauth`]: OAuth 2.1 authorization server for `/mcp`.
 //! - [`security`]: rate limiting and proof-of-work signup challenges.
 //! - [`billing`] / [`money`]: credit ledger, plans, redeem codes, and micro-USD.
-//! - [`payments`]: plan checkout orders via Stripe (cards) and Payroof (crypto).
+//! - [`payments`]: plan checkout orders via Stripe (cards) and Payroof (crypto),
+//!   and native App Store and Google Play purchases.
 //! - [`theme`]: white-label branding, the page template, and theme files.
 //! - [`stats`]: dashboards, usage series, and log retention.
 //! - [`config`] / [`db`] / [`error`]: settings, persistence, and the error type.
@@ -48,8 +49,15 @@ pub struct App {
     pub payroof: Arc<payments::payroof::Cache>,
     /// In-memory abuse limiter (per IP and per account).
     pub limiter: Arc<security::limiter::Limiter>,
+    /// Recent business failures per IP, for adaptive proof of work.
+    pub strikes: Arc<security::strikes::Strikes>,
     /// Optional directory of theme files served under `/theme/`.
     pub theme_dir: Option<Arc<PathBuf>>,
+    /// Google Play signing keys and access token caches.
+    pub store: Arc<payments::store::Cache>,
+    /// Trusted roots (DER) for App Store signed payloads. Production trusts
+    /// only the pinned Apple Root CA - G3.
+    pub apple_roots: Arc<Vec<Vec<u8>>>,
 }
 
 impl App {
@@ -65,7 +73,10 @@ impl App {
             tasks: tokio_util::task::TaskTracker::new(),
             payroof: Arc::default(),
             limiter: Arc::default(),
+            strikes: Arc::default(),
             theme_dir: None,
+            store: Arc::default(),
+            apple_roots: Arc::new(vec![payments::store::apple::ROOT_CA_G3.to_vec()]),
         })
     }
 
@@ -74,6 +85,14 @@ impl App {
     #[must_use]
     pub fn with_theme_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.theme_dir = dir.map(Arc::new);
+        self
+    }
+
+    /// Replaces the trusted roots of App Store signed payloads (DER), so
+    /// tests can use their own certificate chain.
+    #[must_use]
+    pub fn with_apple_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
+        self.apple_roots = Arc::new(roots);
         self
     }
 

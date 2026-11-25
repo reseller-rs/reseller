@@ -1,8 +1,9 @@
 //! Request admission, usage accounting, and settlement.
 //!
 //! [`Meter::begin`] admits a request (key status, balance, rate and usage
-//! limits) and logs it in the same write transaction, so concurrent requests
-//! cannot overshoot limits. [`Meter::finish`] prices observed usage and
+//! limits) and logs it with its worst-case cost ([`Hold`]) in the same write
+//! transaction. Holds of requests in flight count against the balance and
+//! every limit, so concurrent requests cannot overshoot them. [`Meter::finish`] prices observed usage and
 //! settles it exactly once. A meter dropped mid-stream settles in the
 //! background with whatever usage was observed.
 use crate::{
@@ -61,6 +62,20 @@ fn round_micro(usd: Decimal) -> Result<i64> {
 }
 
 impl Usage {
+    /// No usage at all, for example the estimate of a request whose cost
+    /// cannot be known up front.
+    pub const NONE: Self = Self {
+        input: 0,
+        cached_input: 0,
+        output: 0,
+        total: 0,
+        audio_ms: 0,
+        images: 0,
+        characters: 0,
+        cost: None,
+        estimated: false,
+    };
+
     /// Reads an OpenAI-style `usage` object.
     ///
     /// Accepts both `prompt_tokens` and `input_tokens` spellings, and audio
@@ -189,6 +204,8 @@ pub struct RequestMeta<'a> {
     pub kind: &'a str,
     pub model: &'a str,
     pub ip: &'a str,
+    /// Worst-case usage of the request, priced into its [`Hold`].
+    pub estimate: &'a Usage,
 }
 
 /// An admitted request awaiting settlement.
@@ -249,6 +266,10 @@ impl Meter {
         check_model: bool,
     ) -> Result<Self> {
         let config = app.config().await;
+        let hold = match &identity {
+            Some(identity) => Hold::of(&config, identity, meta.model, meta.estimate)?,
+            None => Hold::default(),
+        };
         let mut tx = db::write(&app.db).await?;
         if let Some(identity) = &identity
             && let Err(e) = admit(
@@ -256,6 +277,7 @@ impl Meter {
                 &config,
                 identity,
                 check_model.then_some(meta.model),
+                hold,
             )
             .await
         {
@@ -265,8 +287,8 @@ impl Meter {
         }
         let request_id = id();
         sqlx::query(
-            "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip) \
-             VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip,\
+             hold_micro,hold_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&request_id)
         .bind(identity.as_ref().map(|i| &i.account_id))
@@ -277,6 +299,8 @@ impl Meter {
         .bind(meta.kind)
         .bind(meta.model)
         .bind(meta.ip)
+        .bind(hold.micro)
+        .bind(hold.tokens)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -452,6 +476,29 @@ impl Settlement {
     }
 }
 
+/// Worst-case billed cost and tokens of an admitted request. Holds of
+/// unfinished requests count against the balance and every spend or token
+/// limit, so concurrent requests cannot overdraw them. Settlement closes the
+/// request row, which releases its hold, and debits the actual cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hold {
+    pub micro: i64,
+    pub tokens: i64,
+}
+
+impl Hold {
+    /// Prices a worst-case usage estimate at the caller's markup. The money
+    /// part is at least `billing.min_hold_usd`.
+    pub fn of(config: &Config, identity: &Identity, model: &str, estimate: &Usage) -> Result<Self> {
+        let upstream = estimate.cost(config, model, true)?;
+        let billed = money::markup(upstream, &identity.markup)?;
+        Ok(Self {
+            micro: billed.max(money::usd(&config.billing.min_hold_usd)?),
+            tokens: estimate.total.max(0),
+        })
+    }
+}
+
 /// Checks the status and balance of an account without logging a request,
 /// for routes that are not metered.
 pub async fn preflight(app: &App, identity: &Identity) -> Result<()> {
@@ -459,7 +506,11 @@ pub async fn preflight(app: &App, identity: &Identity) -> Result<()> {
     let checked = {
         let mut conn = app.db.acquire().await?;
         check_status(&mut conn, identity).await?;
-        check_balance(&mut conn, &config, identity).await
+        if db::balance(&mut conn, &identity.account_id).await? <= 0 {
+            Err(deposits::quota_error(&config))
+        } else {
+            Ok(())
+        }
     };
     match checked {
         Err(e) => Err(deposits::explain_quota(app, &config, &identity.account_id, e).await),
@@ -483,14 +534,17 @@ async fn admit(
     config: &Config,
     identity: &Identity,
     model: Option<&str>,
+    hold: Hold,
 ) -> Result<()> {
     check_status(conn, identity).await?;
     if let Some(model) = model {
         check_model(config, identity, model)?;
     }
-    check_balance(conn, config, identity).await?;
+    crate::billing::grant_due(conn, Some(&identity.account_id)).await?;
+    check_balance(conn, config, identity, hold).await?;
     check_concurrency(conn, config, &identity.account_id).await?;
-    check_limits(conn, config, identity).await
+    check_new_account(conn, config, identity, hold).await?;
+    check_limits(conn, config, identity, hold).await
 }
 
 /// Key and account status. It may have changed since authentication, so it
@@ -519,23 +573,117 @@ async fn check_status(conn: &mut SqliteConnection, identity: &Identity) -> Resul
     Ok(())
 }
 
-/// Rejects an account without spendable balance.
+/// Requires the balance left after the holds of requests in flight to cover
+/// this request's hold.
+///
+/// An empty balance, or one too small for the hold even with nothing in
+/// flight, is a 402: only a top-up or a smaller request helps. A balance
+/// that is only reserved by requests in flight is a short 429.
 async fn check_balance(
     conn: &mut SqliteConnection,
     config: &Config,
     identity: &Identity,
+    hold: Hold,
 ) -> Result<()> {
-    if db::balance(conn, &identity.account_id).await? <= 0 {
+    let balance = db::balance(conn, &identity.account_id).await?;
+    if balance <= 0 {
         return Err(deposits::quota_error(config));
     }
-    Ok(())
+    let held = in_flight(conn, config, Scope::Account(&identity.account_id))
+        .await?
+        .micro;
+    if balance - held >= hold.micro {
+        return Ok(());
+    }
+    if balance >= hold.micro {
+        return Err(Error::too_many(
+            "balance_reserved",
+            format!(
+                "Requests in flight have reserved your balance ({} of {}). Retry when they finish",
+                money::display(held),
+                money::display(balance)
+            ),
+            1,
+        ));
+    }
+    Err(deposits::hold_error(config, hold.micro, balance))
 }
 
-/// The key's rate and usage limits.
+/// Daily spending cap for accounts younger than
+/// `rate_limits.new_account_hours`: billed spend in the last 24 hours plus
+/// holds in flight may not exceed `new_account_daily_spend_pct` percent of
+/// the paid allowance (monthly quota of active subscriptions plus purchased
+/// top-ups). Accounts without paid credit are bounded by their trial credit.
+async fn check_new_account(
+    conn: &mut SqliteConnection,
+    config: &Config,
+    identity: &Identity,
+    hold: Hold,
+) -> Result<()> {
+    let limits = &config.rate_limits;
+    let pct = money::decimal(&limits.new_account_daily_spend_pct)?;
+    if limits.new_account_hours == 0 || pct.is_zero() {
+        return Ok(());
+    }
+    let account = identity.account_id.as_str();
+    let created: i64 = sqlx::query_scalar("SELECT created_at FROM accounts WHERE id=?")
+        .bind(account)
+        .fetch_one(&mut *conn)
+        .await?;
+    let ends = created + i64::from(limits.new_account_hours) * HOUR;
+    if ends <= now() {
+        return Ok(());
+    }
+    let allowance: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT SUM(quota_micro) FROM subscriptions \
+           WHERE account_id=?1 AND status='active' AND expires_at>?2),0) \
+         + COALESCE((SELECT SUM(amount_micro) FROM credits WHERE account_id=?1 AND source='purchase'),0)",
+    )
+    .bind(account)
+    .bind(now())
+    .fetch_one(&mut *conn)
+    .await?;
+    if allowance <= 0 {
+        return Ok(());
+    }
+    let cap = (rust_decimal::Decimal::from(allowance) * pct / rust_decimal::Decimal::from(100))
+        .floor()
+        .to_i64()
+        .unwrap_or(i64::MAX);
+    let scope = Scope::Account(account);
+    let used = window_sum(conn, Bucket::Billed, scope, 24).await?;
+    let held = in_flight(conn, config, scope).await?.micro;
+    if used + held + hold.micro <= cap {
+        return Ok(());
+    }
+    let message = format!(
+        "New accounts can spend {} per day during their first {} hours. {} is used or reserved",
+        money::display(cap),
+        limits.new_account_hours,
+        money::display(used + held)
+    );
+    let until_established = (ends - now()).max(1).unsigned_abs();
+    let need = used + held + hold.micro - cap;
+    let wait = match window_retry(conn, Bucket::Billed, scope, 24, need).await? {
+        Some(wait) => wait.min(until_established),
+        None if held > 0 => return Err(Error::too_many("new_account_daily_limit", message, 1)),
+        None => until_established,
+    };
+    Err(Error::quota_window(
+        "new_account_daily_limit",
+        message,
+        wait,
+    ))
+}
+
+/// The key's rate and usage limits. Request, token, and spend windows count
+/// usage settled in the window plus the holds of requests in flight, so
+/// parallel bursts cannot overshoot them.
 async fn check_limits(
     conn: &mut SqliteConnection,
     config: &Config,
     identity: &Identity,
+    hold: Hold,
 ) -> Result<()> {
     let key = identity.key_id.as_str();
     let limits = &identity.limits;
@@ -547,44 +695,66 @@ async fn check_limits(
                 .fetch_one(&mut *conn)
                 .await?;
         if recent >= i64::from(rpm) {
+            // The window frees a slot when the request that would leave the
+            // count at rpm-1 turns a minute old.
+            let oldest: Option<i64> = sqlx::query_scalar(
+                "SELECT created_at FROM requests WHERE key_id=? AND created_at>? \
+                 ORDER BY created_at LIMIT 1 OFFSET ?",
+            )
+            .bind(key)
+            .bind(now() - 60)
+            .bind(recent - i64::from(rpm))
+            .fetch_optional(&mut *conn)
+            .await?;
+            let wait = oldest.map_or(1, |t| (t + 60 - now()).max(1).unsigned_abs());
             return Err(Error::too_many(
                 "rate_limit_exceeded",
                 "Requests per minute limit reached",
+                wait,
             ));
         }
     }
+    let scope = Scope::Key(key);
+    let held = if limits.requests.is_some() || limits.tokens.is_some() || limits.spend.is_some() {
+        in_flight(conn, config, scope).await?
+    } else {
+        InFlight::default()
+    };
     if let Some(w) = &limits.requests {
-        // In-flight requests count too, so parallel bursts cannot overshoot.
-        let used = window_sum(conn, Bucket::Requests, key, w.window_hours).await?
-            + sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM requests WHERE key_id=? AND finished=0 AND created_at>?",
-            )
-            .bind(key)
-            .bind(in_flight_since(config))
-            .fetch_one(&mut *conn)
+        let window = Limit {
+            code: "request_limit_exceeded",
+            noun: "requests",
+            bucket: Bucket::Requests,
+            hours: w.window_hours,
+            max: w.max,
+        };
+        window
+            .check(conn, scope, held.count, 1, |n| n.to_string())
             .await?;
-        if used >= w.max {
-            return Err(Error::too_many(
-                "request_limit_exceeded",
-                "Usage limit reached",
-            ));
-        }
     }
-    if let Some(w) = &limits.tokens
-        && window_sum(conn, Bucket::Tokens, key, w.window_hours).await? >= w.max
-    {
-        return Err(Error::too_many(
-            "token_limit_exceeded",
-            "Usage limit reached",
-        ));
+    if let Some(w) = &limits.tokens {
+        let window = Limit {
+            code: "token_limit_exceeded",
+            noun: "tokens",
+            bucket: Bucket::Tokens,
+            hours: w.window_hours,
+            max: w.max,
+        };
+        window
+            .check(conn, scope, held.tokens, hold.tokens, |n| n.to_string())
+            .await?;
     }
-    if let Some(w) = &limits.spend
-        && window_sum(conn, Bucket::Billed, key, w.window_hours).await? >= money::usd(&w.max_usd)?
-    {
-        return Err(Error::too_many(
-            "spend_limit_exceeded",
-            "Usage limit reached",
-        ));
+    if let Some(w) = &limits.spend {
+        let window = Limit {
+            code: "spend_limit_exceeded",
+            noun: "spend",
+            bucket: Bucket::Billed,
+            hours: w.window_hours,
+            max: money::usd(&w.max_usd)?,
+        };
+        window
+            .check(conn, scope, held.micro, hold.micro, money::display)
+            .await?;
     }
     sqlx::query("UPDATE api_keys SET last_used_at=? WHERE id=?")
         .bind(now())
@@ -592,6 +762,63 @@ async fn check_limits(
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// One request, token, or spend window of a key.
+struct Limit {
+    code: &'static str,
+    noun: &'static str,
+    bucket: Bucket,
+    hours: u32,
+    max: i64,
+}
+
+impl Limit {
+    /// Admits a request needing `need` more units when settled usage plus
+    /// `held` units in flight leave room for it.
+    ///
+    /// Otherwise the error says when enough settled usage leaves the window
+    /// (a 429 that clients must not retry right away). A request that can
+    /// never fit is a 400, and a window that is full only because of requests
+    /// in flight is a short 429.
+    async fn check(
+        &self,
+        conn: &mut SqliteConnection,
+        scope: Scope<'_>,
+        held: i64,
+        need: i64,
+        show: impl Fn(i64) -> String,
+    ) -> Result<()> {
+        let used = window_sum(conn, self.bucket, scope, self.hours).await?;
+        if used + held + need <= self.max {
+            return Ok(());
+        }
+        if need > self.max {
+            return Err(Error::bad(format!(
+                "This request may use up to {} {}, more than the key's limit of {} per {} hours. \
+                 Lower max_tokens (or max_output_tokens) or raise the limit",
+                show(need),
+                self.noun,
+                show(self.max),
+                self.hours
+            ))
+            .with_code(self.code)
+            .with_param("max_tokens"));
+        }
+        let message = format!(
+            "Key {} limit reached: {} used and {} reserved of {} per {} hours",
+            self.noun,
+            show(used),
+            show(held),
+            show(self.max),
+            self.hours
+        );
+        let excess = used + held + need - self.max;
+        match window_retry(conn, self.bucket, scope, self.hours, excess).await? {
+            Some(wait) => Err(Error::quota_window(self.code, message, wait)),
+            None => Err(Error::too_many(self.code, message, 1)),
+        }
+    }
 }
 
 /// Oldest creation time at which an unfinished request can still be in
@@ -622,21 +849,69 @@ async fn check_concurrency(
     if limit == 0 {
         return Ok(());
     }
-    let in_flight: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM requests WHERE account_id=? AND finished=0 AND created_at>?",
-    )
-    .bind(account)
-    .bind(in_flight_since(config))
-    .fetch_one(&mut *conn)
-    .await?;
-    if in_flight >= i64::from(limit) {
+    let count = in_flight(conn, config, Scope::Account(account))
+        .await?
+        .count;
+    if count >= i64::from(limit) {
         return Err(Error::too_many(
             "concurrency_limit_exceeded",
             "Too many requests in flight for this account",
-        )
-        .retry_after(1));
+            1,
+        ));
     }
     Ok(())
+}
+
+/// Whose usage a window or in-flight sum covers.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    Key(&'a str),
+    Account(&'a str),
+}
+
+impl Scope<'_> {
+    fn column(self) -> &'static str {
+        match self {
+            Scope::Key(_) => "key_id",
+            Scope::Account(_) => "account_id",
+        }
+    }
+
+    fn id(self) -> String {
+        match self {
+            Scope::Key(id) | Scope::Account(id) => id.to_owned(),
+        }
+    }
+}
+
+/// Requests in flight and the sum of their holds.
+#[derive(Clone, Copy, Default)]
+struct InFlight {
+    count: i64,
+    micro: i64,
+    tokens: i64,
+}
+
+async fn in_flight(
+    conn: &mut SqliteConnection,
+    config: &Config,
+    scope: Scope<'_>,
+) -> Result<InFlight> {
+    let sql = format!(
+        "SELECT COUNT(*),COALESCE(SUM(hold_micro),0),COALESCE(SUM(hold_tokens),0) FROM requests \
+         WHERE {}=? AND finished=0 AND created_at>?",
+        scope.column()
+    );
+    let (count, micro, tokens): (i64, i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(scope.id())
+        .bind(in_flight_since(config))
+        .fetch_one(conn)
+        .await?;
+    Ok(InFlight {
+        count,
+        micro,
+        tokens,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -646,30 +921,72 @@ enum Bucket {
     Billed,
 }
 
+impl Bucket {
+    fn column(self) -> &'static str {
+        match self {
+            Bucket::Requests => "requests",
+            Bucket::Tokens => "tokens",
+            Bucket::Billed => "billed_micro",
+        }
+    }
+}
+
+/// First hour bucket counted by a window of `hours` whole hours.
+fn window_start(hours: u32) -> i64 {
+    (now() - i64::from(hours) * HOUR) / HOUR * HOUR
+}
+
 /// Sums a usage-bucket column over the last `hours` whole hours.
 async fn window_sum(
     conn: &mut SqliteConnection,
     bucket: Bucket,
-    key: &str,
+    scope: Scope<'_>,
     hours: u32,
 ) -> Result<i64> {
-    let sql = match bucket {
-        Bucket::Requests => {
-            "SELECT COALESCE(SUM(requests),0) FROM usage_buckets WHERE key_id=? AND hour>=?"
-        }
-        Bucket::Tokens => {
-            "SELECT COALESCE(SUM(tokens),0) FROM usage_buckets WHERE key_id=? AND hour>=?"
-        }
-        Bucket::Billed => {
-            "SELECT COALESCE(SUM(billed_micro),0) FROM usage_buckets WHERE key_id=? AND hour>=?"
-        }
-    };
-    let since = (now() - i64::from(hours) * HOUR) / HOUR * HOUR;
-    Ok(sqlx::query_scalar(sql)
-        .bind(key)
-        .bind(since)
+    // Column names come from the fixed enums above.
+    let sql = format!(
+        "SELECT COALESCE(SUM({}),0) FROM usage_buckets WHERE {}=? AND hour>=?",
+        bucket.column(),
+        scope.column()
+    );
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(scope.id())
+        .bind(window_start(hours))
         .fetch_one(conn)
         .await?)
+}
+
+/// Seconds until at least `need` units of the usage counted by a window of
+/// `hours` hours have left it, or `None` when the window holds less.
+///
+/// A bucket stamped `hour` counts while the window start is at most `hour`,
+/// so it leaves at `hour + 1 h + window`.
+async fn window_retry(
+    conn: &mut SqliteConnection,
+    bucket: Bucket,
+    scope: Scope<'_>,
+    hours: u32,
+    need: i64,
+) -> Result<Option<u64>> {
+    let sql = format!(
+        "SELECT hour,SUM({}) FROM usage_buckets WHERE {}=? AND hour>=? GROUP BY hour ORDER BY hour",
+        bucket.column(),
+        scope.column()
+    );
+    let rows: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(scope.id())
+        .bind(window_start(hours))
+        .fetch_all(conn)
+        .await?;
+    let mut freed = 0;
+    for (hour, amount) in rows {
+        freed += amount;
+        if freed >= need {
+            let leaves = hour + HOUR + i64::from(hours) * HOUR;
+            return Ok(Some((leaves - now()).max(1).unsigned_abs()));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
