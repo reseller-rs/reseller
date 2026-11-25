@@ -177,7 +177,7 @@ Defaults appear in parentheses.
 | `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.10"`), `free_credit_halving` (`true`; when true each further signup from the same IP in a calendar month gets half the previous trial credit, so with `ip_limit_per_month = 4` and `"0.1"` the signups get $0.1, $0.05, $0.025, and $0.0125), `free_credit_expiry_days` (30; 0 means never; max 3650), `ip_limit_per_month` (4; 0 turns it off), `cooldown_seconds` (30; 0 turns it off), `global_hourly_limit` (100; 0 turns it off), `pow_max_number` (100000; 0 disables proof of work; max 10000000), `pow_ttl_seconds` (300; 10 to 86400), `adaptive_pow` (`true`), `pow_max_number_ceiling` (1000000; from `pow_max_number` to 10000000), `adaptive_pow_reset_minutes` (30; 1 to 1440), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
 | `[keys]` | `max_per_account` (10 active keys; must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours; 0 turns it off), `rotate_cooldown_seconds` (300; 0 turns it off; max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new account's first key; child keys inherit their parent's limits) |
 | `[rate_limits]` | `management_per_minute` (120), `auth_failures_per_hour` (20), `max_concurrent_requests` (8), `checkouts_per_hour` (10), `redeem_failures_per_hour` (10), `challenges_per_minute` (10), `new_account_hours` (48) and `new_account_daily_spend_pct` (`"20"`): the new-account spending cap (see [Refund protection](#refund-protection)). 0 disables each one. |
-| `[billing]` | `default_max_output_tokens` (4096, held for LLM requests without an output limit), `min_hold_usd` (`"0.01"`, the smallest hold per request), `refund_ip_block_days` (30; 0 turns the address block off), `refund_decline_pct` (50; share of a purchase that must be used before refund answers ask the store to decline) |
+| `[billing]` | `request_estimate_usd` (`"0.001"`, the typical billed cost of one request, used to show customers approximate request counts), `default_max_output_tokens` (4096, held for LLM requests without an output limit), `min_hold_usd` (`"0.01"`, the smallest hold per request), `refund_ip_block_days` (30; 0 turns the address block off), `refund_decline_pct` (50; share of a purchase that must be used before refund answers ask the store to decline) |
 | `[mcp]` | `enabled` (`true`), `oauth` (`true`; OAuth sign-in for `/mcp`, see [MCP](#mcp)), and `max_media_bytes` (16 MiB; 1 byte to 256 MiB), the largest audio or image returned inline |
 | `[stripe]` | `secret_key`, `webhook_secret` |
 | `[[models]]` | Public model catalog: `id`, `upstream`, `aliases`, `enabled`, `name`, `description`, `owned_by`, `created`, `context_length`, `input_modalities`, `output_modalities` (left empty, they derive from the upstream route that serves the model: chat text to text, TTS text to audio, STT audio to text, image text to image), `show_pricing` |
@@ -473,7 +473,8 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 |---|---|---|---|
 | `GET` | `/v1/plans` | Public | Active plans and `payment_methods` |
 | `GET` | `/v1/signup/challenge` | Public | Proof-of-work challenge |
-| `POST` | `/v1/signup` | Public | Body `{"name"?, "contact"?, "altcha"}`. Creates an account and its first key. |
+| `POST` | `/v1/signup` | Public | Body `{"name"?, "contact"?, "altcha", "accept_terms"?}`. Creates an account and its first key. `accept_terms: true` records acceptance of the Terms of Service and Privacy Policy. |
+| `GET` | `/terms`, `/privacy` | Public | Built-in Terms of Service and Privacy Policy pages |
 | `POST` | `/v1/keys` | Key or token (not anonymous) | Body `{"name", "limits"?}`. Creates a child key on the caller's account. The child inherits the caller's limits. Limits you send replace single fields and must be no looser than the parent's (a lower or equal count, a window at least as long, a subset of its model allowlist), otherwise `400 limits_exceed_parent`. Blocked or expired callers get `403 key_inactive`. Returns `401` when anonymous. |
 | `GET` | `/v1/keys?q=&status=&sort=&dir=` | Any | List the caller's keys with `billed_usd` (lifetime spend) and `usage_30d_usd`. `sort` is `created`, `name`, `status`, `last_used`, `spend`, or `usage`. |
 | `GET` | `/v1/keys/:id` | Any | One of the caller's keys with its 30-day usage series |
@@ -483,7 +484,7 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `GET` | `/v1/models/:id` | Key | One catalog entry, or `404 model_not_found` |
 | `GET` | `/v1/account/models` | Any | The `/v1/models` list for the caller's key, also with a dashboard token |
 | `GET` | `/v1/account` | Any | Account, balance (`balance_usd`, split into `quota_remaining_usd` and `topup_remaining_usd`), lifetime `billed_usd`, active `subscriptions` with their monthly quota, credit lots, `consumption_consent`, and `top_up` instructions |
-| `PATCH` | `/v1/account` | Any | Body `{"consumption_consent": true}` or `false`: consent to share consumption data with Apple for refund requests |
+| `PATCH` | `/v1/account` | Any | Body `{"consumption_consent": false}` withdraws (or `true` grants again) the consent to share consumption data with app stores for refund requests |
 | `GET` | `/v1/account/store` | Any | Native app purchase setup: `app_account_token` (App Store) and `obfuscated_account_id` (Google Play) for this account, store settings, and plans with store product ids |
 | `POST` | `/v1/account/store/apple` | Any | Body `{"signed_transaction":"<JWS>"}` or `{"transaction_id":"..."}` after a StoreKit 2 purchase. Returns the account and `purchase: {order_id, credited}` |
 | `POST` | `/v1/account/store/google` | Any | Body `{"product_id","purchase_token"}` after a Play Billing purchase. Same response |
@@ -506,7 +507,7 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 # Sign up after solving the challenge. The response holds key, dashboard_token,
 # dashboard_url, api_base, and limits.
 curl -X POST http://localhost:56787/v1/signup -H 'Content-Type: application/json' \
-  -d '{"name":"my-app","altcha":"<base64 solution>"}'
+  -d '{"name":"my-app","altcha":"<base64 solution>","accept_terms":true}'
 
 export RESELLER_KEY=sk-res-...
 
@@ -764,7 +765,10 @@ Customer-facing pages can be rebranded without rebuilding. Edit `branding` in **
 |---|---|
 | `name`, `tagline`, `description` | Header, footer, page title (`name - tagline`), and meta description |
 | `logo_url`, `favicon_url` | A site path (for example `/theme/logo.svg`) or an `http(s)` URL. Empty uses the built-in mark. |
-| `theme_color`, `color_scheme` | Browser UI colour, and the `dark` or `light` scheme |
+| `theme_color` | Browser UI colour |
+| `color_scheme`, `theme_toggle` | Default theme for visitors who have not chosen one (`system` follows the device, or `dark` or `light`; default `system`), and whether the header shows the light/dark toggle (default `true`). The choice is kept in the browser's local storage. |
+| `legal_name`, `contact_email` | Operator name and contact used in the built-in Terms of Service (`/terms`) and Privacy Policy (`/privacy`) |
+| `terms_url`, `privacy_url` | External legal pages. These replace the built-in ones in links. |
 | `css_vars` | Overrides of the built-in CSS custom properties, written without `--`. Common keys include `accent`, `accent-2`, `accent-ink`, `bg`, `bg-soft`, `panel`, `panel-2`, `border`, `text`, `muted`, and `radius`. |
 | `custom_css` | Extra stylesheet (up to 64 KiB), appended after the built-in theme |
 | `hero_eyebrow`, `hero_title`, `hero_text` | Landing page copy |
@@ -803,8 +807,10 @@ A new database starts with these plans (all editable in **Admin > Plans**):
 | `monthly` | subscription, 1 month | $20 | $20 per month |
 | `halfyear` | subscription, 6 months | $96 | $17 per month |
 | `year` | subscription, 12 months | $144 | $12.50 per month |
-| `topup-10` | top-up | $10 | $10, never expires |
-| `topup-25` | top-up | $25 | $25, never expires |
+
+No top-ups are seeded. Create them in **Admin > Plans** (`kind = "topup"`) when you want to offer extra usage, for example as App Store consumables.
+
+Customers see quotas and trial credit as approximate request counts, not dollar amounts. For example, $20 per month is shown as "~20,000 requests per month" with the default `billing.request_estimate_usd` of `"0.001"`. Set this to the typical billed cost of one request with your models and markup. Counts are rounded to two significant digits and shown as one figure (`~50`), never as a range. Plan prices and the administrator console stay in USD.
 
 Quota is billed usage at the caller's markup, so a fully used quota still earns `markup_pct` over upstream cost.
 
@@ -968,7 +974,11 @@ Apple and Google decide refunds, not the customer, and the usage behind a refund
   - `sampleContentProvided`, true when signup grants trial credit;
   - `refundPreference`: `GRANT_FULL` when nothing was used, `DECLINE` from `billing.refund_decline_pct` (50%) used, and `GRANT_PRORATED` in between.
 
-  Apple accepts consumption data only with the customer's consent. The server answers only for accounts with `consumption_consent` set. Customers give consent at signup (`"consumption_consent": true`) or with `PATCH /v1/account`. Add matching wording to your terms and privacy policy, and keep the opt-in separate from App Tracking Transparency. Without consent, nothing is sent.
+  Apple accepts consumption data only with the customer's consent. The server answers only for accounts with `consumption_consent` set.
+
+  Consent is given through a clickwrap at signup: the form states that clicking **Create key** accepts the Terms of Service and the Privacy Policy, and it sends `"accept_terms": true`. The server then records `consumption_consent` and `consent_at`. The Privacy Policy has its own section on this sharing, and customers withdraw with `PATCH /v1/account` `{"consumption_consent": false}`. Without consent, nothing is sent.
+
+  In the EU, consent bundled into the Terms is not a freely given GDPR consent. The built-in policy therefore names fraud prevention (legitimate interest) as the legal basis and the acceptance as the customer's agreement. If you need a stricter reading, add a separate opt-in.
 - **Google Play chargebacks.** With `google.refund_review = true`, a `pendingRefundReviewNotification` (chargebacks only) is answered through the Review Refund API (`orders.reviewrefund`) within Google's 24-hour window. The answer carries the same consumption share (`consumptionPercentageMilliunits`), `sampleContentProvided`, and a `refundPreference` of `APPROVE`, `DECLINE`, or `NEUTRAL`. Google has no consumption API for ordinary refund requests.
 
 Both stores also issue partial refunds: Apple prorated refunds (`revocationPercentage`) and Google quantity-based refunds. These are treated like full refunds and block the account.

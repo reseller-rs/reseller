@@ -299,6 +299,11 @@ public_url = "http://localhost:56787"
 # (Apple) or stay neutral (Google). 1 to 100. Default: 50.
 # refund_decline_pct = 50
 
+# Typical billed cost of one API request, in USD. Used only to show customers
+# their trial credit and monthly quota as approximate request counts (for
+# example "~20,000 requests per month"). Default: "0.001".
+# request_estimate_usd = "0.001"
+
 # =============================================================================
 #  MCP (Model Context Protocol)
 # =============================================================================
@@ -496,8 +501,12 @@ api_key = "sk-replace-with-your-upstream-key"
 # Browser UI colour. Default: "#0c0e0d".
 # theme_color = "#0c0e0d"
 
-# Colour scheme advertised to the browser: "dark" or "light". Default: "dark".
-# color_scheme = "dark"
+# Default theme for visitors who have not used the toggle: "system" (follow
+# the device), "dark", or "light". Default: "system".
+# color_scheme = "system"
+
+# Show the light/dark theme toggle in the header. Default: true.
+# theme_toggle = true
 
 # Extra CSS appended after the built-in theme. Must not contain "</style".
 # Default: "".
@@ -513,6 +522,18 @@ api_key = "sk-replace-with-your-upstream-key"
 
 # Footer links. Default: one link to the project source.
 # footer_links = [{ label = "Source", url = "https://github.com/reseller-rs/reseller" }]
+
+# Operator name used in the built-in Terms of Service and Privacy Policy.
+# Empty uses name. Default: "".
+# legal_name = "Example Ltd"
+
+# Contact address shown in the legal pages. Default: "".
+# contact_email = "support@example.com"
+
+# External Terms of Service and Privacy Policy. Empty serves the built-in
+# /terms and /privacy pages. Default: "".
+# terms_url = ""
+# privacy_url = ""
 
 # [branding.css_vars]
 # CSS custom properties without the leading "--". Names use a-z, 0-9, and

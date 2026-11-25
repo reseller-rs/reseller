@@ -7,7 +7,7 @@
 //! - `theme.css`: appended to `/assets/theme.css` after the branding CSS.
 //! - Any image, font, or text file, served at `/theme/<path>`. Use these for
 //!   files such as a `logo_url`.
-use crate::{App, config::Branding};
+use crate::{App, config::Config};
 use axum::{
     body::Body,
     http::{HeaderValue, StatusCode, header},
@@ -61,18 +61,28 @@ fn content_type(path: &Path) -> Option<&'static str> {
 }
 
 /// Branding values exposed to the browser app.
-pub fn public_json(b: &Branding) -> serde_json::Value {
+pub fn public_json(config: &Config) -> serde_json::Value {
+    let b = &config.branding;
     json!({
         "name": b.name,
         "tagline": b.tagline,
         "hero_eyebrow": b.hero_eyebrow,
         "hero_title": b.hero_title,
         "hero_text": b.hero_text,
+        "legal_name": b.legal_name,
+        "contact_email": b.contact_email,
+        "terms_url": b.terms_url,
+        "privacy_url": b.privacy_url,
+        "color_scheme": b.color_scheme,
+        "theme_toggle": b.theme_toggle,
+        "request_estimate_usd": config.billing.request_estimate_usd,
+        "trial_credit_usd": config.signup.free_credit_usd,
     })
 }
 
 /// Renders the page template with the current branding.
-pub fn render(template: &str, b: &Branding) -> String {
+pub fn render(template: &str, config: &Config) -> String {
+    let b = &config.branding;
     let favicon = if b.favicon_url.is_empty() {
         "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/assets/favicon.svg\">\n  \
          <link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/assets/favicon-32.png\">"
@@ -112,7 +122,7 @@ pub fn render(template: &str, b: &Branding) -> String {
         format!("{}: {}", b.name, b.tagline)
     };
     // Escape markup in the JSON so it cannot close the script element.
-    let data = public_json(b)
+    let data = public_json(config)
         .to_string()
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
@@ -130,7 +140,13 @@ pub fn render(template: &str, b: &Branding) -> String {
         ("{{name}}", escape(&b.name)),
         ("{{description}}", escape(&b.description)),
         ("{{theme_color}}", escape(&b.theme_color)),
-        ("{{color_scheme}}", escape(&b.color_scheme)),
+        (
+            "{{color_scheme}}",
+            match b.color_scheme.as_str() {
+                "system" => "dark light".to_owned(),
+                scheme => escape(scheme),
+            },
+        ),
         ("{{logo_url}}", escape(logo)),
         ("{{footer_text}}", escape(&b.footer_text)),
     ]
@@ -166,10 +182,7 @@ pub async fn page(app: &App) -> Html<String> {
     let custom = theme_file(app, Path::new("index.html"), MAX_TEMPLATE_BYTES)
         .await
         .and_then(|bytes| String::from_utf8(bytes).ok());
-    let mut html = render(
-        custom.as_deref().unwrap_or(BUILTIN_TEMPLATE),
-        &config.branding,
-    );
+    let mut html = render(custom.as_deref().unwrap_or(BUILTIN_TEMPLATE), &config);
     // A custom favicon gets the conventional companions from the theme
     // directory: a PNG fallback and the iOS home-screen icon.
     let mut extra = String::new();
@@ -244,7 +257,7 @@ pub async fn file(app: &App, path: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Link;
+    use crate::config::{Branding, Link};
 
     #[test]
     fn template_values_are_escaped() {
@@ -260,7 +273,11 @@ mod tests {
             }],
             ..Branding::default()
         };
-        let page = render(BUILTIN_TEMPLATE, &b);
+        let config = Config {
+            branding: b,
+            ..Config::default()
+        };
+        let page = render(BUILTIN_TEMPLATE, &config);
         assert!(page.contains("<title>Acme &lt;AI&gt;</title>"));
         assert!(page.contains("src=\"/theme/logo.svg\""));
         assert!(page.contains("<link rel=\"icon\" type=\"image/png\" href=\"/theme/icon.png\">"));
@@ -268,5 +285,8 @@ mod tests {
         assert!(page.contains("a=1&amp;b=2"));
         assert!(!page.contains("</script><script>alert"));
         assert!(!page.contains("{{"));
+        // The default theme follows the device; the app applies it.
+        assert!(page.contains("name=\"color-scheme\" content=\"dark light\""));
+        assert!(page.contains("\"request_estimate_usd\":\"0.001\""));
     }
 }

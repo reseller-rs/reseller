@@ -20,6 +20,9 @@ pub struct Billing {
     /// ask for a prorated refund (Apple) or stay neutral (Google). An unused
     /// purchase always asks for a full refund.
     pub refund_decline_pct: u32,
+    /// Typical billed cost of one API request in USD. Used only to show
+    /// customers credit and quotas as approximate request counts.
+    pub request_estimate_usd: String,
 }
 
 impl Default for Billing {
@@ -29,6 +32,7 @@ impl Default for Billing {
             min_hold_usd: "0.01".into(),
             refund_ip_block_days: 30,
             refund_decline_pct: 50,
+            request_estimate_usd: "0.001".into(),
         }
     }
 }
@@ -36,6 +40,12 @@ impl Default for Billing {
 impl Billing {
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         crate::money::usd(&self.min_hold_usd).context("billing.min_hold_usd")?;
+        anyhow::ensure!(
+            crate::money::usd(&self.request_estimate_usd)
+                .context("billing.request_estimate_usd")?
+                > 0,
+            "billing.request_estimate_usd must be positive"
+        );
         anyhow::ensure!(
             (1..=1_000_000).contains(&self.default_max_output_tokens),
             "billing.default_max_output_tokens must be 1-1000000"

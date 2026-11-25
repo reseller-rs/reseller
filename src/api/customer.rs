@@ -28,8 +28,11 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
     // Public routes: the plan catalogue and self-service signup.
     match (path.as_slice(), method.as_str()) {
         (["plans"], "GET") => {
+            let config = app.config().await;
             let mut plans = billing::plans(app, true).await?;
-            plans["payment_methods"] = payments::methods(&*app.config().await).into();
+            plans["payment_methods"] = payments::methods(&config).into();
+            plans["request_estimate_usd"] = config.billing.request_estimate_usd.clone().into();
+            plans["trial_credit_usd"] = config.signup.free_credit_usd.clone().into();
             return Ok(plans);
         }
         (["signup", "challenge"], "GET") => return signup_challenge(app, ip).await,
@@ -77,6 +80,13 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         }
         (["account"], "GET") => {
             let mut overview = billing::account(app, account).await?;
+            overview["request_estimate_usd"] = app
+                .config()
+                .await
+                .billing
+                .request_estimate_usd
+                .clone()
+                .into();
             overview["top_up"] =
                 payments::deposits::top_up(app, &*app.config().await, account).await;
             Ok(overview)

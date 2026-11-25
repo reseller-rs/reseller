@@ -11,14 +11,56 @@ const brand = (() => {
   }
 })();
 const brandName = brand.name || 'Reseller';
+const legalName = brand.legal_name || brandName;
+const contactEmail = brand.contact_email || '';
+
+/* Theme ------------------------------------------------------------------------
+   html[data-theme] is always "light" or "dark" (CSS also follows the OS when the
+   attribute is missing). Order: the visitor's saved choice, then the operator's
+   default (branding.color_scheme), where "system" follows the OS live. Runs first
+   so the page is painted in the right palette. */
+const colorQuery = matchMedia('(prefers-color-scheme: light)');
+const storedTheme = () => {
+  try {
+    const v = localStorage.getItem('theme');
+    return v === 'light' || v === 'dark' ? v : '';
+  } catch {
+    return '';
+  }
+};
+let chosenTheme = storedTheme();
+const followsSystem = !['light', 'dark'].includes(brand.color_scheme);
+const currentTheme = () => chosenTheme || (followsSystem ? (colorQuery.matches ? 'light' : 'dark') : brand.color_scheme);
+function applyTheme() {
+  const theme = currentTheme();
+  document.documentElement.dataset.theme = theme;
+  document.querySelector('meta[name="color-scheme"]')?.setAttribute('content', theme);
+  const button = document.querySelector('#theme-toggle');
+  if (button) {
+    button.setAttribute('aria-pressed', String(theme === 'dark'));
+    button.title = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
+    button.innerHTML = ico(theme === 'dark' ? 'sun' : 'moon', 18);
+  }
+}
+function toggleTheme() {
+  chosenTheme = currentTheme() === 'dark' ? 'light' : 'dark';
+  try {
+    localStorage.setItem('theme', chosenTheme);
+  } catch { /* storage blocked: the choice lasts until reload */ }
+  applyTheme();
+}
+colorQuery.addEventListener('change', () => { if (!chosenTheme && followsSystem) applyTheme(); });
+document.documentElement.dataset.theme = currentTheme();
 const admin = location.pathname.startsWith('/admin');
 const workspace = location.pathname.startsWith('/workspace');
 const docsPage = location.pathname.startsWith('/docs');
+const legalPage = /^\/(terms|privacy)(\/|$)/.test(location.pathname);
+const legalKind = location.pathname.startsWith('/privacy') ? 'privacy' : 'terms';
 const oauthPage = location.pathname.startsWith('/oauth/authorize');
 const CUSTOMER_STORE = 'reseller.customer';
 const store = admin ? 'reseller.admin' : CUSTOMER_STORE;
 // The docs page reads the workspace session (same tab) to list the caller's models.
-let token = docsPage || oauthPage ? '' : sessionStorage.getItem(store) || '';
+let token = docsPage || oauthPage || legalPage ? '' : sessionStorage.getItem(store) || '';
 let tab = 'overview';
 
 // The operator-issued workspace link carries the dashboard token as `#token=...`.
@@ -83,6 +125,93 @@ const ms = v => {
 };
 const shortId = id => id ? `${String(id).slice(0, 8)}...` : '-';
 const percent = (part, whole) => whole > 0 ? `${((part / whole) * 100).toFixed(1)}%` : '-';
+
+/* Icons -------------------------------------------------------------------------
+   One stroke style (24 grid, 1.8 stroke, round caps), sized 16px in text and 18-20px
+   in headers. Always decorative: the visible text or aria-label carries the meaning. */
+const ICONS = {
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  key: '<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M14 9l2 2"/>',
+  refresh: '<path d="M20 11a8 8 0 0 0-14.5-4M4 5v4h4"/><path d="M4 13a8 8 0 0 0 14.5 4M20 19v-4h-4"/>',
+  ban: '<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>',
+  external: '<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+  download: '<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
+  book: '<path d="M5 4h14v16H7a2 2 0 0 1-2-2z"/><path d="M5 18a2 2 0 0 1 2-2h12M9 8h6"/>',
+  grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  logout: '<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M16 8l4 4-4 4M20 12H9"/>',
+  card: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/>',
+  chart: '<path d="M5 20V11M12 20V4M19 20v-6M3 21h18"/>',
+  list: '<path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+  sliders: '<path d="M4 7h9M19 7h1M4 17h1M11 17h9"/><circle cx="16" cy="7" r="2.2"/><circle cx="8" cy="17" r="2.2"/>',
+  shield: '<path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/>',
+  lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+  alert: '<path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18h.01"/>',
+  inbox: '<path d="M3 13l3-8h12l3 8v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M3 13h5l1 3h6l1-3h5"/>',
+  file: '<path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>',
+  back: '<path d="M19 12H5M11 6l-6 6 6 6"/>',
+  users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.8a3.5 3.5 0 0 1 0 6.4M21.5 20a6.5 6.5 0 0 0-4-6"/>',
+  tag: '<path d="M3 12V4h8l10 10-8 8z"/><path d="M7.5 8h.01"/>',
+  ticket: '<path d="M3 7h18v3a2 2 0 0 0 0 4v3H3v-3a2 2 0 0 0 0-4z"/><path d="M14 7v10"/>',
+  zap: '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  infinity: '<path d="M6 8a4 4 0 1 0 0 8c4 0 8-8 12-8a4 4 0 1 1 0 8c-4 0-8-8-12-8z"/>',
+  home: '<path d="M4 11l8-7 8 7v9H4z"/><path d="M10 20v-6h4v6"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+  terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l3 2-3 2M12 15h5"/>',
+  wallet: '<path d="M4 7a2 2 0 0 1 2-2h12v4"/><path d="M4 7v11a2 2 0 0 0 2 2h14V9H6a2 2 0 0 1-2-2z"/><path d="M16 14.5h.01"/>',
+};
+const ico = (name, size = 16) => `<svg class="ico" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${ICONS[name] || ''}</svg>`;
+// An icon followed by a text label, for buttons and links.
+const withIcon = (name, label) => `${ico(name)}<span>${esc(label)}</span>`;
+
+/* Request counts ----------------------------------------------------------------
+   Customers see approximate requests, not dollars of usage. The server sends the
+   typical billed cost of one request (branding.request_estimate_usd, refreshed by
+   /v1/plans and /v1/account). Two significant digits, never a range. */
+let requestEstimate = Number(brand.request_estimate_usd) > 0 ? Number(brand.request_estimate_usd) : 0.001;
+const setRequestEstimate = v => { if (Number(v) > 0) requestEstimate = Number(v); };
+function approxNumber(amount) {
+  const n = Number(amount || 0) / requestEstimate;
+  return n > 0 ? Number(n.toPrecision(2)) : 0;
+}
+// "~20,000" for a USD amount; "0" when nothing is left.
+const approx = amount => {
+  const n = approxNumber(amount);
+  return n === 0 ? '0' : n < 1 ? '<1' : `~${n.toLocaleString('en-US')}`;
+};
+// "~100 requests", "~1 request", "0 requests".
+const requestsText = amount => {
+  const n = approxNumber(amount);
+  return n === 0 ? '0 requests' : n < 1 ? 'less than 1 request' : `~${n.toLocaleString('en-US')} request${n === 1 ? '' : 's'}`;
+};
+const ESTIMATE_NOTE = 'Request counts are estimates for typical requests; long prompts and outputs use more.';
+const estimateNote = () => `<p class="hint estimate-note">${ico('info', 14)}<span>${esc(ESTIMATE_NOTE)}</span></p>`;
+
+/* Legal links -------------------------------------------------------------------- */
+const LEGAL_LABELS = { terms: 'Terms of Service', privacy: 'Privacy Policy' };
+function legalUrl(kind) {
+  const url = (kind === 'terms' ? brand.terms_url : brand.privacy_url) || '';
+  if (!url) return '';
+  try {
+    return ['http:', 'https:'].includes(new URL(url, location.origin).protocol) ? url : '';
+  } catch {
+    return '';
+  }
+}
+function legalLink(kind, { label = LEGAL_LABELS[kind], newTab = false, icon = '' } = {}) {
+  const external = Boolean(legalUrl(kind));
+  const blank = newTab || external;
+  return `<a href="${esc(legalUrl(kind) || `/${kind}`)}"${blank ? ' target="_blank" rel="noopener noreferrer"' : ''}>${icon ? ico(icon) : ''}${esc(label)}${blank ? '<span class="sr-only"> (opens in a new tab)</span>' : ''}</a>`;
+}
+// Shown under the button that creates an account: using it is the agreement.
+const clickwrap = button => `<p class="clickwrap">By clicking ${esc(button)}, you agree to the ${legalLink('terms', { newTab: true })} and ${legalLink('privacy', { newTab: true })}.</p>`;
 /* Plan maths ---------------------------------------------------------------------
    Everything shown about a plan is derived from the API values (price, credit,
    duration), so operators can change the catalog without touching this file. */
@@ -184,15 +313,24 @@ function signOut() {
 function renderHeader() {
   const el = document.querySelector('#header-actions');
   if (!el) return;
-  const docs = `<a class="nav-link${docsPage ? ' current' : ''}" href="/docs/"${docsPage ? ' aria-current="page"' : ''}>Docs</a>`;
+  const docs = `<a class="nav-link${docsPage ? ' current' : ''}" href="/docs/"${docsPage ? ' aria-current="page"' : ''}>${withIcon('book', 'Docs')}</a>`;
+  const toggle = brand.theme_toggle === false ? '' : '<button type="button" id="theme-toggle" class="icon-button ghost" aria-label="Dark theme" aria-pressed="false"></button>';
   if (oauthPage) {
-    el.innerHTML = docs;
+    el.innerHTML = `${docs}${toggle}`;
   } else if (token && (workspace || admin)) {
-    el.innerHTML = `${docs}<button type="button" id="header-logout" class="ghost">Sign out</button>`;
+    el.innerHTML = `${docs}${toggle}<button type="button" id="header-logout" class="ghost">${withIcon('logout', 'Sign out')}</button>`;
     el.querySelector('#header-logout').onclick = signOut;
   } else {
-    el.innerHTML = `${docs}<a class="button" href="/workspace/">Workspace</a>`;
+    el.innerHTML = `${docs}${toggle}<a class="button" href="/workspace/">${withIcon('grid', 'Workspace')}</a>`;
   }
+  el.querySelector('#theme-toggle')?.addEventListener('click', toggleTheme);
+  applyTheme();
+}
+// Terms and Privacy links in the footer (operator URLs may point elsewhere).
+function renderFooter() {
+  const el = document.querySelector('#footer-legal');
+  if (!el) return;
+  el.innerHTML = `${legalLink('terms', { label: 'Terms', icon: 'file' })}${legalLink('privacy', { label: 'Privacy', icon: 'lock' })}${contactEmail ? `<a href="mailto:${esc(contactEmail)}">${ico('link')}Contact</a>` : ''}`;
 }
 
 let noticeTimer;
@@ -224,13 +362,14 @@ function flash(el, duration = 1400) {
 }
 function flashCopied(button) {
   if (!button) return;
-  if (!button.dataset.label) button.dataset.label = button.textContent;
+  if (button._label === undefined) button._label = button.innerHTML;
   button.classList.add('copied');
-  button.textContent = 'Copied';
+  button.innerHTML = withIcon('check', 'Copied');
   clearTimeout(button._flashTimer);
   button._flashTimer = setTimeout(() => {
     button.classList.remove('copied');
-    button.textContent = button.dataset.label;
+    button.innerHTML = button._label;
+    button._label = undefined;
   }, 1400);
 }
 
@@ -318,13 +457,13 @@ function table(columns, rows, { group, empty } = {}) {
   }
   return `<div class="table-wrap stack"><table><thead><tr>${columns.map(([label, , cls]) => `<th scope="col"${cls ? ` class="${cls}"` : ''}>${esc(label)}</th>`).join('')}</tr></thead>${body}</table></div>`;
 }
-function metric(label, value, hint, { tone, html } = {}) {
-  return `<div class="card metric-card${tone ? ` tone-${tone}` : ''}"><div class="label">${esc(label)}</div><div class="metric">${html ? value : esc(value)}</div>${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
+function metric(label, value, hint, { tone, html, icon } = {}) {
+  return `<div class="card metric-card${tone ? ` tone-${tone}` : ''}"><div class="label">${icon ? ico(icon, 14) : ''}${esc(label)}</div><div class="metric">${html ? value : esc(value)}</div>${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
 }
 // A compact label/value list. Values are HTML; escape them at the call site.
 const facts = items => `<dl class="facts">${items.filter(Boolean).map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${value}</dd></div>`).join('')}</dl>`;
-function emptyState(title, text) {
-  return `<div class="empty"><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
+function emptyState(title, text, icon = 'inbox') {
+  return `<div class="empty"><span class="empty-icon">${ico(icon, 20)}</span><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
 }
 function loading(text = 'Loading...') {
   return `<div class="loading"><span class="spinner" aria-hidden="true"></span>${esc(text)}</div>`;
@@ -338,44 +477,59 @@ function loading(text = 'Loading...') {
 const skel = (cls = 'skel-line', n = 1) => `<span class="skel ${cls}"></span>`.repeat(n);
 const skeleton = (inner, label = 'Loading', cls = 'skeleton-body') =>
   `<div class="skeleton" role="status"><span class="sr-only">${esc(label)}...</span><div class="${cls}" aria-hidden="true">${inner}</div></div>`;
+// Each helper uses the same classes as the real element it stands in for, so
+// margins, paddings, and grid columns come from the same rules.
 const skHead = (actions = false) => `<div class="page-head"><div>${skel('skel-title')}${skel('skel-line md')}</div>${actions ? skel('skel-btn') : ''}</div>`;
-const skStats = n => `<div class="stats">${Array.from({ length: n }, () => `<div class="card metric-card">${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line md')}</div>`).join('')}</div>`;
-const skBanner = () => `<div class="banner"><div>${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line md')}</div><div class="actions">${skel('skel-btn', 2)}</div></div>`;
-const skChart = () => `<div class="card"><div class="card-head">${skel('skel-title')}</div>${skel('skel-chart')}</div>`;
-const skToolbar = () => `<div class="toolbar">${skel('skel-input wide')}${skel('skel-input', 2)}${skel('skel-btn')}</div>`;
-const skTable = (rows = 6, cols = 5) => `<div class="skel-table"><div class="skel-row head cols-${cols}">${skel('skel-line sm', cols)}</div>${Array.from({ length: rows }, () => `<div class="skel-row cols-${cols}">${skel('skel-line md')}${skel('skel-line sm', cols - 1)}</div>`).join('')}</div>`;
+const skStats = (n, hint = true) => `<div class="stats">${Array.from({ length: n }, () => `<div class="card metric-card">${skel('skel-label')}${skel('skel-metric')}${hint ? skel('skel-line md') : ''}</div>`).join('')}</div>`;
+const skBanner = () => `<div class="banner"><div>${skel('skel-label')}${skel('skel-metric')}${skel('skel-line md')}</div><div class="actions">${skel('skel-btn', 2)}</div></div>`;
+const skCardHead = (button = false) => `<div class="card-head">${skel('skel-h3')}${button ? skel('skel-btn small') : ''}</div>`;
+const skChart = () => `<div class="card">${skCardHead(true)}${skel('skel-chart')}</div>`;
+const skToolbar = () => `<div class="toolbar">${skel('skel-input wide')}${skel('skel-input', 3)}${skel('skel-btn')}</div>`;
+const skPager = () => `<div class="pager">${skel('skel-line sm')}<div class="pager-actions">${skel('skel-btn', 2)}</div></div>`;
+const skTable = (rows = 6, cols = 5, tall = false) => `<div class="skel-table"><div class="skel-row head cols-${cols}">${skel('skel-line sm', cols)}</div>${Array.from({ length: rows }, () => `<div class="skel-row${tall ? ' tall' : ''} cols-${cols}">${skel('skel-line md')}${skel('skel-line sm', cols - 1)}</div>`).join('')}</div>`;
 const skFacts = n => `<div class="skel-facts">${Array.from({ length: n }, () => `<div class="skel-fact">${skel('skel-line sm')}${skel('skel-line lg')}</div>`).join('')}</div>`;
-const skPlans = n => `<div class="plans pricing" data-count="${n}">${Array.from({ length: n }, () => `<div class="card plan-card skel-plan"><div class="plan-top">${skel('skel-line sm')}</div>${skel('skel-metric')}${skel('skel-line md')}<div class="skel-feats">${skel('skel-line lg', 3)}</div>${skel('skel-line lg')}${skel('skel-btn wide')}</div>`).join('')}</div><div class="assurance skel-assure">${skel('skel-line md', 3)}</div>`;
-const skHero = () => `<div class="card balance-hero"><div class="balance-main">${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line md')}</div><div class="actions">${skel('skel-btn')}</div></div>`;
-const skWays = () => `<div class="ways">${Array.from({ length: 3 }, () => `<div class="card way">${skel('skel-line md')}${skel('skel-line lg', 2)}${skel('skel-btn')}</div>`).join('')}</div>`;
+// Plan cards, reassurance row, and the FAQ, as on the landing page and the billing catalog.
+const skPlans = n => `<div class="plans pricing" data-count="${n}">${Array.from({ length: n }, () => `<div class="card plan-card skel-plan"><div class="plan-top">${skel('skel-line sm')}</div>${skel('skel-price')}${skel('skel-line md')}<div class="skel-feats">${skel('skel-line lg', 3)}</div>${skel('skel-line lg')}${skel('skel-btn wide')}</div>`).join('')}</div><div class="assurance skel-assure">${skel('skel-line md', 3)}</div>${skel('skel-note')}<div class="faq">${skel('skel-faq', 5)}</div>`;
+const skHero = () => `<div class="card balance-hero"><div class="balance-main">${skel('skel-label')}${skel('skel-balance')}${skel('skel-line md')}</div><div class="actions">${skel('skel-btn')}</div></div>`;
 const skCard = body => `<div class="card">${body}</div>`;
+const skSeg = n => `<div class="seg-tabs">${skel('skel-seg', n)}</div>`;
+const skCode = () => skel('skel-code');
+const skRanks = n => `<div class="skel-ranks">${skel('skel-rank', n)}</div>`;
 
 const SKELETON_VIEWS = {
   overview: () => admin
-    ? `${skHead(true)}${skStats(4)}${skChart()}${skStats(3)}<div class="split-even">${skCard(skel('skel-line sm', 1) + skFacts(5))}${skCard(skel('skel-line sm', 1) + skFacts(5))}</div>`
-    : `${skBanner()}${skStats(4)}${skChart()}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(4, 5)}`)}`,
-  keys: () => `${skHead(true)}${skToolbar()}${skTable(7, 6)}`,
-  accounts: () => `${skHead()}${skToolbar()}${skTable(7, 6)}`,
-  payments: () => `${skHead(true)}${skToolbar()}${skTable(7, 6)}`,
-  requests: () => `${skHead(true)}${skToolbar()}${skTable(8, 6)}`,
-  usage: () => `${skHead()}${skStats(3)}${skChart()}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(4, 4)}`)}`,
-  billing: () => `${skHero()}${skStats(3)}${skWays()}${skPlans(3)}${skTable(3, 5)}${skTable(3, 5)}`,
-  connect: () => `${skHead(true)}${skCard(skFacts(3))}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(3, 5)}`)}${skCard(skel('skel-code'))}`,
-  plans: () => `${skHead(true)}${skTable(5, 6)}`,
-  codes: () => `${skHead(true)}${skTable(5, 5)}`,
-  settings: () => `${skHead()}${skCard(skel('skel-line lg', 2))}${skCard(skel('skel-block'))}`,
+    ? `${skHead(true)}${skStats(4)}${skChart()}${skStats(3)}<div class="split-even">${skCard(skCardHead(true) + skRanks(5))}${skCard(skCardHead(true) + skRanks(5))}</div>${skCard(`${skCardHead(true)}${skel('skel-line lg', 2)}`)}`
+    : `${skBanner()}${skStats(4)}${skChart()}${skCard(`${skCardHead(true)}${skTable(5, 5)}`)}`,
+  keys: () => `${skHead(!admin)}${skToolbar()}${skTable(8, admin ? 7 : 6, true)}${skPager()}`,
+  accounts: () => `${skHead()}${skToolbar()}${skTable(8, 7, true)}${skPager()}`,
+  payments: () => `${skHead(true)}${skToolbar()}${skTable(8, 7, true)}${skPager()}`,
+  requests: () => `${skHead(true)}${skToolbar()}${skTable(8, 6, true)}${skPager()}`,
+  usage: () => `${skHead()}${skStats(3, false)}${skChart()}${skCard(`${skCardHead()}${skTable(4, 4)}`)}${skCard(`${skCardHead()}${skTable(5, 4)}`)}`,
+  billing: () => billingSub === 'add'
+    ? `${skSeg(3)}<div class="bill-body"><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div><div class="plan-tiles">${skel('skel-tile', 3)}</div></div><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div><div class="ways">${skel('skel-way', 2)}</div></div>${skel('skel-more')}</div>`
+    : billingSub === 'history'
+      ? `${skSeg(3)}<div class="bill-body"><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div>${skTable(3, 5, true)}</div>${skel('skel-more', 2)}</div>`
+      : `${skSeg(3)}<div class="bill-body">${skHero()}<div class="plan-chip-row">${skel('skel-pill')}</div>${skel('skel-more')}${skel('skel-note')}</div>`,
+  connect: () => `${skHead(true)}${skCard(`${skCardHead()}${skFacts(3)}`)}${skCard(`${skCardHead()}${skTable(3, 5)}`)}${skCard(`${skCardHead()}${skel('skel-tab-row')}${skCode()}`)}<div class="docs-title">${skel('skel-h3')}</div>${skCard(`${skCardHead()}${skel('skel-line lg', 2)}${skel('skel-btn')}${skel('skel-line md', 4)}`)}<div class="section-gap"></div>${skCard(`${skCardHead()}${skTable(2, 4, true)}`)}<div class="docs-title">${skel('skel-h3')}</div><div class="docs-split">${skCard(skel('skel-code'))}${skCard(skel('skel-code'))}</div>`,
+  plans: () => `${skHead(true)}${skTable(5, 7, true)}`,
+  codes: () => `${skHead(true)}${skTable(5, 5, true)}`,
+  settings: () => `${skHead()}${skel('skel-callout')}${skCard(`${skel('skel-line sm')}${skel('skel-textarea')}`)}`,
 };
 const viewSkeleton = name => skeleton((SKELETON_VIEWS[name] || SKELETON_VIEWS.keys)(), 'Loading');
-const tabsSkeleton = () => `<div class="tabs" aria-hidden="true">${skel('skel-tab', 5)}</div>`;
-const modalSkeleton = () => skeleton(`${skel('skel-title')}${skFacts(4)}${skel('skel-chart')}${skTable(3, 4)}`, 'Loading details');
+const tabsSkeleton = () => `<div class="tabs" aria-hidden="true">${skel('skel-tab', admin ? 8 : 6)}</div>`;
+const modalSkeleton = () => skeleton(`${skel('skel-title')}${skFacts(4)}${skel('skel-chart')}${skTable(3, 4)}`, 'Loading details', 'skeleton-body stack');
 const plansSkeleton = () => skeleton(skPlans(3), 'Loading plans');
-const docsSkeleton = () => skeleton(`<div>${skel('skel-line', 1)}${skel('skel-line md', 1)}${skel('skel-line sm', 1)}${skel('skel-line md', 1)}${skel('skel-line', 1)}${skel('skel-line sm', 1)}</div><div class="skeleton-body wide">${skel('skel-title')}${skel('skel-line lg')}${skel('skel-block')}${skel('skel-line md')}${skTable(4, 4)}</div>`, 'Loading documentation', 'skel-docs');
-const landingSkeleton = () => skeleton(`<div>${skel('skel-eyebrow')}${skel('skel-hero', 2)}${skel('skel-line lg')}${skel('skel-line md')}<div class="actions section">${skel('skel-btn', 2)}</div></div>${skel('skel-block')}`, 'Loading', 'skel-landing');
-const consentSkeleton = () => skeleton(`<div class="card consent-card"><div class="skel-center">${skel('skel-circle', 2)}</div>${skel('skel-title')}${skel('skel-line md')}<div class="skel-facts">${skel('skel-line lg', 3)}${skel('skel-input')}${skel('skel-block')}</div></div>`, 'Loading authorization request', 'skel-consent');
+// Docs and legal pages: contents column plus the article column.
+const docNavSkeleton = n => `<div class="skel-nav">${skel('skel-eyebrow')}${skel('skel-navlink', n)}<div class="skel-nav-legal">${skel('skel-navlink', 2)}</div></div>`;
+const docsSkeleton = () => skeleton(`${docNavSkeleton(9)}<div class="skel-article"><div class="skel-doc-hero"><div>${skel('skel-eyebrow')}${skel('skel-title')}${skel('skel-line lg', 2)}${skel('skel-btn')}</div>${skel('skel-block')}</div>${skel('skel-h2')}<div class="skel-steps">${skel('skel-step', 3)}</div>${skCode()}</div>`, 'Loading documentation', 'skel-docs');
+const legalSkeleton = () => skeleton(`${docNavSkeleton(legalKind === 'privacy' ? 12 : 17)}<div class="skel-article">${skel('skel-line sm')}${skel('skel-title')}${skel('skel-line md')}${skel('skel-line lg', 3)}${skel('skel-h2')}${skel('skel-line lg', 5)}${skel('skel-h2')}${skel('skel-line lg', 4)}</div>`, 'Loading document', 'skel-docs');
+const landingSkeleton = () => skeleton(`<div class="skel-landing"><div>${skel('skel-eyebrow')}${skel('skel-hero', 2)}${skel('skel-line lg', 3)}<div class="actions section">${skel('skel-btn', 2)}</div></div>${skel('skel-block')}</div><div class="section">${skel('skel-eyebrow')}${skel('skel-title')}<div class="skel-steps">${skel('skel-step', 3)}</div>${skCard(`${skCardHead(true)}${skCode()}`)}</div><div class="section">${skel('skel-eyebrow')}${skel('skel-title')}${skPlans(3)}</div><div class="skel-steps section">${skel('skel-step', 3)}</div>`, 'Loading');
+const consentSkeleton = () => skeleton(`<div class="card consent-card"><div class="skel-center">${skel('skel-circle', 2)}</div>${skel('skel-consent-title', 2)}${skel('skel-line lg')}<div class="consent-section">${skel('skel-line sm')}${skel('skel-line lg', 2)}</div><div class="consent-section">${skel('skel-line sm')}${skel('skel-seg-bar')}${skel('skel-input')}</div><div class="skel-buttons">${skel('skel-btn', 2)}</div></div>`, 'Loading authorization request', 'skel-consent');
 const shellSkeleton = () => `${tabsSkeleton()}<section id="content" aria-busy="true">${viewSkeleton('overview')}</section>`;
 // Painted before any data is known, so every route has a shaped placeholder at once.
 function bootSkeleton() {
   if (docsPage) return docsSkeleton();
+  if (legalPage) return legalSkeleton();
   if (oauthPage) return consentSkeleton();
   if (admin || workspace) return token ? shellSkeleton() : '';
   return landingSkeleton();
@@ -440,6 +594,8 @@ const TABS = admin
 let billingSub = 'overview';
 const BILLING_SUBS = ['overview', 'add', 'history'];
 const TAB_LABELS = { overview: 'Overview', accounts: 'Accounts', keys: 'API keys', requests: 'Requests', payments: 'Payments', plans: 'Plans', codes: 'Redeem codes', settings: 'Settings', usage: 'Usage', billing: 'Billing', connect: 'Connect' };
+
+const TAB_ICONS = { overview: 'home', accounts: 'users', keys: 'key', requests: 'list', payments: 'wallet', plans: 'tag', codes: 'ticket', settings: 'sliders', usage: 'chart', billing: 'card', connect: 'link' };
 
 function hashFor(name) {
   const state = listStates[name];
@@ -545,25 +701,29 @@ function planCard(p, badges, cta) {
     <div class="plan-price"><span class="plan-amount">${esc(i.topup ? usdShort(i.price) : perMonthLabel(i))}</span>${!i.topup && i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
     <div class="plan-billed">${esc(billedLine(i))}</div>
     <ul class="plan-features">${i.topup
-      ? `<li>${CHECK}<span><strong>${esc(usdShort(i.credit))} extra usage</strong></span></li>
-      <li>${CHECK}<span>Never expires, carries over</span></li>
-      <li>${CHECK}<span>Used after your monthly quota</span></li>`
-      : `<li>${CHECK}<span><strong>${esc(usdShort(i.quota))} of usage per month</strong></span></li>
-      <li>${CHECK}<span>Quota resets every month</span></li>
-      <li>${CHECK}<span>${esc(monthsLabel(i.months))} prepaid, no auto-renewal</span></li>`}</ul>
+      ? `<li>${ico('zap')}<span><strong>${esc(approx(i.credit))} extra requests</strong> that never expire</span></li>
+      <li>${ico('infinity')}<span>Carries over, no deadline</span></li>
+      <li>${ico('list')}<span>Used after your monthly quota</span></li>`
+      : `<li>${ico('zap')}<span><strong>${esc(approx(i.quota))} requests per month</strong></span></li>
+      <li>${ico('refresh')}<span>Quota resets every month</span></li>
+      <li>${ico('calendar')}<span>${esc(monthsLabel(i.months))} prepaid, no auto-renewal</span></li>`}</ul>
     <p class="plan-desc">${esc(p.description || (i.topup ? 'Extra usage that never expires.' : 'Monthly usage quota.'))}</p>
     <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/#billing/add">${p.kind === 'topup' ? 'Add top-up' : 'Choose plan'}</a>`}</div>
   </article>`;
 }
 function planFaq(plans, methods) {
+  const topups = plans.some(p => p.kind === 'topup');
+  const crypto = methods.includes('crypto');
+  const extra = [topups && 'add a top-up', crypto && 'send stablecoins to your deposit address', 'redeem a code'].filter(Boolean).join(', ');
   const faq = [
     ['How does the monthly quota work?', 'A plan gives you a quota of usage each month. Each request is priced from its usage (tokens, characters, audio seconds, or images) and counted against the quota. The quota resets every month and unused quota does not carry over. Every key on your account shares it.'],
-    ['What happens when my quota runs out?', 'Requests stop with a 402 insufficient_quota error that explains your options. Add a top-up, redeem a code, or wait for the quota to reset, and calls work again right away.'],
-    ['Do top-ups expire?', 'No. A top-up is extra usage that never expires and carries over. Your monthly quota is used first, then your top-up balance.'],
-    ['Can I add usage without a plan?', methods.includes('crypto')
-      ? 'Yes. Buy a top-up, or open Billing in your workspace and send stablecoins to your personal deposit address. Any amount is added 1:1 in USD as usage that never expires.'
-      : 'Buy a top-up, or ask the operator for a code to add a custom amount.'],
-  ];
+    ['How many requests do I get?', 'Plans show an approximate number of requests, based on a typical request. Short requests use less of your quota and long prompts or outputs use more, so the real count varies.'],
+    ['What happens when my quota runs out?', `Requests stop with a 402 insufficient_quota error that explains your options. Wait for the quota to reset, or ${extra}, and calls work again right away.`],
+    topups && ['Do top-ups expire?', 'No. A top-up is extra usage that never expires and carries over. Your monthly quota is used first, then your top-up balance.'],
+    (topups || crypto) && ['Can I add usage without a plan?', crypto
+      ? `Yes. ${topups ? 'Buy a top-up, or open' : 'Open'} Billing in your workspace and send stablecoins to your personal deposit address. Any amount you send is added as usage that never expires.`
+      : 'Yes. Buy a top-up, or ask the operator for a code.'],
+  ].filter(Boolean);
   return `<div class="faq" role="list">${faq.map(([q, a]) => `<details role="listitem"><summary>${esc(q)}</summary><p>${esc(a)}</p></details>`).join('')}</div>`;
 }
 const methodNames = methods => [methods.includes('stripe') && 'card', methods.includes('crypto') && 'crypto'].filter(Boolean);
@@ -576,10 +736,11 @@ function pricingSection(plans, methods = [], cta) {
     'Monthly quota resets each month',
     paid.length ? `Pay by ${paid.join(' or ')}` : 'Redeem a code from the operator',
     'Card and crypto plans are prepaid and do not auto-renew',
-    'Top-ups never expire and are used after the quota',
-  ];
+    plans.some(p => p.kind === 'topup') && 'Top-ups never expire and are used after the quota',
+  ].filter(Boolean);
   return `<div class="plans pricing" data-count="${plans.length}">${plans.map(p => planCard(p, badges, cta?.(p))).join('')}</div>
     <ul class="assurance">${assurances.map(a => `<li>${CHECK}${esc(a)}</li>`).join('')}</ul>
+    ${estimateNote()}
     ${planFaq(plans, methods)}`;
 }
 
@@ -594,12 +755,12 @@ function planFacts(p, { paidAt } = {}) {
   return facts(i.topup ? [
     ['Top-up', `<strong>${esc(p.name || p.code)}</strong>`],
     ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">one-time</span>`],
-    ['Extra usage', `<strong>${esc(usdShort(i.credit))}</strong> <span class="muted">never expires</span>`],
+    ['Extra requests', `<strong>${esc(approx(i.credit))}</strong> <span class="muted">never expire</span>`],
   ] : [
     ['Plan', `<strong>${esc(p.name || p.code)}</strong>`],
     ['Per month', esc(perMonthLabel(i))],
     ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">${esc(monthsLabel(i.months))}, prepaid</span>`],
-    ['Monthly quota', `<strong>${esc(usdShort(i.quota))}</strong> <span class="muted">resets each month</span>`],
+    ['Requests per month', `<strong>${esc(approx(i.quota))}</strong> <span class="muted">resets each month</span>`],
     ['Term', esc(`${monthsLabel(i.months)}, until ${day((paidAt || nowSeconds()) + i.months * 30.4 * DAY, { dateStyle: 'medium' })}`)],
   ]);
 }
@@ -616,14 +777,16 @@ function checkout(plan, methods) {
         <div><div class="label">Plan</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${i.topup ? 'Top-up, never expires' : `${esc(perMonthLabel(i))}${i.price > 0 ? ' per month' : ''} &middot; ${esc(monthsLabel(i.months))}`}</div></div>
         <div class="co-total"><div class="label">Total</div><div class="co-price">${esc(usdShort(i.price))}</div></div>
       </div>
-      <div class="co-credit">${i.topup ? `<span>You get <strong>${esc(usdShort(i.credit))}</strong> of extra usage that never expires</span>` : `<span>You get <strong>${esc(usdShort(i.quota))}</strong> of usage every month</span>`}</div>
+      <div class="co-credit">${i.topup ? `<span>${ico('zap')}You get <strong>${esc(requestsText(i.credit))}</strong> of extra usage that never expires</span>` : `<span>${ico('zap')}You get <strong>${esc(requestsText(i.quota))}</strong> every month</span>`}</div>
       <fieldset class="method-choice"><legend>Pay with</legend>
         ${methods.map((m, n) => `<label class="method"><input type="radio" name="method" value="${esc(m)}"${n === 0 ? ' checked' : ''}><span class="method-body"><strong>${esc(METHOD_INFO[m]?.[0] || m)}</strong><span class="hint">${esc(METHOD_INFO[m]?.[1] || '')}</span></span></label>`).join('')}
       </fieldset>
       <details class="more"><summary>Details</summary>
         ${planFacts(plan)}
         <p class="hint">${i.topup ? 'Top-ups never expire. The monthly quota is used first, then your top-up balance.' : 'Prepaid for the whole term, it does not auto-renew. The quota is shared by all your keys.'}</p>
+        ${estimateNote()}
       </details>
+      <p class="clickwrap">Our ${legalLink('terms', { newTab: true })} and ${legalLink('privacy', { newTab: true })} apply to your purchase.</p>
       <div class="actions sticky-actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary" data-submit>Continue</button></div>
     </form>
   </div>`, d => {
@@ -632,7 +795,7 @@ function checkout(plan, methods) {
     const submit = form.querySelector('[data-submit]');
     const label = () => {
       const m = form.elements.method.value;
-      submit.textContent = m === 'stripe' ? `Pay ${usdShort(i.price)} by card` : 'Continue to crypto payment';
+      submit.innerHTML = m === 'stripe' ? withIcon('card', `Pay ${usdShort(i.price)} by card`) : withIcon('wallet', 'Continue to crypto payment');
     };
     label();
     form.addEventListener('change', label);
@@ -790,20 +953,20 @@ function redeemForm() {
 function secrets(v, { embedded = false } = {}) {
   modal('Save your credentials', `
     <p class="muted">These are shown only once. Keep the dashboard token to manage your account even if you block your API key.</p>
-    ${Number(v.trial_credit_usd) > 0 ? `<p class="trial-note">Your account starts with <strong>${esc(usd(v.trial_credit_usd))}</strong> of free trial credit.</p>` : ''}
+    ${Number(v.trial_credit_usd) > 0 ? `<p class="trial-note">${ico('zap')}<span>Your account starts with <strong>${esc(approx(v.trial_credit_usd))} free requests</strong> to try the API. <span class="trial-foot">${esc(ESTIMATE_NOTE)}</span></span></p>` : ''}
     <div class="cred-row">
       <span class="cred-label">API key</span>
       <code class="cred-value secret" title="${esc(v.key)}">${esc(v.key)}</code>
-      <button type="button" class="small primary" data-copy="key">Copy key</button>
+      <button type="button" class="small primary" data-copy="key">${withIcon('copy', 'Copy key')}</button>
     </div>
     <div class="cred-row">
       <span class="cred-label">Dashboard token</span>
       <code class="cred-value" title="${esc(v.dashboard_token)}">${esc(v.dashboard_token)}</code>
-      <button type="button" class="small" data-copy="token">Copy token</button>
+      <button type="button" class="small" data-copy="token">${withIcon('copy', 'Copy token')}</button>
     </div>
     <div class="actions section">
-      <button type="button" data-copy-all class="ghost">Copy both</button>
-      ${admin || embedded ? '' : '<button type="button" data-open class="ghost">Open workspace</button>'}
+      <button type="button" data-copy-all class="ghost">${withIcon('copy', 'Copy both')}</button>
+      ${admin || embedded ? '' : `<button type="button" data-open class="ghost">${withIcon('grid', 'Open workspace')}</button>`}
     </div>`, d => {
     const wire = (selector, text, label) => {
       const button = d.querySelector(selector);
@@ -837,9 +1000,9 @@ function keyForm() {
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
       <p class="field-help">${signedIn ? 'The new key shares your account balance.' : 'New accounts receive evaluation credit. Additional keys share the same balance.'}</p>
-      ${signedIn ? '' : '<label class="inline check-line"><input type="checkbox" name="consumption_consent"> Share usage data with Apple when I request a refund</label>'}
       <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
-      <div class="actions"><button class="primary" type="submit">Create key</button></div>
+      <div class="actions"><button class="primary" type="submit">${withIcon('plus', 'Create key')}</button></div>
+      ${signedIn ? '' : clickwrap('Create key')}
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     const pow = d.querySelector('.pow');
     const bar = pow.querySelector('progress');
@@ -850,7 +1013,7 @@ function keyForm() {
       if (signedIn) v = await api('/v1/keys', 'POST', b);
       else {
         pow.hidden = false;
-        v = await signup({ name: b.name, contact: b.contact, consumption_consent: b.consumption_consent === 'on' }, p => { bar.value = Math.round(p * 100); }, ctl.signal);
+        v = await signup({ name: b.name, contact: b.contact, accept_terms: true }, p => { bar.value = Math.round(p * 100); }, ctl.signal);
       }
     } finally {
       pow.hidden = true;
@@ -914,10 +1077,10 @@ function keyDetails(kid) {
       </div>
       <div class="quick-links">
         ${goButton('View requests', 'requests', { key: k.id }, 'primary small')}
-        <button type="button" class="small" data-key-edit>${admin ? 'Edit key' : 'Rename'}</button>
-        <button type="button" class="small" data-key-rotate${k.status !== 'active' ? ' disabled' : ''}>Rotate</button>
-        ${k.status === 'active' ? '<button type="button" class="small danger" data-key-block>Block</button>' : ''}
-        ${admin && k.status !== 'revoked' ? '<button type="button" class="small danger" data-key-revoke>Revoke</button>' : ''}
+        <button type="button" class="small" data-key-edit>${withIcon('edit', admin ? 'Edit key' : 'Rename')}</button>
+        <button type="button" class="small" data-key-rotate${k.status !== 'active' ? ' disabled' : ''}>${withIcon('refresh', 'Rotate')}</button>
+        ${k.status === 'active' ? `<button type="button" class="small danger" data-key-block>${withIcon('ban', 'Block')}</button>` : ''}
+        ${admin && k.status !== 'revoked' ? `<button type="button" class="small danger" data-key-revoke>${withIcon('ban', 'Revoke')}</button>` : ''}
       </div>
       <section class="detail-section">${chart(series, { compact: true })}</section>
       ${series.length ? `<section class="detail-section"><h4>By model</h4>${modelTable(series, { upstream: admin })}</section>` : ''}
@@ -1033,9 +1196,9 @@ function manageAccount(aid) {
         ${goButton(`Keys (${count(keyTotal)})`, 'keys', { account: a.id })}
         ${goButton('Payments', 'payments', { account: a.id })}
         <span class="spacer"></span>
-        <button type="button" class="primary small" data-credit>Add credit</button>
+        <button type="button" class="primary small" data-credit>${withIcon('plus', 'Add credit')}</button>
         ${hasPlans ? '<button type="button" class="small" data-sub>Grant plan</button>' : ''}
-        <button type="button" class="small" data-key>Create key</button>
+        <button type="button" class="small" data-key>${withIcon('key', 'Create key')}</button>
         <button type="button" class="small" data-edit>Edit</button>
         ${a.status === 'active' ? '<button type="button" class="danger small" data-suspend>Suspend</button>' : '<button type="button" class="small" data-activate>Reactivate</button>'}
       </div>
@@ -1093,8 +1256,8 @@ function manageAccount(aid) {
 function creditTable(credits) {
   return table([
     ['Source', c => esc(sourceLabel(c.source))],
-    ['Amount', c => `<span class="num">${esc(usd(c.amount_usd))}</span>`, 'end'],
-    ['Remaining', c => `<span class="num">${esc(usd(c.remaining_usd))}</span>`, 'end'],
+    [admin ? 'Amount' : 'Requests', c => admin ? `<span class="num">${esc(usd(c.amount_usd))}</span>` : `<span class="num">${esc(approx(c.amount_usd))}</span>`, 'end'],
+    [admin ? 'Remaining' : 'Remaining requests', c => admin ? `<span class="num">${esc(usd(c.remaining_usd))}</span>` : `<span class="num">${esc(approx(c.remaining_usd))}</span><div class="hint">${esc(usd(c.remaining_usd))}</div>`, 'end'],
     ['State', c => pill(lotState(c))],
     ['Expires', c => c.expires_at ? esc(date(c.expires_at)) : '<span class="muted">Never</span>'],
     ['Note', c => c.note ? esc(c.note) : DASH, 'wrap'],
@@ -1278,7 +1441,7 @@ function requestDetails(r) {
 
 /* API and MCP guidance ----------------------------------------------------------- */
 
-const codeBlock = (text, label) => `<div class="code-block">${label ? `<div class="code-label">${esc(label)}</div>` : ''}<button type="button" class="small ghost" data-copy-code>Copy</button><pre><code>${esc(text)}</code></pre></div>`;
+const codeBlock = (text, label) => `<div class="code-block">${label ? `<div class="code-label">${esc(label)}</div>` : ''}<button type="button" class="small ghost" data-copy-code>${withIcon('copy', 'Copy')}</button><pre><code>${esc(text)}</code></pre></div>`;
 
 function snippetTabs(items) {
   return `<div class="snippets">
@@ -1426,7 +1589,8 @@ const ENDPOINT_DOCS = [
 ];
 const ACCOUNT_DOCS = [
   ['GET', '/v1/account', 'Balance, monthly quota left, top-up balance, subscriptions, debt, and top-up instructions.'],
-  ['PATCH', '/v1/account', 'Update settings. Body {"consumption_consent": true|false} (share usage data with Apple on refund requests).'],
+  ['POST', '/v1/signup', 'Create an account (no credential needed). Body {"name", "contact", "accept_terms": true, "altcha"}. Accepting the Terms and Privacy Policy is required.'],
+  ['PATCH', '/v1/account', 'Withdraw or grant consent to share consumption data with app stores for refund requests. Body {"consumption_consent": true|false}.'],
   ['GET', '/v1/account/store', 'App account token and store products for in-app purchases.'],
   ['POST', '/v1/account/store/apple', 'Verify an App Store purchase. Body {"signed_transaction"} or {"transaction_id"}.'],
   ['POST', '/v1/account/store/google', 'Verify a Google Play purchase. Body {"product_id", "purchase_token"}.'],
@@ -1565,6 +1729,30 @@ const DOC_SECTIONS = [
 
 const quickStartCode = (base, model) => codeBlock(`export RESELLER_KEY="sk-res-..."\ncurl ${base}/chat/completions \\\n  -H "Authorization: Bearer $RESELLER_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello"}]}'`, 'Terminal');
 
+// Contents column: highlights the section in view and folds on narrow screens.
+function wireToc(root) {
+  const links = new Map([...root.querySelectorAll('[data-doc-link]')].map(a => [a.dataset.docLink, a]));
+  const toc = root.querySelector('.docs-nav');
+  const toggle = toc.querySelector('.docs-nav-toggle');
+  toggle.onclick = () => {
+    const open = toc.classList.toggle('open');
+    toggle.setAttribute('aria-expanded', String(open));
+  };
+  toc.addEventListener('click', e => {
+    if (!e.target.closest('a')) return;
+    toc.classList.remove('open');
+    toggle.setAttribute('aria-expanded', 'false');
+  });
+  const observer = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      links.forEach((a, id) => id === entry.target.id ? a.setAttribute('aria-current', 'location') : a.removeAttribute('aria-current'));
+      toc.querySelector('[data-toc-current]').textContent = links.get(entry.target.id)?.textContent || '';
+    }
+  }, { rootMargin: '-15% 0px -70% 0px' });
+  root.querySelectorAll('.doc-section').forEach(s => observer.observe(s));
+}
+
 async function docs() {
   // Same-tab workspace session, if any, to show the caller's own models.
   const session = sessionStorage.getItem(CUSTOMER_STORE) || '';
@@ -1579,6 +1767,7 @@ async function docs() {
         <button type="button" class="docs-nav-toggle" aria-expanded="false" aria-controls="docs-toc"><span>On this page</span><strong data-toc-current>${esc(DOC_SECTIONS[0][1])}</strong></button>
         <div class="eyebrow">On this page</div>
         <ol id="docs-toc">${DOC_SECTIONS.map(([id, label]) => `<li><a href="#${id}" data-doc-link="${id}">${esc(label)}</a></li>`).join('')}</ol>
+        <div class="docs-nav-legal">${legalLink('terms', { label: 'Terms', icon: 'file' })}${legalLink('privacy', { label: 'Privacy', icon: 'lock' })}</div>
       </nav>
       <article class="docs-body">
         <header class="docs-hero">
@@ -1586,7 +1775,7 @@ async function docs() {
             <div class="eyebrow">${esc(brandName)} API</div>
             <h1>Developer docs</h1>
             <p class="lead">One OpenAI-compatible API for text, speech, transcription, and images. Change the base URL and key, keep your code.</p>
-            <div class="actions">${session ? '<a class="button primary" href="/workspace/#keys">API keys</a>' : '<button type="button" class="primary" data-create>Get an API key</button><a class="button ghost" href="/workspace/">Sign in</a>'}<a class="button ghost" href="#quick-start">Quick start</a></div>
+            <div class="actions">${session ? `<a class="button primary" href="/workspace/#keys">${withIcon('key', 'API keys')}</a>` : `<button type="button" class="primary" data-create>${withIcon('key', 'Get an API key')}</button><a class="button ghost" href="/workspace/">${withIcon('grid', 'Sign in')}</a>`}<a class="button ghost" href="#quick-start">${withIcon('terminal', 'Quick start')}</a></div>
           </div>
           <div class="connect-card" role="group" aria-label="Connection details">
             <div class="connect-row"><span class="label">Base URL</span>${copyable(base, 'Base URL')}</div>
@@ -1682,27 +1871,7 @@ async function docs() {
   wireDocs(main);
   wireCopies(main);
   main.querySelector('[data-create]')?.addEventListener('click', keyForm);
-  // Highlight the section in view.
-  const links = new Map([...main.querySelectorAll('[data-doc-link]')].map(a => [a.dataset.docLink, a]));
-  const toc = main.querySelector('.docs-nav');
-  const toggle = toc.querySelector('.docs-nav-toggle');
-  toggle.onclick = () => {
-    const open = toc.classList.toggle('open');
-    toggle.setAttribute('aria-expanded', String(open));
-  };
-  toc.addEventListener('click', e => {
-    if (!e.target.closest('a')) return;
-    toc.classList.remove('open');
-    toggle.setAttribute('aria-expanded', 'false');
-  });
-  const observer = new IntersectionObserver(entries => {
-    for (const entry of entries) {
-      if (!entry.isIntersecting) continue;
-      links.forEach((a, id) => id === entry.target.id ? a.setAttribute('aria-current', 'location') : a.removeAttribute('aria-current'));
-      toc.querySelector('[data-toc-current]').textContent = links.get(entry.target.id)?.textContent || '';
-    }
-  }, { rootMargin: '-15% 0px -70% 0px' });
-  main.querySelectorAll('.doc-section').forEach(s => observer.observe(s));
+  wireToc(main);
   if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
   if (!session) return;
   // The model list arrives after the page: fill its slots in place.
@@ -1724,6 +1893,227 @@ async function docs() {
   }
 }
 
+/* Legal pages --------------------------------------------------------------------
+   /terms and /privacy render from the data below. Operator values (legal name,
+   contact address) are escaped once here and interpolated into trusted markup.
+   Bump LEGAL_UPDATED whenever the wording changes. */
+const LEGAL_UPDATED = '2026-11-25';
+const legalDate = () => new Date(`${LEGAL_UPDATED}T00:00:00Z`).toLocaleDateString('en-US', { dateStyle: 'long', timeZone: 'UTC' });
+
+function legalContent(kind) {
+  const co = esc(legalName);
+  const svc = esc(brandName);
+  const mail = contactEmail ? `<a href="mailto:${esc(contactEmail)}">${esc(contactEmail)}</a>` : '';
+  // Contact wording that disappears cleanly when no address is configured.
+  const atMail = mail ? ` at ${mail}` : '';
+  const terms = `<a href="${esc(legalUrl('terms') || '/terms')}">Terms of Service</a>`;
+  const privacy = `<a href="${esc(legalUrl('privacy') || '/privacy')}">Privacy Policy</a>`;
+  if (kind === 'privacy') {
+    return {
+      title: 'Privacy Policy',
+      intro: `This policy explains what personal data ${co} ("we", "us") collects when you use ${svc}, why we collect it, who receives it, and the choices you have.`,
+      sections: [
+        { id: 'who-we-are', title: 'Who we are', body: [
+          `${co} operates ${svc}, an OpenAI-compatible API and workspace that forwards your requests to third-party AI model providers. We are the controller of the personal data described in this policy.`,
+          mail ? `You can reach us at ${mail} with any question about your data.` : '',
+        ] },
+        { id: 'data-we-collect', title: 'Data we collect', body: [
+          { ul: [
+            '<strong>Account data</strong>: an account ID, the names you give your API keys, hashed key secrets and short key prefixes, and an optional contact such as an email address if you provide one.',
+            '<strong>Technical data</strong>: the IP address of your requests and sign-ups, and anti-abuse signals such as proof-of-work results and rate-limit counters.',
+            '<strong>API request metadata and usage</strong>: for each request we keep request metadata such as the route, model, token counts, characters, audio seconds or images, status, duration, timestamps and the amount billed. This data powers your usage history and billing.',
+            '<strong>Payment records</strong>: the plan or top-up you bought, price, payment method, status, provider and transaction identifiers (including blockchain transaction hashes and your deposit addresses), and App Store or Google Play transaction identifiers. We do not receive or store full card numbers.',
+            '<strong>Messages you send us</strong>, if you contact support.',
+          ] },
+          `<strong>Prompts and outputs.</strong> The content of your requests and the model responses are forwarded to the upstream AI providers that serve the model you chose. We do not store prompts or outputs beyond the request metadata listed above.`,
+        ] },
+        { id: 'how-we-use-data', title: 'How and why we use data', body: [
+          'We use personal data only for the purposes below, each with its legal basis where data protection law requires one.',
+          { ul: [
+            '<strong>Providing the Service</strong> (creating accounts and keys, routing requests, showing usage and billing). Legal basis: performance of our contract with you.',
+            '<strong>Processing payments and keeping financial records</strong>. Legal basis: contract, and compliance with legal obligations.',
+            '<strong>Security, fraud prevention and abuse control</strong>, including rate limits, new-account limits and refund-abuse checks. Legal basis: our legitimate interests in protecting the Service and other customers.',
+            '<strong>Sharing consumption data with app stores</strong> when you request a refund (see the dedicated section below). Legal basis: legitimate interests in preventing fraud and refund abuse, and your agreement given at sign-up.',
+            '<strong>Support and service messages</strong>. Legal basis: contract and legitimate interests.',
+            '<strong>Operating and improving the Service</strong> using aggregated usage statistics. Legal basis: legitimate interests.',
+            '<strong>Legal claims and compliance</strong>. Legal basis: legal obligation and legitimate interests.',
+          ] },
+          'We do not sell personal data and we do not use it for advertising.',
+        ] },
+        { id: 'app-store-sharing', title: 'Sharing consumption data with app stores', body: [
+          `When you request a refund from Apple for an App Store purchase, or a refund or chargeback through Google Play, the store may ask us for information about how the purchase was used. In that case we may send the store:`,
+          { ul: [
+            'how much of the purchase was used (for example the share of the plan quota or credit that was consumed),',
+            'the delivery status of the purchase (whether the plan or credit was delivered to your account), and',
+            'whether trial usage was provided to your account.',
+          ] },
+          'We do not send your prompts, outputs, API keys or dashboard tokens. The store uses this information only to decide the refund request.',
+          '<strong>Legal basis.</strong> Our legitimate interests in preventing fraud and refund abuse, and your agreement, which you give by accepting the Terms and this Privacy Policy when you create your account.',
+          `<strong>How to withdraw.</strong> You can withdraw your agreement at any time by contacting us${atMail}, or by calling <code>PATCH /v1/account</code> with the body <code>{"consumption_consent": false}</code> using your API key or dashboard token. Withdrawal does not affect sharing that already took place. After you withdraw, the store decides your refund request without this information, which can affect the outcome.`,
+          '<strong>Retention.</strong> We keep a record of what was shared with the store together with the related payment record, for as long as we keep that record.',
+        ] },
+        { id: 'sharing', title: 'Who receives your data', body: [
+          'We share personal data only with service providers that process it on our behalf or as needed to deliver what you asked for:',
+          { ul: [
+            '<strong>Upstream AI providers</strong> receive the prompts, files and parameters of the requests you send, so that they can produce a response.',
+            '<strong>Payment providers</strong>: Stripe for card payments, Payroof for crypto payments, and Apple and Google for App Store and Google Play purchases.',
+            '<strong>Infrastructure providers</strong> that host and secure the Service.',
+            '<strong>Authorities and advisers</strong> when the law requires it or to establish or defend legal claims.',
+          ] },
+          'These providers have their own privacy policies and, where they act as our processors, are bound by data processing terms.',
+        ] },
+        { id: 'transfers', title: 'International transfers', body: [
+          'Our providers may process data in countries other than your own, including countries outside the European Economic Area and the United Kingdom. Where required, we rely on safeguards such as standard contractual clauses.',
+        ] },
+        { id: 'retention', title: 'Retention', body: [
+          'We keep account data and request metadata while your account is active, and afterwards only as long as needed for billing, tax, security and legal purposes. Payment records are kept for the period required by financial regulations. When data is no longer needed, we delete or anonymise it.',
+        ] },
+        { id: 'cookies', title: 'Cookies and local storage', body: [
+          'We do not use advertising or tracking cookies. The web pages store a small amount of data in your browser:',
+          { ul: [
+            '<strong>Theme preference</strong> (light or dark) in local storage, so the site looks the way you chose.',
+            '<strong>Session token</strong>: when you sign in to the workspace, your dashboard token or API key is kept in session storage for that browser tab and is removed when you sign out or close the tab.',
+          ] },
+          'You can clear this data at any time in your browser settings.',
+        ] },
+        { id: 'security', title: 'Security', body: [
+          'We protect data with encryption in transit, hashed key secrets, access controls and rate limits. No system is perfectly secure, so keep your API keys and dashboard token private and rotate them if you suspect misuse.',
+        ] },
+        { id: 'your-rights', title: 'Your rights', body: [
+          `Depending on where you live, you may have the right to access, correct or delete your personal data, to restrict or object to its processing, to receive it in a portable format, and to withdraw consent you have given. To exercise a right, contact us${atMail}. You also have the right to complain to your local data protection authority.`,
+        ] },
+        { id: 'children', title: 'Children', body: [
+          `${svc} is not directed to children under 16, and we do not knowingly collect their personal data. If you believe a child has created an account, contact us so that we can delete it.`,
+        ] },
+        { id: 'changes', title: 'Changes to this policy', body: [
+          `We may update this policy. The date above shows the latest version, and we will give notice of material changes, for example in the workspace or by email if you gave us an address. The current ${terms} apply together with this policy.`,
+        ] },
+        { id: 'contact', title: 'Contact', body: [
+          mail ? `Questions or requests about this policy can be sent to ${co} at ${mail}.` : `Questions or requests about this policy can be sent to ${co} through the support channel the operator of this service provides.`,
+        ] },
+      ],
+    };
+  }
+  return {
+    title: 'Terms of Service',
+    intro: `These terms govern your use of ${svc}, provided by ${co} ("we", "us"). Please read them together with our ${privacy}.`,
+    sections: [
+      { id: 'agreement', title: 'Agreement', body: [
+        `By creating an account, creating or using an API key, or buying a plan, you agree to these Terms of Service and to our ${privacy}. If you do not agree, do not use the Service. You must be at least 16 years old and able to enter a binding contract, and if you use the Service for an organisation you confirm that you may bind it.`,
+      ] },
+      { id: 'service', title: 'The Service', body: [
+        `${svc} provides an OpenAI-compatible API, a Model Context Protocol (MCP) endpoint and a web workspace. Your requests are forwarded to third-party AI model providers for text, speech, transcription and image generation, and the responses are returned to you. The workspace lets you manage keys, see usage and request history, and pay for plans.`,
+        'Models, features, prices and availability can change, and we do not promise that a particular model remains available.',
+      ] },
+      { id: 'accounts', title: 'Accounts and API keys', body: [
+        'You can create an account without a password. Sign-up gives you an API key, which calls the API, and a dashboard token, which manages the account. Both are shown only once, so store them securely.',
+        { ul: [
+          'Provide accurate information and keep your credentials private. You are responsible for all activity under your keys and tokens.',
+          'Tell us promptly if a key is lost or abused. You can rotate or block keys in the workspace.',
+          'All keys of an account share one balance and one usage quota.',
+          'Do not resell, sublicense or share access to the Service without our written agreement.',
+        ] },
+      ] },
+      { id: 'acceptable-use', title: 'Acceptable use', body: [
+        'You agree not to use the Service to:',
+        { ul: [
+          'break the law or infringe the rights of others, or generate content that is illegal, such as child sexual abuse material,',
+          'violate the usage policies of the upstream model providers, which also apply to you,',
+          'create malware, run fraud or phishing, or harass, threaten or deceive people,',
+          'bypass rate limits, spend limits, the sign-up proof of work, or other protections, or create several accounts to collect trial credit,',
+          'probe, overload or disrupt the Service, or attempt to access data that is not yours.',
+        ] },
+        'We may block keys or suspend accounts that break these rules, with or without notice when the risk is serious.',
+      ] },
+      { id: 'subscriptions', title: 'Subscriptions and monthly quota', body: [
+        'A subscription gives your account a usage quota for each month of its term (for example 1, 6 or 12 months). The quota resets at the start of each billing period, and unused quota does not carry over.',
+        'Each request is priced from its measured usage (tokens, characters, audio seconds or images) and counted against your quota. Numbers of requests shown in the Service are estimates for typical requests. Long prompts and outputs use more.',
+        'Plans paid by card or crypto are prepaid for the chosen term and do not renew automatically. Plans bought through the App Store or Google Play renew according to the rules of that store, and you manage them in your store account.',
+      ] },
+      { id: 'top-ups', title: 'Top-ups and trial credit', body: [
+        'Where offered, top-ups add usage to your account. Top-ups never expire, and they are used after your monthly quota is used up.',
+        'New accounts may receive limited trial credit so that you can try the API. Trial credit has no cash value, cannot be transferred, may expire, and we may reduce it or stop offering it, for example to prevent abuse.',
+      ] },
+      { id: 'payments', title: 'Payments', body: [
+        'Prices are shown in US dollars and may exclude taxes, which are added where required. You can pay by card, by cryptocurrency, or through the App Store or Google Play where available.',
+        { ul: [
+          '<strong>Card</strong> payments are processed by Stripe, and <strong>crypto</strong> payments are detected by Payroof. Send only the tokens and networks the payment screen lists, because other transfers may be lost and we cannot recover them. Network fees are yours.',
+          '<strong>App Store and Google Play</strong> purchases are governed by the terms of Apple or Google. Those companies handle billing, and they decide refunds for store purchases, not us.',
+          'Except where the law or the payment screen says otherwise, payments are non-refundable once the purchased usage has been delivered.',
+        ] },
+      ] },
+      { id: 'refund-abuse', title: 'Refunds, chargebacks and refund abuse', body: [
+        'If a store refunds a purchase, or a card payment is reversed, we remove the usage that purchase provided. Usage you already consumed may be recorded as a debt on your account.',
+        'To protect the Service from people who consume usage and then reverse the payment, we may suspend an account after a refund or chargeback, block it from buying again, limit or review purchases from new accounts (for example with a daily cap), and refuse service in cases of repeated abuse.',
+        `When you ask Apple or Google for a refund, we may share consumption data with that store as described in the ${privacy}. Please contact us first if something is wrong with a purchase.`,
+      ] },
+      { id: 'limits', title: 'Usage limits and fair use', body: [
+        'We apply rate limits, concurrency limits, spend limits and daily limits on creating keys and new accounts. When you reach a limit the API answers with an error, such as 429 with a Retry-After header, or 402 when your quota and top-ups are used up.',
+        'We may change limits to keep the Service reliable and fair for everyone. Do not use the Service in ways that place an unreasonable load on it.',
+      ] },
+      { id: 'providers', title: 'Third-party model providers', body: [
+        'The AI models are operated by third parties. Your requests, including prompts and files, are sent to the provider that serves the model you chose, and that provider processes them under its own terms. We do not control those providers and are not responsible for their availability or conduct.',
+        'You are responsible for the content you send and for having the rights to use it. Do not send data you are not allowed to share. AI output can be inaccurate or inappropriate, so review it before relying on it.',
+      ] },
+      { id: 'your-content', title: 'Your content', body: [
+        'You keep your rights in the content you send and receive. You give us the permission needed to process it to provide the Service, which includes forwarding it to the providers you choose. We keep request metadata and not the content, as described in the ' + privacy + '.',
+      ] },
+      { id: 'disclaimers', title: 'Disclaimers', body: [
+        'The Service is provided "as is" and "as available". To the fullest extent the law allows, we disclaim all warranties, express or implied, including fitness for a particular purpose, accuracy of AI output, and uninterrupted or error-free operation.',
+      ] },
+      { id: 'liability', title: 'Limitation of liability', body: [
+        'To the fullest extent the law allows, we are not liable for indirect, incidental, special or consequential damages, or for lost profits, data or goodwill. Our total liability for any claim relating to the Service is limited to the greater of the amount you paid us in the 12 months before the claim and 100 US dollars.',
+        'Nothing in these Terms limits liability that cannot be limited by law. You agree to compensate us for claims and losses caused by your breach of these Terms or your misuse of the Service.',
+      ] },
+      { id: 'termination', title: 'Suspension and termination', body: [
+        'You can stop using the Service at any time. We may suspend or end your access if you break these Terms, if we suspect fraud or abuse, if a payment is reversed, or if the law requires it. Unused prepaid usage is not refunded when we end access because of your breach, except where the law says otherwise. Sections that by their nature should continue, such as payments, disclaimers and liability, survive termination.',
+      ] },
+      { id: 'changes', title: 'Changes to these Terms', body: [
+        'We may update these Terms. The date above shows the latest version. We will give notice of material changes, for example in the workspace, and the new Terms apply to your use after that notice. If you do not agree, stop using the Service.',
+      ] },
+      { id: 'law', title: 'Governing law', body: [
+        `These Terms are governed by the laws of the place where ${co} is established, without regard to conflict-of-law rules. Mandatory consumer protections in your country of residence still apply.`,
+      ] },
+      { id: 'contact', title: 'Contact', body: [
+        mail ? `Questions about these Terms can be sent to ${co} at ${mail}.` : `Questions about these Terms can be sent to ${co} through the support channel the operator of this service provides.`,
+      ] },
+    ],
+  };
+}
+
+const legalBody = items => items.filter(Boolean).map(item => typeof item === 'string' ? `<p>${item}</p>` : `<ul class="doc-list">${item.ul.map(li => `<li>${li}</li>`).join('')}</ul>`).join('');
+
+function legal() {
+  const kind = legalKind;
+  const doc = legalContent(kind);
+  const other = kind === 'terms' ? 'privacy' : 'terms';
+  document.title = `${doc.title} - ${brandName}`;
+  main.innerHTML = `
+    <div class="docs-layout legal">
+      <nav class="docs-nav" aria-label="Contents">
+        <button type="button" class="docs-nav-toggle" aria-expanded="false" aria-controls="docs-toc"><span>Contents</span><strong data-toc-current>${esc(doc.sections[0].title)}</strong></button>
+        <div class="eyebrow">Contents</div>
+        <ol id="docs-toc" class="legal-toc">${doc.sections.map(sec => `<li><a href="#${sec.id}" data-doc-link="${sec.id}">${esc(sec.title)}</a></li>`).join('')}</ol>
+        <div class="docs-nav-legal"><a href="/">${ico('back')}Back to ${esc(brandName)}</a></div>
+      </nav>
+      <article class="docs-body legal-doc">
+        <div class="legal-head">
+          <div class="eyebrow">Legal</div>
+          <h1>${esc(doc.title)}</h1>
+          <p class="lead">${doc.intro}</p>
+          <p class="legal-meta">${ico('clock')}<span>Last updated <time datetime="${LEGAL_UPDATED}">${esc(legalDate())}</time></span></p>
+        </div>
+        ${doc.sections.map((sec, n) => `<section id="${sec.id}" class="doc-section legal-section"><h2><span class="sec-num">${n + 1}.</span>${esc(sec.title)}</h2>${legalBody(sec.body)}</section>`).join('')}
+        <div class="legal-foot">
+          <a class="button ghost" href="/">${withIcon('back', `Back to ${brandName}`)}</a>
+          <a class="button ghost" href="/${other}">${withIcon(other === 'terms' ? 'file' : 'lock', LEGAL_LABELS[other])}</a>
+        </div>
+      </article>
+    </div>`;
+  wireToc(main);
+  if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
+}
+
 /* Landing and sign-in ------------------------------------------------------------ */
 
 async function landing() {
@@ -1734,13 +2124,13 @@ async function landing() {
         <h1>${brand.hero_title ? esc(brand.hero_title) : 'Intelligence,<br>on your terms<span class="accent">.</span>'}</h1>
         <p>${esc(brand.hero_text || 'Language, speech, audio, and images through one familiar API. Create a key, connect your app, and stay in control of every request.')}</p>
         <div class="actions section">
-          <button type="button" class="primary" id="create">Get an API key</button>
-          <a class="button ghost" href="/docs/">Read the docs</a>
+          <button type="button" class="primary" id="create">${withIcon('key', 'Get an API key')}</button>
+          <a class="button ghost" href="/docs/">${withIcon('book', 'Read the docs')}</a>
         </div>
-        <ul class="chips" aria-label="Highlights"><li>OpenAI-compatible</li><li>Prepaid, pay as you go</li><li>MCP ready</li><li>Per-request history</li></ul>
+        <ul class="chips" aria-label="Highlights"><li>OpenAI-compatible</li><li>Monthly plans</li><li>MCP ready</li><li>Per-request history</li></ul>
       </div>
       <div class="terminal">
-        <div class="bar">QUICK START / cURL</div>
+        <div class="bar">${ico('terminal')}<span>QUICK START / cURL</span></div>
         <pre><span class="accent">curl</span> ${esc(location.origin)}/v1/chat/completions \\
   -H "Authorization: Bearer $RESELLER_KEY" \\
   -H "Content-Type: application/json" \\
@@ -1763,7 +2153,7 @@ async function landing() {
         <li class="card"><span class="step-num">3</span><div><h3>Connect an agent</h3><p>Paste <code>${esc(location.origin)}/mcp</code> into Claude, ChatGPT, Cursor, or VS Code and approve in your browser.</p></div></li>
       </ol>
       <div class="card">
-        <div class="card-head"><h3>Call the API</h3><a class="button ghost small" href="/docs/#examples">All examples</a></div>
+        <div class="card-head"><h3>Call the API</h3><a class="button ghost small" href="/docs/#examples">${withIcon('book', 'All examples')}</a></div>
         ${snippetTabs(apiSnippets())}
       </div>
     </section>
@@ -1784,6 +2174,7 @@ async function landing() {
   const slot = document.querySelector('#plans');
   try {
     const v = await api('/v1/plans');
+    setRequestEstimate(v.request_estimate_usd);
     slot.innerHTML = pricingSection(v.plans, v.payment_methods || []);
   } catch (e) {
     slot.innerHTML = `<div class="card error"><strong>Plans could not be loaded</strong><p>${esc(e.message)}</p></div>`;
@@ -1819,7 +2210,7 @@ function login() {
           <label for="login-token">${admin ? 'Administrator token' : 'API key or dashboard token'}</label>
           <input id="login-token" name="token" type="password" autocomplete="off" required>
           <p class="field-help">Credentials stay in this browser tab for the session.</p>
-          <div class="actions full"><button class="primary" type="submit">Open ${admin ? 'console' : 'workspace'}</button></div>
+          <div class="actions full"><button class="primary" type="submit">${withIcon('logout', `Open ${admin ? 'console' : 'workspace'}`)}</button></div>
         </form>
         ${admin ? '' : `
         <div class="auth-alt">
@@ -1827,7 +2218,7 @@ function login() {
             <div class="label">New here?</div>
             <div class="hint">Create an account and get evaluation credit. No card required.</div>
           </div>
-          <button type="button" id="create" class="button ghost">Create a new account</button>
+          <button type="button" id="create" class="button ghost">${withIcon('plus', 'Create a new account')}</button>
         </div>`}
       </section>
     </div>`;
@@ -1866,7 +2257,7 @@ async function shell() {
   if (location.hash.slice(1).split('?')[0].split('/')[0] !== tab) history.replaceState(null, '', hashFor(tab));
   main.innerHTML = `
     <div class="tabs" role="tablist" aria-label="${admin ? 'Console sections' : 'Workspace sections'}">
-      ${TABS.map(t => `<button type="button" role="tab" id="tab-${t}" data-tab="${t}" aria-controls="content" aria-selected="${t === tab}" tabindex="${t === tab ? 0 : -1}">${esc(TAB_LABELS[t])}</button>`).join('')}
+      ${TABS.map(t => `<button type="button" role="tab" id="tab-${t}" data-tab="${t}" aria-controls="content" aria-selected="${t === tab}" tabindex="${t === tab ? 0 : -1}">${withIcon(TAB_ICONS[t], TAB_LABELS[t])}</button>`).join('')}
     </div>
     <section id="content" role="tabpanel" aria-busy="true" data-view="${tab}">${viewSkeleton(tab)}</section>`;
   const tabButtons = [...main.querySelectorAll('[data-tab]')];
@@ -1915,7 +2306,7 @@ async function load() {
   } catch (e) {
     if (e.name === 'AbortError' || gen !== generation) return;
     delete content.dataset.view;
-    content.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p><div class="actions"><button type="button" data-refresh class="ghost">Try again</button></div></div>`;
+    content.innerHTML = `<div class="card error"><strong>Something went wrong</strong><p>${esc(e.message)}</p><div class="actions"><button type="button" data-refresh class="ghost">${withIcon('refresh', 'Try again')}</button></div></div>`;
     wire(content);
   } finally {
     if (gen === generation) content.removeAttribute('aria-busy');
@@ -1939,21 +2330,21 @@ const views = {
       const top = (rows, label, link, value) => rows.filter(r => isPositive(value(r))).length
         ? `<ol class="leaderboard">${rows.filter(r => isPositive(value(r))).map(r => `<li><span class="leader-name">${link(r)}</span><span class="num">${esc(usd(value(r)))}</span></li>`).join('')}</ol>`
         : `<p class="hint">No ${label} spent anything in the last 30 days.</p>`;
-      return `${pageHead('Overview', 'Platform totals since launch. Charts and rankings cover the last 30 days.', '<button type="button" data-refresh class="ghost small">Refresh</button>')}
+      return `${pageHead('Overview', 'Platform totals since launch. Charts and rankings cover the last 30 days.', `<button type="button" data-refresh class="ghost small">${withIcon('refresh', 'Refresh')}</button>`)}
         <div class="stats">
-          ${metric('API revenue', usd(v.billed_cost_usd), `${esc(count(v.requests))} requests, ${esc(count(v.tokens))} tokens`)}
-          ${metric('Upstream cost', usd(v.upstream_cost_usd), 'Paid to model providers')}
-          ${metric('Gross margin', usd(v.margin_usd), `${percent(Number(v.margin_usd), billed)} of revenue`)}
-          ${metric('Outstanding credit', usd(v.outstanding_usd), isPositive(v.suspended_credit_usd) ? `Spendable by active accounts. ${esc(usd(v.suspended_credit_usd))} more is held by suspended accounts.` : 'Unexpired usage active accounts can spend')}
+          ${metric('API revenue', usd(v.billed_cost_usd), `${esc(count(v.requests))} requests, ${esc(count(v.tokens))} tokens`, { icon: 'wallet' })}
+          ${metric('Upstream cost', usd(v.upstream_cost_usd), 'Paid to model providers', { icon: 'zap' })}
+          ${metric('Gross margin', usd(v.margin_usd), `${percent(Number(v.margin_usd), billed)} of revenue`, { icon: 'chart' })}
+          ${metric('Outstanding credit', usd(v.outstanding_usd), isPositive(v.suspended_credit_usd) ? `Spendable by active accounts. ${esc(usd(v.suspended_credit_usd))} more is held by suspended accounts.` : 'Unexpired usage active accounts can spend', { icon: 'card' })}
         </div>
         <div class="card">
           <div class="card-head"><h3>Usage</h3>${goButton('Request log', 'requests')}</div>
           ${chart(u.series)}
         </div>
         <div class="stats">
-          ${metric('Accounts', count(v.accounts), Number(v.suspended_accounts) ? `${esc(count(v.suspended_accounts))} suspended` : 'None suspended')}
-          ${metric('Usable keys', count(v.active_keys), 'Active, unexpired, on active accounts')}
-          ${metric('Customer debt', usd(v.debt_usd), 'Spend not yet covered by credit', { tone: isPositive(v.debt_usd) ? 'warn' : '' })}
+          ${metric('Accounts', count(v.accounts), Number(v.suspended_accounts) ? `${esc(count(v.suspended_accounts))} suspended` : 'None suspended', { icon: 'users' })}
+          ${metric('Usable keys', count(v.active_keys), 'Active, unexpired, on active accounts', { icon: 'key' })}
+          ${metric('Customer debt', usd(v.debt_usd), 'Spend not yet covered by credit', { tone: isPositive(v.debt_usd) ? 'warn' : '', icon: 'alert' })}
         </div>
         <div class="split-even">
           <div class="card">
@@ -1966,29 +2357,31 @@ const views = {
           </div>
         </div>
         <div class="card docs-note">
-          <div class="card-head"><h3>Customer docs</h3><a class="button ghost small" href="/docs/">Open docs</a></div>
+          <div class="card-head"><h3>Customer docs</h3><a class="button ghost small" href="/docs/">${withIcon('book', 'Open docs')}</a></div>
           <p>Customers connect through the OpenAI-compatible API at <code>${esc(location.origin)}/v1</code> and MCP at <code>${esc(location.origin)}/mcp</code>. The public docs page lists endpoints, examples, errors, and billing rules.</p>
         </div>`;
     }
     const [v, u, r] = await Promise.all([get('/v1/account', signal), get('/v1/account/usage', signal), get('/v1/account/requests?limit=5', signal)]);
+    setRequestEstimate(v.request_estimate_usd);
     const a = v.account;
     const sub = a.subscription;
     const t = seriesTotals(u.series);
     const empty = !isPositive(a.balance_usd);
     return `<div class="banner${empty ? ' warn' : ''}">
         <div>
-          <div class="label">Available usage</div>
-          <div class="metric">${esc(usd(a.balance_usd))}</div>
-          <div class="hint">${isPositive(a.debt_usd) ? `Outstanding debt ${esc(usd(a.debt_usd))} settles from the next top-up.` : empty ? 'API calls are refused until you get a plan or top-up.' : `${esc(usd(a.quota_remaining_usd))} monthly quota and ${esc(usd(a.topup_remaining_usd))} top-ups, shared by every key.`}</div>
+          <div class="label">${ico('zap', 14)}Requests left</div>
+          <div class="metric">${esc(requestsText(a.balance_usd))}</div>
+          <div class="hint">${isPositive(a.debt_usd) ? `Outstanding debt ${esc(usd(a.debt_usd))} settles from the next top-up.` : empty ? 'API calls are refused until you get a plan or top-up.' : `${esc([isPositive(a.quota_remaining_usd) && `${approx(a.quota_remaining_usd)} from this month's quota`, isPositive(a.topup_remaining_usd) && `${approx(a.topup_remaining_usd)} from top-ups`].filter(Boolean).join(' and ') || 'Available')}, shared by every key. Balance ${esc(usd(a.balance_usd))}.`}</div>
         </div>
-        <div class="actions">${goButton('Add usage', 'billing', { sub: 'add' }, empty ? 'primary' : 'ghost')}<button type="button" class="${empty ? 'ghost' : 'primary'}" data-create>Create key</button></div>
+        <div class="actions">${goButton('Add usage', 'billing', { sub: 'add' }, empty ? 'primary' : 'ghost')}<button type="button" class="${empty ? 'ghost' : 'primary'}" data-create>${withIcon('plus', 'Create key')}</button></div>
       </div>
       <div class="stats">
-        ${metric('Spent, all time', usd(a.billed_usd))}
-        ${metric('Last 30 days', usd(t.cost), esc(`${plural(t.requests, 'request')}, ${count(t.tokens)} tokens`))}
-        ${metric('Plan', sub ? sub.plan_name || sub.plan_code : 'None', sub ? `${esc(usd(sub.quota_remaining_usd))} of ${esc(usd(sub.monthly_quota_usd))} quota left${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}` : 'No active plan')}
-        ${metric('Top-up balance', usd(a.topup_remaining_usd), 'Never expires, used after the quota')}
+        ${metric('Spent, all time', usd(a.billed_usd), 'Across all keys', { icon: 'wallet' })}
+        ${metric('Last 30 days', usd(t.cost), esc(`${plural(t.requests, 'request')}, ${count(t.tokens)} tokens`), { icon: 'chart' })}
+        ${metric('Plan', sub ? sub.plan_name || sub.plan_code : 'None', sub ? `${esc(approx(sub.quota_remaining_usd))} of ${esc(approx(sub.monthly_quota_usd))} requests left${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}` : 'No active plan', { icon: 'tag' })}
+        ${metric('Top-up requests', requestsText(a.topup_remaining_usd), 'Never expire, used after the quota', { icon: 'infinity' })}
       </div>
+      ${estimateNote()}
       <div class="card">
         <div class="card-head"><h3>Your usage</h3>${goButton('Usage details', 'usage')}</div>
         ${chart(u.series)}
@@ -2008,7 +2401,7 @@ const views = {
     ]);
     if (!prefix) prefix = (keys.find(x => x.status === 'active') || keys[0] || {}).key_prefix || '';
     const m = exampleModels(models);
-    return `${pageHead('Connect', 'Everything an app or agent needs to call the API.', '<a class="button ghost small" href="/docs/">Full docs</a>')}
+    return `${pageHead('Connect', 'Everything an app or agent needs to call the API.', `<a class="button ghost small" href="/docs/">${withIcon('book', 'Full docs')}</a>`)}
       <div class="card">
         <div class="card-head"><h3>Connection details</h3></div>
         ${facts([
@@ -2050,7 +2443,7 @@ const views = {
     columns.push(['', r => `<div class="actions">
         ${goButton('Requests', 'requests', { key: r.id }, 'small')}
         <button type="button" class="small" data-edit-key="${esc(r.id)}" data-key-name="${esc(r.name)}">${admin ? 'Edit' : 'Rename'}</button>
-        <button type="button" class="small" data-rotate="${esc(r.id)}"${r.status !== 'active' ? ' disabled' : ''}>Rotate</button>
+        <button type="button" class="small" data-rotate="${esc(r.id)}"${r.status !== 'active' ? ' disabled' : ''}>${withIcon('refresh', 'Rotate')}</button>
       </div>`, 'end']);
     const toolbar = listToolbar('keys', state, {
       placeholder: 'Search name, prefix, or ID',
@@ -2062,7 +2455,7 @@ const views = {
     const scope = admin && state.account
       ? `<div class="filter-chips">${filterChip('keys', 'account', 'Account', esc(accountLabel(state.account, v.keys[0]?.account_contact)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`)}</div>`
       : '';
-    return `${pageHead('API keys', `${esc(plural(v.total, 'key'))}${admin ? '' : ' on this account'}. Open a key for its usage, limits, and requests.`, admin ? '' : '<button type="button" class="primary" data-create>Create key</button>')}
+    return `${pageHead('API keys', `${esc(plural(v.total, 'key'))}${admin ? '' : ' on this account'}. Open a key for its usage, limits, and requests.`, admin ? '' : `<button type="button" class="primary" data-create>${withIcon('plus', 'Create key')}</button>`)}
       ${toolbar}${scope}${table(columns, v.keys, { group, empty: ['No keys match', 'Change the filters or create a key.'] })}${listPager('keys', state, Number(v.total || 0), v.keys.length)}`;
   },
   async accounts(signal) {
@@ -2092,7 +2485,7 @@ const views = {
     const v = await get(endpoint('plans'), signal);
     adminPlans = v.plans;
     const best = bestCode(v.plans.filter(p => p.active));
-    return `${pageHead('Plans', 'Deactivate a plan to hide it from customers. Plans referenced by subscriptions, payments, or redeem codes cannot be deleted, only retired.', '<button type="button" class="primary" data-plan>Create plan</button>')}
+    return `${pageHead('Plans', 'Deactivate a plan to hide it from customers. Plans referenced by subscriptions, payments, or redeem codes cannot be deleted, only retired.', `<button type="button" class="primary" data-plan>${withIcon('plus', 'Create plan')}</button>`)}
       ${table([
         ['Plan', r => `<strong>${esc(r.name)}</strong><div class="hint"><code>${esc(r.code)}</code></div>`, 'wrap'],
         ['Price', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
@@ -2111,7 +2504,7 @@ const views = {
     const v = await get(endpoint('codes'), signal);
     const now = nowSeconds();
     const state = r => r.redeemed_at ? pill('redeemed', 'info') : r.expires_at && r.expires_at < now ? pill('expired', 'warn') : pill('available', 'ok');
-    return `${pageHead('Redeem codes', 'Codes are shown once and stored hashed. Unredeemed codes can be edited or cancelled. Redeemed codes are kept as audit records.', '<button type="button" class="primary" data-code>Issue codes</button>')}
+    return `${pageHead('Redeem codes', 'Codes are shown once and stored hashed. Unredeemed codes can be edited or cancelled. Redeemed codes are kept as audit records.', `<button type="button" class="primary" data-code>${withIcon('ticket', 'Issue codes')}</button>`)}
       ${table([
         ['Code', r => `<code>${esc(r.code_prefix)}...</code>${r.note ? `<div class="hint">${esc(r.note)}</div>` : ''}`, 'wrap'],
         ['Grants', r => r.plan_code ? `Plan <code>${esc(r.plan_code)}</code>` : `<span class="num">${esc(usd(r.credit_usd))}</span>`],
@@ -2137,7 +2530,7 @@ const views = {
     });
     const group = state.group ? { value: r => state.group === 'plan' ? r.plan_code : state.group === 'account' ? r.account_id : state.group === 'method' ? methodLabel(r.method) : r.status } : null;
     const scope = state.account ? `<div class="filter-chips">${filterChip('payments', 'account', 'Account', esc(shortId(state.account)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`)}</div>` : '';
-    return `${pageHead('Payments', `${esc(plural(v.total, 'order'))} by card, crypto, App Store, or Google Play.`, '<button type="button" class="ghost" data-payroof>Crypto payments setup</button>')}
+    return `${pageHead('Payments', `${esc(plural(v.total, 'order'))} by card, crypto, App Store, or Google Play.`, `<button type="button" class="ghost" data-payroof>${withIcon('wallet', 'Crypto payments setup')}</button>`)}
       ${toolbar}${scope}${table([
         ['Created', r => when(r.created_at)],
         ['Order', r => `<code title="${esc(r.id)}">${esc(shortId(r.id))}</code>`],
@@ -2164,7 +2557,7 @@ const views = {
     if (state.account && admin) chips.push(filterChip('requests', 'account', 'Account', esc(accountLabel(state.account, first?.account_contact)), `<button type="button" class="link" data-open-account="${esc(state.account)}">Open account</button>`));
     if (state.model) chips.push(filterChip('requests', 'model', 'Model', `<code>${esc(state.model)}</code>`));
     const option = (value, label, selected) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`;
-    return `${pageHead('Requests', admin ? 'Every proxied request with its usage and charge.' : 'Every request made with your keys and what it was billed.', '<button type="button" data-refresh class="ghost small">Refresh</button>')}
+    return `${pageHead('Requests', admin ? 'Every proxied request with its usage and charge.' : 'Every request made with your keys and what it was billed.', `<button type="button" data-refresh class="ghost small">${withIcon('refresh', 'Refresh')}</button>`)}
       <form class="toolbar" data-list-form="requests" role="search">
         <input class="toolbar-search" name="q" type="search" value="${esc(state.q)}" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID">
         <button type="button" class="ghost toolbar-toggle" data-toolbar-toggle aria-expanded="false" aria-controls="requests-filters">Filters${state.model || state.kind || state.status ? ' •' : ''}</button>
@@ -2202,6 +2595,7 @@ const views = {
   async billing(signal) {
     const [v, p, orders] = await Promise.all([get('/v1/account', signal), get('/v1/plans', signal), get('/v1/account/payments', signal)]);
     const methods = p.payment_methods || [];
+    setRequestEstimate(v.request_estimate_usd ?? p.request_estimate_usd);
     planCatalog = { plans: p.plans, methods };
     billingData = { v, p, orders, methods };
     return renderBilling();
@@ -2232,7 +2626,7 @@ function planTile(plan, badges, methods) {
     <div class="plan-top"><h4 class="plan-name">${esc(plan.name)}</h4>${badge ? `<span class="plan-flag${featured ? '' : ' soft'}">${esc(badge)}</span>` : ''}${tip(detail)}</div>
     <div class="plan-price"><span class="plan-amount">${esc(i.topup ? usdShort(i.price) : perMonthLabel(i))}</span>${!i.topup && i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
     <div class="plan-billed">${esc(billedLine(i))}</div>
-    <div class="plan-credit">${i.topup ? `<strong>${esc(usdShort(i.credit))}</strong> extra usage, never expires` : `<strong>${esc(usdShort(i.quota))}</strong> usage per month`}</div>
+    <div class="plan-credit">${ico('zap')}<span>${i.topup ? `<strong>${esc(approx(i.credit))}</strong> extra requests, never expire` : `<strong>${esc(approx(i.quota))}</strong> requests per month`}</span></div>
     ${methods.length ? `<button type="button" class="${featured ? 'primary' : ''}" data-checkout="${esc(plan.code)}">${i.topup ? 'Buy' : 'Choose'} ${esc(plan.name)}</button>` : ''}
   </article>`;
 }
@@ -2258,12 +2652,13 @@ function renderBilling() {
         <div class="section-head"><h3>Choose a plan</h3><span class="hint">Card and crypto plans are prepaid and do not auto-renew</span></div>
         ${p.plans.length ? `<div class="plan-tiles" data-count="${p.plans.length}">${p.plans.map(x => planTile(x, badges, methods)).join('')}</div>` : emptyState('No plans yet', 'An operator has not published any plans.')}
         ${methods.length ? '' : '<p class="hint">Online payments are not enabled. Redeem a code instead.</p>'}
+        ${estimateNote()}
       </div>
       <div class="bill-section">
         <div class="section-head"><h3>Other ways to add usage</h3></div>
         <div class="ways">
-          ${hasTopUp ? `<div class="card way"><div><strong>Top up with stablecoins</strong> ${tip('Send USDC or USDT to your personal address. Any amount is added 1:1 in USD as usage that never expires, no plan needed.')}</div><p>Any amount, no plan needed.</p><button type="button" class="small" data-topup-open>Show my address</button></div>` : ''}
-          <div class="card way"><div><strong>Redeem a code</strong> ${tip('Apply a single-use code from the operator. The usage is available immediately.')}</div><p>Have a code?</p><button type="button" class="small" data-redeem>Redeem a code</button></div>
+          ${hasTopUp ? `<div class="card way"><div><strong>Top up with stablecoins</strong> ${tip('Send USDC or USDT to your personal address. Any amount is added 1:1 in USD as usage that never expires, no plan needed.')}</div><p>Any amount, no plan needed.</p><button type="button" class="small" data-topup-open>${withIcon('wallet', 'Show my address')}</button></div>` : ''}
+          <div class="card way"><div><strong>Redeem a code</strong> ${tip('Apply a single-use code from the operator. The usage is available immediately.')}</div><p>Have a code?</p><button type="button" class="small" data-redeem>${withIcon('ticket', 'Redeem a code')}</button></div>
         </div>
       </div>
       <details class="more faq-more"><summary>Common questions</summary>${planFaq(p.plans, methods)}</details>`;
@@ -2289,30 +2684,29 @@ function renderBilling() {
       : empty ? 'Nothing left. API calls are refused until you get a plan or top-up.'
       : 'Shared by every key on your account.';
     const notes = [
-      `Monthly quota left: ${usd(a.quota_remaining_usd)}. It resets each month and unused quota does not carry over.`,
-      `Top-up balance: ${usd(a.topup_remaining_usd)}. Top-ups never expire and are used after the quota.`,
-      trialLeft > 0 && `Includes ${usd(trialLeft)} of trial usage${Number.isFinite(trialEnds) ? `, valid until ${date(trialEnds)}` : ''}.`,
+      `Monthly quota left: ${requestsText(a.quota_remaining_usd)} (${usd(a.quota_remaining_usd)}). It resets each month and unused quota does not carry over.`,
+      `Top-up balance: ${requestsText(a.topup_remaining_usd)} (${usd(a.topup_remaining_usd)}). Top-ups never expire and are used after the quota.`,
+      trialLeft > 0 && `Includes ${requestsText(trialLeft)} of trial usage${Number.isFinite(trialEnds) ? `, valid until ${date(trialEnds)}` : ''}.`,
       `Spent so far: ${usd(a.billed_usd)} across all keys.`,
     ].filter(Boolean);
     const subLine = s => {
-      const left = `${usd(s.quota_remaining_usd)} of ${usd(s.monthly_quota_usd)} monthly quota left${s.quota_resets_at ? `, resets ${date(s.quota_resets_at)}` : ''}`;
+      const left = `${approx(s.quota_remaining_usd)} of ${approx(s.monthly_quota_usd)} requests left this month${s.quota_resets_at ? `, resets ${date(s.quota_resets_at)}` : ''}`;
       const term = `${s.auto_renew ? 'Renews' : 'Ends'} ${date(s.expires_at)}${s.provider === 'app_store' ? ' (App Store)' : s.provider === 'google_play' ? ' (Google Play)' : ''}`;
       return `<div class="sub-line"><strong>${esc(s.plan_name || s.plan_code)}</strong> ${s.status && s.status !== 'active' ? pill(s.status) : ''}<div class="hint">${esc(left)}. ${esc(term)}.</div></div>`;
     };
     body = `${refunded ? '<div class="callout warn"><p><strong>Account suspended.</strong> This account was suspended after a refund through the App Store or Google Play. Contact the operator to restore access.</p></div>' : ''}
       <section class="card balance-hero${empty || debt ? ' warn' : ''}" aria-labelledby="balance-label">
         <div class="balance-main">
-          <div class="label" id="balance-label">Available usage</div>
-          <div class="metric balance-amount">${esc(usd(a.balance_usd))}</div>
-          <p class="balance-line${empty || debt ? ' warn' : ''}">${esc(line)}</p>
+          <div class="label" id="balance-label">${ico('zap', 14)}Requests left</div>
+          <div class="metric balance-amount">${esc(requestsText(a.balance_usd))}</div>
+          <p class="balance-line${empty || debt ? ' warn' : ''}">${esc(line)}${debt || empty ? '' : ` <span class="muted">Balance ${esc(usd(a.balance_usd))}.</span>`}</p>
         </div>
         <div class="actions"><button type="button" class="primary" data-bsub-go="add">${sub ? 'Add a top-up' : 'Get a plan'}</button></div>
       </section>
-      <div class="plan-chip-row"><span class="plan-chip${sub ? ' active' : ''}">${sub ? `${esc(sub.plan_name || sub.plan_code)} plan &middot; ${esc(usd(sub.quota_remaining_usd))} of ${esc(usd(sub.monthly_quota_usd))} quota left${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}` : 'No active plan'}</span>${sub ? `<span class="hint">${sub.auto_renew ? 'Renews' : 'Ends'} ${esc(date(sub.expires_at))}</span>` : ''}</div>
+      <div class="plan-chip-row"><span class="plan-chip${sub ? ' active' : ''}">${sub ? `${esc(sub.plan_name || sub.plan_code)} plan &middot; ${esc(approx(sub.quota_remaining_usd))} of ${esc(approx(sub.monthly_quota_usd))} requests left${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}` : 'No active plan'}</span>${sub ? `<span class="hint">${sub.auto_renew ? 'Renews' : 'Ends'} ${esc(date(sub.expires_at))}</span>` : ''}</div>
       ${subs.length > 1 ? `<div class="bill-section">${subs.map(subLine).join('')}</div>` : ''}
       <details class="more"><summary>Balance details</summary><ul class="balance-notes">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></details>
-      <div class="bill-section"><label class="inline check-line"><input type="checkbox" data-consent${a.consumption_consent ? ' checked' : ''}> Share usage data with Apple when you request a refund</label>
-        <p class="hint">Lets the operator tell Apple how much of a purchase was used when you ask for a refund.</p></div>`;
+      ${estimateNote()}`;
   }
   return `${billingTabs()}<div class="bill-body">${body}</div>`;
 }
@@ -2382,7 +2776,7 @@ function planForm(initial = {}) {
 function showIssuedCodes(v) {
   const codes = v.codes || [v.code];
   const list = codes.join('\n');
-  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'}. Shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button type="button" class="primary" data-copy-codes>Copy ${codes.length === 1 ? 'code' : 'all'}</button></div>`, d => {
+  modal(codes.length > 1 ? 'Save your redeem codes' : 'Save your redeem code', `<p class="muted">${count(codes.length)} single-use code${codes.length === 1 ? '' : 's'}. Shown only once. Copy ${codes.length === 1 ? 'it' : 'them'} now.</p><pre class="code-list secret">${esc(list)}</pre><div class="actions section"><button type="button" class="primary" data-copy-codes>${withIcon('copy', codes.length === 1 ? 'Copy code' : 'Copy all')}</button></div>`, d => {
     const button = d.querySelector('[data-copy-codes]');
     button.onclick = () => copyText(list, 'Redeem codes').then(ok => ok && flashCopied(button));
   }, 'wide');
@@ -2717,7 +3111,7 @@ function netPanel(n, t) {
       <div class="addr-body">
         <div class="label">Your ${esc(n.chain_name)} deposit address</div>
         <div class="addr-value">${copyable(n.address, `${n.chain_name} address`)}</div>
-        <button type="button" class="primary big" data-copy-value="${esc(n.address)}" data-copy-label="${esc(n.chain_name)} address">Copy address</button>
+        <button type="button" class="primary big" data-copy-value="${esc(n.address)}" data-copy-label="${esc(n.chain_name)} address">${withIcon('copy', 'Copy address')}</button>
       </div>
     </div>
     <p class="warn-line">Send only ${esc(joinOr(symbols))} on ${esc(n.chain_name)}. Other tokens or networks can be lost.</p>
@@ -2806,9 +3200,10 @@ const planOfOrder = o => {
   };
 };
 // What an order gives, in words.
-const orderGrant = o => {
+const orderGrant = (o, dollars = false) => {
   const i = planInfo(planOfOrder(o));
-  return i.topup ? `${usd(i.credit)} of extra usage that never expires` : `${usd(i.quota)} of usage per month for ${monthsLabel(i.months)}`;
+  if (dollars) return i.topup ? `${usd(i.credit)} of extra usage that never expires` : `${usd(i.quota)} of usage per month for ${monthsLabel(i.months)}`;
+  return i.topup ? `${requestsText(i.credit)} of extra usage that never expire` : `${requestsText(i.quota)} per month for ${monthsLabel(i.months)}`;
 };
 // pending, confirming, underpaid, review, paid, expired, or failed.
 function orderState(o) {
@@ -2835,7 +3230,7 @@ function orderMessage(o, state, i) {
     case 'confirming': return ['Payment detected', `The network has seen your transfer. Waiting for ${confirmations ? plural(confirmations, 'confirmation') : 'network confirmations'}. You can close this window: credit is added automatically.`];
     case 'underpaid': return ['Payment received, but it is not enough yet', `${usd(received)} of ${usd(price)} has been confirmed. Send the remaining ${usd(Math.max(0, price - received))} in any listed token to finish the order.${tolerance && Number(tolerance) > 0 ? ` Shortfalls up to ${tolerance}% are accepted.` : ''}${o.status === 'expired' ? ' The quote has expired: stablecoin transfers still count, native coin transfers need the operator.' : ''}`];
     case 'review': return ['A transfer needs review', `${flagged ? `${noteLabel(flagged.note)}. ` : ''}It was not counted towards this order. Contact the operator with the transaction hash shown below.`];
-    case 'paid': return ['Payment confirmed', `${i.topup ? `${usdShort(i.credit)} of extra usage was added. It never expires.` : `Your plan is active with ${usdShort(i.quota)} of usage per month for ${monthsLabel(i.months)}.`}${received > price + 0.01 ? ` You sent ${usd(received)}: the purchase is applied once, so ask the operator about the extra ${usd(received - price)}.` : ''}`];
+    case 'paid': return ['Payment confirmed', `${i.topup ? `${requestsText(i.credit)} of extra usage were added. They never expire.` : `Your plan is active with ${requestsText(i.quota)} per month for ${monthsLabel(i.months)}.`}${received > price + 0.01 ? ` You sent ${usd(received)}: the purchase is applied once, so ask the operator about the extra ${usd(received - price)}.` : ''}`];
     case 'expired': return ['This quote expired', 'Quotes are valid for a limited time. If you already sent a stablecoin it is still counted once it confirms. Otherwise start a new payment to get fresh amounts.'];
     default: return ['Payment not completed', 'This order was cancelled or failed. Contact the operator if you already sent funds.'];
   }
@@ -2878,12 +3273,12 @@ function payScreen(o, q, sel, state, banner) {
     <div class="pay-main">
       <div class="pay-fields">
         <div class="pay-row"><span class="label">Send exactly</span>
-          <div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span><button type="button" class="small primary" data-copy-value="${esc(q.amount)}" data-copy-label="${esc(q.symbol)} amount">Copy</button></div>
+          <div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span><button type="button" class="small primary" data-copy-value="${esc(q.amount)}" data-copy-label="${esc(q.symbol)} amount">${withIcon('copy', 'Copy')}</button></div>
           <div class="pay-chip-row"><span class="net-chip">${esc(q.chain_name)}</span>${(o.quotes || []).length > 1 && state === 'pending' ? '<button type="button" class="link" data-pay-change>Change</button>' : ''}</div>
         </div>
         <div class="pay-row"><span class="label">To address</span>
           <div class="pay-addr"><code>${esc(q.address)}</code></div>
-          <button type="button" class="small" data-copy-value="${esc(q.address)}" data-copy-label="${esc(q.chain_name)} address">Copy address</button>
+          <button type="button" class="small" data-copy-value="${esc(q.address)}" data-copy-label="${esc(q.chain_name)} address">${withIcon('copy', 'Copy address')}</button>
         </div>
       </div>
       <div class="pay-qr">${qrSvg(content, `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}`) || qrSvg(q.address)}</div>
@@ -3060,7 +3455,7 @@ async function paymentDetails(id) {
   modal(`Payment ${shortId(o.id)}`, `
     <div class="tiles">
       ${metric('Price', usd(o.price_usd), `${esc(o.plan_code)}, ${esc(methodLabel(o.method))}`)}
-      ${metric('Received', usd(o.received_usd), `Grants ${esc(orderGrant(o))}`)}
+      ${metric('Received', usd(o.received_usd), `Grants ${esc(orderGrant(o, true))}`)}
       ${metric('Status', pill(o.refunded_at ? 'refunded' : o.status), o.refunded_at ? `Refunded ${esc(date(o.refunded_at))}` : o.paid_at ? `Paid ${esc(date(o.paid_at))}${o.paid_by ? ` by ${esc(o.paid_by)}` : ''}` : `Created ${esc(date(o.created_at))}`, { html: true })}
     </div>
     <section class="detail-section"><h4>Order</h4>${facts([
@@ -3237,9 +3632,9 @@ async function oauthConsent() {
             <label for="consent-contact">Contact (optional)</label>
             <input id="consent-contact" name="contact" type="email" placeholder="you@example.com" autocomplete="email">
             <p class="field-help">New accounts receive evaluation credit. No card needed.</p>
-            <label class="inline check-line"><input id="consent-share" type="checkbox"> Share usage data with Apple when I request a refund</label>
             <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span>Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
-            <div class="actions"><button type="button" class="ghost" data-make-account>Create account</button></div>
+            <div class="actions"><button type="button" class="ghost" data-make-account>${withIcon('plus', 'Create account')}</button></div>
+            ${clickwrap('Create account')}
           </div>
           <div data-created hidden>
             <div class="callout info"><strong>Account created</strong><p>Save your credentials, then choose Allow to finish connecting.</p><div class="actions"><button type="button" class="small" data-show-secrets>Show credentials</button></div></div>
@@ -3333,7 +3728,7 @@ async function oauthConsent() {
     refresh();
     pow.hidden = false;
     try {
-      created = await signup({ name: form.querySelector('#consent-name').value.trim() || clientName.slice(0, 80), contact: form.querySelector('#consent-contact').value.trim(), consumption_consent: form.querySelector('#consent-share').checked }, p => { bar.value = Math.round(p * 100); });
+      created = await signup({ name: form.querySelector('#consent-name').value.trim() || clientName.slice(0, 80), contact: form.querySelector('#consent-contact').value.trim(), accept_terms: true }, p => { bar.value = Math.round(p * 100); });
       form.querySelector('[data-create-form]').hidden = true;
       form.querySelector('[data-created]').hidden = false;
       secrets(created, { embedded: true });
@@ -3428,21 +3823,6 @@ function wire(root) {
     };
   });
   root.querySelectorAll('[data-bsub-go]').forEach(b => b.onclick = () => showBilling(b.dataset.bsubGo));
-  root.querySelectorAll('[data-consent]').forEach(box => box.onchange = async () => {
-    const wanted = box.checked;
-    box.disabled = true;
-    try {
-      const v = await api('/v1/account', 'PATCH', { consumption_consent: wanted });
-      if (billingData && v.account) billingData.v.account = { ...billingData.v.account, ...v.account };
-      else if (billingData) billingData.v.account.consumption_consent = wanted;
-      notice(wanted ? 'Usage data sharing enabled' : 'Usage data sharing disabled');
-    } catch (e) {
-      box.checked = !wanted;
-      notice(e.message, true);
-    } finally {
-      box.disabled = false;
-    }
-  });
   root.querySelectorAll('[data-scroll]').forEach(b => b.onclick = () => {
     const target = document.getElementById(b.dataset.scroll);
     if (!target) return;
@@ -3571,7 +3951,9 @@ if (paymentResult) {
     : 'Checkout cancelled. You have not been charged.', paymentResult !== 'success');
 }
 renderHeader();
+renderFooter();
 const boot = oauthPage ? oauthConsent
+  : legalPage ? legal
   : docsPage ? docs
   : !admin && !workspace ? landing
   : token ? shell

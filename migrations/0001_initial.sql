@@ -52,13 +52,12 @@ CREATE TABLE plans (
  CHECK((kind='subscription' AND months BETWEEN 1 AND 12) OR (kind='topup' AND months IS NULL))
 ) STRICT;
 -- Built-in plans: price and credit in micro-USD (20000000 = 20 USD). Subscription
--- credit is the monthly quota. Store product ids are set by the operator.
+-- credit is the monthly quota. No top-ups are seeded; operators add them as
+-- needed. Store product ids are set by the operator.
 INSERT INTO plans(code,name,kind,price_micro,credit_micro,months,description) VALUES
- ('monthly','Monthly','subscription',20000000,20000000,1,'$20 of usage every month. Cancel any time.'),
- ('halfyear','6 months','subscription',96000000,17000000,6,'$17 of usage every month for six months.'),
- ('year','12 months','subscription',144000000,12500000,12,'$12.50 of usage every month for a year.'),
- ('topup-10','Top-up $10','topup',10000000,10000000,NULL,'Extra usage that never expires.'),
- ('topup-25','Top-up $25','topup',25000000,25000000,NULL,'Extra usage that never expires.');
+ ('monthly','Monthly','subscription',20000000,20000000,1,'A monthly usage quota. Cancel any time.'),
+ ('halfyear','6 months','subscription',96000000,17000000,6,'A lower monthly price for six months.'),
+ ('year','12 months','subscription',144000000,12500000,12,'Our best monthly price, billed yearly.');
 -- Subscriptions. The current paid period runs from period_start to expires_at.
 -- Each month of it grants one quota lot of quota_micro (granted_months counts
 -- them), which expires at the end of that month. Store renewals start a new

@@ -49,6 +49,8 @@ pub async fn router(app: App) -> Router {
         .route("/workspace/", get(page))
         .route("/docs", get(page))
         .route("/docs/", get(page))
+        .route("/terms", get(page))
+        .route("/privacy", get(page))
         .route("/oauth/authorize", get(page))
         .route("/admin", get(page))
         .route("/admin/", get(page))

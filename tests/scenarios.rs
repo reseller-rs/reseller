@@ -3589,3 +3589,68 @@ async fn admin_top_ups_are_idempotent_by_key() {
     assert_eq!(subs, 1);
     assert_eq!(balance(&t, &aid).await, "26.1");
 }
+
+/// Signing up with `accept_terms` records acceptance of the Terms and
+/// Privacy Policy (and with it the consumption-data consent); the plan
+/// catalogue seeds only the three subscriptions and carries the request
+/// estimate the UI uses; the legal pages are served.
+#[tokio::test]
+async fn signup_terms_acceptance_plans_and_legal_pages() {
+    let t = Test::new().await;
+    let (s, plans) = t.call("GET", "/v1/plans", None, json!({})).await;
+    assert_eq!(s, 200);
+    let codes: Vec<&str> = plans["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["monthly", "halfyear", "year"]);
+    assert_eq!(plans["request_estimate_usd"], "0.001");
+    assert_eq!(plans["trial_credit_usd"], "0.10");
+
+    let consent = |accept: Value| {
+        let t = &t;
+        async move {
+            let (s, v) = t
+                .call(
+                    "POST",
+                    "/v1/signup",
+                    None,
+                    json!({"name":"n","accept_terms":accept}),
+                )
+                .await;
+            if s != 200 {
+                return (s, None);
+            }
+            let row: (bool, Option<i64>) =
+                sqlx::query_as("SELECT consumption_consent,consent_at FROM accounts WHERE id=?")
+                    .bind(v["account_id"].as_str().unwrap())
+                    .fetch_one(&t.app.db)
+                    .await
+                    .unwrap();
+            (s, Some(row))
+        }
+    };
+    let (_, accepted) = consent(json!(true)).await;
+    let accepted = accepted.unwrap();
+    assert!(accepted.0 && accepted.1.is_some());
+    let (_, declined) = consent(Value::Null).await;
+    assert_eq!(declined.unwrap(), (false, None));
+    assert_eq!(consent(json!("yes")).await.0, 400);
+
+    for path in ["/terms", "/privacy"] {
+        let router = reseller::web::router(t.app.clone()).await;
+        let mut req = Request::get(path).body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("127.0.0.1:9000".parse::<SocketAddr>().unwrap()));
+        let r = router.oneshot(req).await.unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        let html =
+            String::from_utf8(to_bytes(r.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(
+            html.contains("\"request_estimate_usd\":\"0.001\""),
+            "{path}"
+        );
+    }
+}

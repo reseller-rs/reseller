@@ -39,8 +39,11 @@ pub struct Branding {
     pub favicon_url: String,
     /// Browser UI colour (`<meta name="theme-color">`).
     pub theme_color: String,
-    /// `dark` or `light`: the colour scheme advertised to the browser.
+    /// Default theme for visitors who have not picked one with the toggle:
+    /// `system` (follow the device), `dark`, or `light`.
     pub color_scheme: String,
+    /// Show the light/dark theme toggle in the header.
+    pub theme_toggle: bool,
     /// CSS custom properties without the leading `--` (for example
     /// `accent = "#ff7a1a"`), applied on `:root` after the built-in theme.
     pub css_vars: BTreeMap<String, String>,
@@ -53,6 +56,15 @@ pub struct Branding {
     /// Footer text next to the product name.
     pub footer_text: String,
     pub footer_links: Vec<Link>,
+    /// Operator name used in the Terms of Service and Privacy Policy.
+    /// Empty uses `name`.
+    pub legal_name: String,
+    /// Contact address shown in the legal pages. Empty omits it.
+    pub contact_email: String,
+    /// External Terms of Service URL. Empty serves the built-in `/terms` page.
+    pub terms_url: String,
+    /// External Privacy Policy URL. Empty serves the built-in `/privacy` page.
+    pub privacy_url: String,
 }
 
 impl Default for Branding {
@@ -65,7 +77,8 @@ impl Default for Branding {
             logo_url: String::new(),
             favicon_url: String::new(),
             theme_color: "#0c0e0d".into(),
-            color_scheme: "dark".into(),
+            color_scheme: "system".into(),
+            theme_toggle: true,
             css_vars: BTreeMap::new(),
             custom_css: String::new(),
             hero_eyebrow: String::new(),
@@ -76,6 +89,10 @@ impl Default for Branding {
                 label: "Source".into(),
                 url: "https://github.com/reseller-rs/reseller".into(),
             }],
+            legal_name: String::new(),
+            contact_email: String::new(),
+            terms_url: String::new(),
+            privacy_url: String::new(),
         }
     }
 }
@@ -124,6 +141,7 @@ impl Branding {
             ("hero_title", &self.hero_title),
             ("hero_text", &self.hero_text),
             ("footer_text", &self.footer_text),
+            ("legal_name", &self.legal_name),
         ] {
             anyhow::ensure!(
                 value.chars().count() <= MAX_TEXT_CHARS,
@@ -133,6 +151,8 @@ impl Branding {
         for (field, value) in [
             ("logo_url", &self.logo_url),
             ("favicon_url", &self.favicon_url),
+            ("terms_url", &self.terms_url),
+            ("privacy_url", &self.privacy_url),
         ] {
             anyhow::ensure!(
                 value.is_empty() || link_target(value),
@@ -144,8 +164,18 @@ impl Branding {
             "branding.theme_color must be a CSS colour"
         );
         anyhow::ensure!(
-            matches!(self.color_scheme.as_str(), "dark" | "light"),
-            "branding.color_scheme must be \"dark\" or \"light\""
+            matches!(self.color_scheme.as_str(), "system" | "dark" | "light"),
+            "branding.color_scheme must be \"system\", \"dark\", or \"light\""
+        );
+        anyhow::ensure!(
+            self.contact_email.is_empty()
+                || (self.contact_email.len() <= 254
+                    && self
+                        .contact_email
+                        .split_once('@')
+                        .is_some_and(|(user, host)| { !user.is_empty() && host.contains('.') })
+                    && !self.contact_email.contains(['<', '>', '"', ' ', '\\'])),
+            "branding.contact_email must be an email address"
         );
         anyhow::ensure!(
             self.css_vars.len() <= MAX_CSS_VARS,
@@ -193,14 +223,13 @@ impl Branding {
 
     /// Builds the branding stylesheet.
     ///
-    /// The output starts with a `:root` block that sets the colour scheme and
-    /// the CSS variables. That block is omitted unless there are variables or
-    /// the scheme is `light`. The custom CSS follows.
+    /// The output starts with a `:root` block that sets the CSS variables
+    /// (omitted when there are none). The custom CSS follows. The app picks
+    /// the light or dark palette itself (`data-theme`, see `color_scheme`).
     pub fn stylesheet(&self) -> String {
         let mut css = String::from("/* Generated from branding settings. */\n");
-        if !self.css_vars.is_empty() || self.color_scheme == "light" {
+        if !self.css_vars.is_empty() {
             css.push_str(":root {\n");
-            css.push_str(&format!("  color-scheme: {};\n", self.color_scheme));
             for (name, value) in &self.css_vars {
                 css.push_str(&format!("  --{name}: {};\n", value.trim()));
             }

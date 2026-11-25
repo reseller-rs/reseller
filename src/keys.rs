@@ -554,12 +554,16 @@ async fn open_trial_account(
             "New accounts cannot be opened from this address after a refunded store purchase",
         ));
     }
-    let consent = match body.get("consumption_consent") {
+    // `accept_terms: true` records acceptance of the Terms of Service and
+    // Privacy Policy (a clickwrap in the UI). The Privacy Policy covers
+    // sharing consumption data with app stores for refund requests, so the
+    // acceptance also records that consent. It can be withdrawn later with
+    // `PATCH /v1/account`.
+    let consent = match body.get("accept_terms") {
         None | Some(Value::Null) => false,
-        Some(Value::Bool(consent)) => *consent,
+        Some(Value::Bool(accepted)) => *accepted,
         Some(_) => {
-            return Err(Error::bad("consumption_consent must be a boolean")
-                .with_param("consumption_consent"));
+            return Err(Error::bad("accept_terms must be a boolean").with_param("accept_terms"));
         }
     };
     let mut amount = money::usd(&config.signup.free_credit_usd)?;
