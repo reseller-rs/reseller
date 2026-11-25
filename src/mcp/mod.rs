@@ -324,7 +324,7 @@ fn header_mismatch(message: impl Into<String>) -> RpcError {
 /// go with it.
 ///
 /// - `initialize` without modern `_meta` opens the legacy era.
-/// - Every other request must carry `MCP-Protocol-Version`; when `_meta`
+/// - Every other request must carry `MCP-Protocol-Version`. When `_meta`
 ///   carries the version too, the two must agree. The version then picks the
 ///   era: 2026-07-28 needs the full modern `_meta` and the `Mcp-Method` /
 ///   `Mcp-Name` headers, 2025-11-25 is served with legacy semantics, and any

@@ -9,7 +9,7 @@ use serde_json::json;
 
 /// An error that is safe to show to API clients.
 ///
-/// `code` is a stable machine-readable identifier; `message` is human-readable.
+/// `code` is a stable machine-readable identifier, and `message` is human-readable.
 /// `param` names the request parameter at fault, when there is one.
 /// Internal failures are logged and replaced by a generic message so that
 /// database or upstream details never leak to callers.

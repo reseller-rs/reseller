@@ -76,6 +76,15 @@ pub async fn router(app: App) -> Router {
             }),
         )
         .route(
+            "/assets/theme.js",
+            get(|| {
+                asset(
+                    "text/javascript; charset=utf-8",
+                    include_bytes!("../assets/theme.js"),
+                )
+            }),
+        )
+        .route(
             "/assets/style.css",
             get(|| {
                 asset(

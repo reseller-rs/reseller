@@ -692,7 +692,7 @@ async fn code_flow_with_pkce_issues_tokens_for_mcp_only() {
     let (status, e) = t.exchange("mcpc_unknown", &code, VERIFIER).await;
     assert_eq!((status, e["error"].as_str()), (401, Some("invalid_client")));
 
-    // The happy path; codes are single use.
+    // The happy path. Codes are single use.
     let code = t.code(&client).await;
     let r = t
         .http

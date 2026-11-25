@@ -391,7 +391,7 @@ async fn apply(
         "REVOKE" => end_subscription(&mut dbtx, &tx.original_transaction_id, true).await?,
         _ => tracing::warn!(
             transaction = %tx.transaction_id,
-            "App Store refund reversed; the account stays suspended until an operator reviews it"
+            "App Store refund reversed. The account stays suspended until an operator reviews it"
         ),
     }
     dbtx.commit().await?;

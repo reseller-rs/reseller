@@ -3,7 +3,7 @@
 
 -- Single row holding the JSON-encoded settings (id is always 1).
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL CHECK(json_valid(value))) STRICT;
--- Customer accounts. status is active or suspended; suspended_reason says why
+-- Customer accounts. status is active or suspended, and suspended_reason says why
 -- ('' for an administrator, refund for an automatic store refund block).
 -- markup_pct overrides the global markup when set. debt_micro never goes below 0.
 -- store_token is the UUID native apps pass to the stores (App Store appAccountToken,
@@ -52,7 +52,7 @@ CREATE TABLE plans (
  CHECK((kind='subscription' AND months BETWEEN 1 AND 12) OR (kind='topup' AND months IS NULL))
 ) STRICT;
 -- Built-in plans: price and credit in micro-USD (20000000 = 20 USD). Subscription
--- credit is the monthly quota. No top-ups are seeded; operators add them as
+-- credit is the monthly quota. No top-ups are seeded. Operators add them as
 -- needed. Store product ids are set by the operator.
 INSERT INTO plans(code,name,kind,price_micro,credit_micro,months,description) VALUES
  ('monthly','Monthly','subscription',20000000,20000000,1,'A monthly usage quota. Cancel any time.'),
@@ -81,7 +81,7 @@ CREATE UNIQUE INDEX subscriptions_google ON subscriptions(purchase_token) WHERE 
 CREATE UNIQUE INDEX subscriptions_idempotency ON subscriptions(account_id,idempotency_key) WHERE idempotency_key IS NOT NULL;
 -- Credit lots per account. remaining_micro counts down as credit is spent.
 -- A NULL expires_at means the credit never expires. subscription_id links a
--- monthly quota lot to its subscription; payment_id links a purchased top-up
+-- monthly quota lot to its subscription, and payment_id links a purchased top-up
 -- to its payment. idempotency_key deduplicates administrator top-ups.
 CREATE TABLE credits (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), source TEXT NOT NULL,

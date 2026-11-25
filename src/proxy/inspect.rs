@@ -107,7 +107,7 @@ pub struct Inspector {
     skipping_line: bool,
     /// Bounded prefix of a JSON body or audio header.
     capture: Vec<u8>,
-    /// Set once a JSON body outgrows [`CAPTURE_LIMIT`]; `tail` then holds
+    /// Set once a JSON body outgrows [`CAPTURE_LIMIT`]. `tail` then holds
     /// its last bytes.
     overflow: bool,
     tail: Vec<u8>,
@@ -121,7 +121,7 @@ pub struct Inspector {
     audio_ms: i64,
     images: i64,
     characters: i64,
-    /// Estimated request input tokens; `Some` enables the estimation
+    /// Estimated request input tokens. `Some` enables the estimation
     /// fallback when the upstream reports no usage.
     estimate_input: Option<i64>,
     /// Unicode characters of generated text seen so far (estimation only).

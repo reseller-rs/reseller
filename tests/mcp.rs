@@ -91,7 +91,7 @@ impl Test {
                 ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
-                // Halving is on by default; these tests expect full trial credit.
+                // Halving is on by default, but these tests expect full trial credit.
                 free_credit_halving: false,
                 ..Default::default()
             },

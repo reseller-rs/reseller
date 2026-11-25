@@ -302,7 +302,7 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    /// Reads the resource; `product` picks the line item when there are several.
+    /// Reads the resource. `product` picks the line item when there are several.
     fn parse(v: &Value, product: Option<&str>) -> Self {
         let items = v["lineItems"]
             .as_array()
@@ -696,7 +696,7 @@ async fn subscription_charge(
 }
 
 /// Handles a one-time product notification: a purchase is credited and
-/// consumed; a cancellation of a pending purchase grants nothing.
+/// consumed, and a cancellation of a pending purchase grants nothing.
 async fn one_time_event(app: &App, config: &Config, event: &str, n: &Value) -> Result<Value> {
     let (Some(token), Some(product), 1) = (
         n["purchaseToken"].as_str(),

@@ -548,8 +548,8 @@ async fn cached_tokens_and_aggregates_agree_to_the_micro_dollar() {
     }
     let rows = t.settled(3).await;
     for row in &rows {
-        // 600*2 + 400*0.5 + 100*8 (reasoning is inside the 100) = 2200;
-        // +30% = 2860.
+        // 600*2 + 400*0.5 + 100*8 (reasoning is inside the 100) = 2200,
+        // and +30% = 2860.
         assert_eq!(row.get::<i64, _>("upstream_micro"), 2200);
         assert_eq!(row.get::<i64, _>("billed_micro"), 2860);
         let breakdown = ["tokens", "input_tokens", "cached_tokens", "output_tokens"]
@@ -1053,7 +1053,7 @@ async fn concurrent_requests_cannot_overdraw_the_balance() {
             .json(&body);
         tasks.push(tokio::spawn(async move { request.send().await.unwrap() }));
     }
-    // The three admitted requests wait upstream; the rest answer at once.
+    // The three admitted requests wait upstream, and the rest answer at once.
     for _ in 0..200 {
         if tasks.iter().filter(|task| task.is_finished()).count() == 3 {
             break;
@@ -1098,7 +1098,7 @@ async fn unaffordable_and_empty_balances_are_402_without_retry_after() {
         fixed(|_| async { json_response(json!({"usage":{"total_tokens":1}})) }),
     )
     .await;
-    // 20000 output tokens hold 0.20 USD; the trial credit is 0.10.
+    // 20000 output tokens hold 0.20 USD, and the trial credit is 0.10.
     let r = t
         .post(
             "/v1/chat/completions",

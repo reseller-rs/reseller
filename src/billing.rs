@@ -109,8 +109,8 @@ pub async fn credit_lot(
     Ok(lot_id)
 }
 
-/// Consumes `amount` micro-USD from unexpired lots (earliest expiry first);
-/// the remainder is recorded as debt.
+/// Consumes `amount` micro-USD from unexpired lots (earliest expiry first).
+/// The remainder is recorded as debt.
 pub async fn debit(conn: &mut SqliteConnection, account: &str, amount: i64) -> Result<()> {
     let lots = sqlx::query(
         "SELECT id,remaining_micro FROM credits \
@@ -266,7 +266,7 @@ pub struct Terms {
     pub price: i64,
     /// Monthly quota of a subscription, or the credit of a top-up.
     pub credit: i64,
-    /// Months of a subscription; `None` for a top-up.
+    /// Months of a subscription, or `None` for a top-up.
     pub months: Option<i64>,
 }
 
@@ -353,7 +353,7 @@ pub struct Subscription<'a> {
     pub plan: &'a str,
     /// Monthly quota in micro-USD.
     pub quota: i64,
-    /// Plan length in months; the period is that long unless `period` is set.
+    /// Plan length in months. The period is that long unless `period` is set.
     pub months: i64,
     /// `admin`, `code`, `stripe`, `payroof`, `apple`, or `google`.
     pub provider: &'a str,
@@ -772,7 +772,7 @@ pub fn plan_json(r: &SqliteRow) -> Value {
     plan
 }
 
-/// Plan catalogue (subscriptions first, then top-ups, each by price);
+/// Plan catalogue (subscriptions first, then top-ups, each by price).
 /// `active_only` hides retired plans.
 pub async fn plans(app: &App, active_only: bool) -> Result<Value> {
     let rows = sqlx::query(

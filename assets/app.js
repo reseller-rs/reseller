@@ -15,42 +15,103 @@ const legalName = brand.legal_name || brandName;
 const contactEmail = brand.contact_email || '';
 
 /* Theme ------------------------------------------------------------------------
-   html[data-theme] is always "light" or "dark" (CSS also follows the OS when the
-   attribute is missing). Order: the visitor's saved choice, then the operator's
-   default (branding.color_scheme), where "system" follows the OS live. Runs first
-   so the page is painted in the right palette. */
+   Three choices: system (default, follows the OS live), light, and dark. The saved
+   choice lives in localStorage "theme". Without one, the operator default
+   (branding.color_scheme) applies when it is "light" or "dark". theme.js already
+   set html[data-theme] before the first paint. This code keeps it in sync, shows
+   the header menu, and saves new choices. */
 const colorQuery = matchMedia('(prefers-color-scheme: light)');
-const storedTheme = () => {
+const THEMES = { system: 'Match system', light: 'Light', dark: 'Dark' };
+const THEME_ICONS = { system: 'monitor', light: 'sun', dark: 'moon' };
+const themeMode = () => {
   try {
     const v = localStorage.getItem('theme');
-    return v === 'light' || v === 'dark' ? v : '';
-  } catch {
-    return '';
-  }
+    if (v in THEMES) return v;
+  } catch { /* storage blocked: use the default */ }
+  return ['light', 'dark'].includes(brand.color_scheme) ? brand.color_scheme : 'system';
 };
-let chosenTheme = storedTheme();
-const followsSystem = !['light', 'dark'].includes(brand.color_scheme);
-const currentTheme = () => chosenTheme || (followsSystem ? (colorQuery.matches ? 'light' : 'dark') : brand.color_scheme);
+let chosenTheme = themeMode();
+const resolvedTheme = () => chosenTheme === 'system' ? (colorQuery.matches ? 'light' : 'dark') : chosenTheme;
 function applyTheme() {
-  const theme = currentTheme();
-  document.documentElement.dataset.theme = theme;
-  document.querySelector('meta[name="color-scheme"]')?.setAttribute('content', theme);
-  const button = document.querySelector('#theme-toggle');
+  const theme = resolvedTheme();
+  const root = document.documentElement;
+  root.dataset.themeMode = chosenTheme;
+  root.dataset.theme = theme;
+  root.style.colorScheme = theme;
+  const button = document.querySelector('#theme-button');
   if (button) {
-    button.setAttribute('aria-pressed', String(theme === 'dark'));
-    button.title = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
-    button.innerHTML = ico(theme === 'dark' ? 'sun' : 'moon', 18);
+    button.innerHTML = ico(THEME_ICONS[chosenTheme], 20);
+    button.setAttribute('aria-label', `Theme: ${THEMES[chosenTheme]}`);
+    button.title = `Theme: ${THEMES[chosenTheme]}`;
   }
+  document.querySelectorAll('#theme-menu [data-theme-choice]').forEach(item => {
+    const on = item.dataset.themeChoice === chosenTheme;
+    item.setAttribute('aria-checked', String(on));
+    item.tabIndex = on ? 0 : -1;
+  });
 }
-function toggleTheme() {
-  chosenTheme = currentTheme() === 'dark' ? 'light' : 'dark';
+function setTheme(mode) {
+  chosenTheme = mode;
   try {
-    localStorage.setItem('theme', chosenTheme);
+    localStorage.setItem('theme', mode);
   } catch { /* storage blocked: the choice lasts until reload */ }
   applyTheme();
 }
-colorQuery.addEventListener('change', () => { if (!chosenTheme && followsSystem) applyTheme(); });
-document.documentElement.dataset.theme = currentTheme();
+colorQuery.addEventListener('change', () => { if (chosenTheme === 'system') applyTheme(); });
+applyTheme();
+// Header control: an icon button that opens a small menu of the three choices.
+const themeControl = () => `<div class="theme-wrap">
+  <button type="button" id="theme-button" class="icon-button ghost" aria-haspopup="menu" aria-expanded="false" aria-controls="theme-menu"></button>
+  <div id="theme-menu" class="menu" role="menu" aria-label="Theme" hidden>${Object.entries(THEMES).map(([k, label]) => `<button type="button" role="menuitemradio" class="menu-item" data-theme-choice="${k}" aria-checked="false">${ico(THEME_ICONS[k])}<span>${esc(label)}</span>${ico('check')}</button>`).join('')}</div>
+</div>`;
+let themeMenuController;
+function wireThemeMenu(root) {
+  themeMenuController?.abort();
+  themeMenuController = new AbortController();
+  const button = root.querySelector('#theme-button');
+  const menu = root.querySelector('#theme-menu');
+  if (!button || !menu) return;
+  const items = [...menu.querySelectorAll('[role=menuitemradio]')];
+  const close = (focus = false) => {
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    if (focus) button.focus();
+  };
+  const open = () => {
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    (items.find(i => i.getAttribute('aria-checked') === 'true') || items[0]).focus();
+  };
+  button.onclick = () => menu.hidden ? open() : close();
+  button.onkeydown = e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      open();
+    }
+  };
+  items.forEach((item, i) => {
+    item.onclick = () => {
+      setTheme(item.dataset.themeChoice);
+      close(true);
+    };
+    item.onkeydown = e => {
+      const target = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: items.length - 1 }[e.key];
+      if (target !== undefined) {
+        e.preventDefault();
+        items[(target + items.length) % items.length].focus();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        close(true);
+      } else if (e.key === 'Tab') {
+        close();
+      }
+    };
+  });
+  document.addEventListener('pointerdown', e => {
+    if (!menu.hidden && !menu.contains(e.target) && !button.contains(e.target)) close();
+  }, { signal: themeMenuController.signal });
+}
 const admin = location.pathname.startsWith('/admin');
 const workspace = location.pathname.startsWith('/workspace');
 const docsPage = location.pathname.startsWith('/docs');
@@ -131,6 +192,8 @@ const percent = (part, whole) => whole > 0 ? `${((part / whole) * 100).toFixed(1
    in headers. Always decorative: the visible text or aria-label carries the meaning. */
 const ICONS = {
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  monitor: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+  x: '<path d="M6 6l12 12M18 6L6 18"/>',
   moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
   copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -174,25 +237,43 @@ const withIcon = (name, label) => `${ico(name)}<span>${esc(label)}</span>`;
 /* Request counts ----------------------------------------------------------------
    Customers see approximate requests, not dollars of usage. The server sends the
    typical billed cost of one request (branding.request_estimate_usd, refreshed by
-   /v1/plans and /v1/account). Two significant digits, never a range. */
+   /v1/plans and /v1/account). All rounding happens in roundRequests() so every
+   screen shows the same numbers. */
 let requestEstimate = Number(brand.request_estimate_usd) > 0 ? Number(brand.request_estimate_usd) : 0.001;
 const setRequestEstimate = v => { if (Number(v) > 0) requestEstimate = Number(v); };
-function approxNumber(amount) {
-  const n = Number(amount || 0) / requestEstimate;
-  return n > 0 ? Number(n.toPrecision(2)) : 0;
+// From 10,000 up, round to the nearest `step` (10,000 for a whole paid term,
+// 1,000 for monthly figures and balances). Below 10,000, keep 2 significant digits.
+function roundRequests(n, step = 1000) {
+  if (!(n > 0)) return 0;
+  return n >= 10000 ? Math.round(n / step) * step : Number(n.toPrecision(2));
 }
-// "~20,000" for a USD amount; "0" when nothing is left.
-const approx = amount => {
-  const n = approxNumber(amount);
-  return n === 0 ? '0' : n < 1 ? '<1' : `~${n.toLocaleString('en-US')}`;
-};
+// Requests that a USD amount buys, spread over `months` (1 for a single month).
+const requestsFor = (amount, { months = 1, step = months > 1 ? 10000 : 1000 } = {}) => roundRequests(Number(amount || 0) * months / requestEstimate, step);
+const formatApprox = n => n === 0 ? '0' : n < 1 ? '<1' : `~${n.toLocaleString('en-US')}`;
+// "~20,000" for a USD amount, "0" when nothing is left.
+const approx = (amount, options) => formatApprox(requestsFor(amount, options));
 // "~100 requests", "~1 request", "0 requests".
-const requestsText = amount => {
-  const n = approxNumber(amount);
+const requestsText = (amount, options) => {
+  const n = requestsFor(amount, options);
   return n === 0 ? '0 requests' : n < 1 ? 'less than 1 request' : `~${n.toLocaleString('en-US')} request${n === 1 ? '' : 's'}`;
 };
-const ESTIMATE_NOTE = 'Request counts are estimates for typical requests; long prompts and outputs use more.';
-const estimateNote = () => `<p class="hint estimate-note">${ico('info', 14)}<span>${esc(ESTIMATE_NOTE)}</span></p>`;
+// Requests for a whole paid term plus an honest monthly line, because the quota
+// does not carry over. Example with 0.001 per request: $17 a month for 6 months
+// gives "~100,000 requests" and "Quota resets monthly, up to ~17,000 a month".
+function planRequests(i) {
+  if (i.topup) return { main: `${requestsText(i.credit)} of extra usage`, sub: 'Never expires and is used after your monthly quota', short: formatApprox(requestsFor(i.credit)) };
+  const total = requestsFor(i.quota, { months: i.months });
+  const monthly = requestsFor(i.quota);
+  return {
+    main: `${requestsText(i.quota, { months: i.months })}`,
+    sub: i.months > 1 ? `Quota resets monthly, up to ${formatApprox(monthly)} a month` : 'Unused quota does not carry over',
+    short: formatApprox(total),
+    monthly: formatApprox(monthly),
+    total,
+  };
+}
+const ESTIMATE_NOTE = 'Request counts are estimates for typical requests. Long prompts and outputs use more.';
+const estimateNote = () => `<p class="estimate-note">${ico('info', 16)}<span>${esc(ESTIMATE_NOTE)}</span></p>`;
 
 /* Legal links -------------------------------------------------------------------- */
 const LEGAL_LABELS = { terms: 'Terms of Service', privacy: 'Privacy Policy' };
@@ -212,6 +293,13 @@ function legalLink(kind, { label = LEGAL_LABELS[kind], newTab = false, icon = ''
 }
 // Shown under the button that creates an account: using it is the agreement.
 const clickwrap = button => `<p class="clickwrap">By clicking ${esc(button)}, you agree to the ${legalLink('terms', { newTab: true })} and ${legalLink('privacy', { newTab: true })}.</p>`;
+// A callout: info, success, warn, or danger. Icon, title, and body. Errors and
+// warnings that appear at once use role="alert", the rest role="status".
+const ALERT_ICONS = { info: 'info', success: 'check', warn: 'alert', danger: 'alert' };
+function alertBox(tone, title, body = '', { live = false, actions = '' } = {}) {
+  const role = live ? ` role="${tone === 'danger' || tone === 'warn' ? 'alert' : 'status'}"` : '';
+  return `<div class="alert tone-${tone}"${role}>${ico(ALERT_ICONS[tone] || 'info', 20)}<div class="alert-body">${title ? `<strong>${esc(title)}</strong>` : ''}${body ? `<p>${esc(body)}</p>` : ''}${actions ? `<div class="actions">${actions}</div>` : ''}</div></div>`;
+}
 /* Plan maths ---------------------------------------------------------------------
    Everything shown about a plan is derived from the API values (price, credit,
    duration), so operators can change the catalog without touching this file. */
@@ -220,7 +308,7 @@ const usdShort = n => {
   const r = Math.round(Number(n) * 100) / 100;
   return `$${Number.isInteger(r) ? r.toLocaleString() : r.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
-// Subscriptions have a monthly quota that resets; top-ups are extra usage that never expires.
+// Subscriptions have a monthly quota that resets. Top-ups are extra usage that never expires.
 function planInfo(p) {
   const price = Number(p.price_usd);
   const topup = p.kind === 'topup';
@@ -258,6 +346,8 @@ const KIND_LABELS = { llm: 'Text', tts: 'Speech', stt: 'Transcription', image: '
 const kindLabel = k => KIND_LABELS[k] || k || '-';
 const SOURCE_LABELS = { free: 'Trial credit', purchase: 'Purchase', admin: 'Operator grant', refund: 'Refund', subscription: 'Plan quota', topup: 'Top-up' };
 const sourceLabel = s => SOURCE_LABELS[s] || s;
+const SOURCE_ICONS = { free: 'zap', purchase: 'card', admin: 'shield', refund: 'refresh', subscription: 'calendar', topup: 'plus' };
+const sourceCell = s => `<span class="source">${ico(SOURCE_ICONS[s] || 'wallet')}<span>${esc(sourceLabel(s))}</span></span>`;
 const pill = (value, tone) => `<span class="pill tone-${tone || TONES.get(String(value).toLowerCase()) || 'muted'}">${esc(value)}</span>`;
 const requestPill = r => !r.finished ? pill('In progress', 'info') : r.status >= 400 ? pill(r.status, 'danger') : pill(r.status, 'ok');
 const lotState = c => c.expires_at && c.expires_at < nowSeconds() ? 'expired' : isPositive(c.remaining_usd) ? 'active' : 'used up';
@@ -280,14 +370,14 @@ function accountLink(id, contact) {
 }
 function keyLink(id, name, prefix) {
   if (!id) return '<span class="muted">-</span>';
-  const label = name || (prefix ? `${String(prefix).slice(0, 12)}\u2026` : shortId(id));
+  const label = name || (prefix ? `${String(prefix).slice(0, 12)}...` : shortId(id));
   return `<button type="button" class="link" data-open-key="${esc(id)}" title="Open key details">${esc(label)}</button>`;
 }
 const goButton = (label, name, params = {}, cls = 'ghost small') =>
   `<button type="button" class="${cls}" data-go="${esc(name)}" data-go-params="${esc(new URLSearchParams(params))}">${esc(label)}</button>`;
-const KEY_PREFIX_TIP = 'Key prefix \u2014 the full key is shown only once when created or rotated';
+const KEY_PREFIX_TIP = 'Key prefix. The full key is shown only once, when it is created or rotated.';
 // A key prefix is only a label for recognising a key. It is deliberately not selectable or copyable.
-const keyPrefix = p => p ? `<span class="key-prefix" tabindex="0" title="${esc(KEY_PREFIX_TIP)}">${esc(String(p).slice(0, 12))}\u2026</span>` : '';
+const keyPrefix = p => p ? `<span class="key-prefix" tabindex="0" title="${esc(KEY_PREFIX_TIP)}">${esc(String(p).slice(0, 12))}...</span>` : '';
 const copyable = (value, label, display = value) =>
   `<button type="button" class="copy-value" data-copy-value="${esc(value)}" data-copy-label="${esc(label)}" title="Copy ${esc(label.toLowerCase())}"><code>${esc(display)}</code></button>`;
 
@@ -314,7 +404,7 @@ function renderHeader() {
   const el = document.querySelector('#header-actions');
   if (!el) return;
   const docs = `<a class="nav-link${docsPage ? ' current' : ''}" href="/docs/"${docsPage ? ' aria-current="page"' : ''}>${withIcon('book', 'Docs')}</a>`;
-  const toggle = brand.theme_toggle === false ? '' : '<button type="button" id="theme-toggle" class="icon-button ghost" aria-label="Dark theme" aria-pressed="false"></button>';
+  const toggle = brand.theme_toggle === false ? '' : themeControl();
   if (oauthPage) {
     el.innerHTML = `${docs}${toggle}`;
   } else if (token && (workspace || admin)) {
@@ -323,7 +413,7 @@ function renderHeader() {
   } else {
     el.innerHTML = `${docs}${toggle}<a class="button" href="/workspace/">${withIcon('grid', 'Workspace')}</a>`;
   }
-  el.querySelector('#theme-toggle')?.addEventListener('click', toggleTheme);
+  wireThemeMenu(el);
   applyTheme();
 }
 // Terms and Privacy links in the footer (operator URLs may point elsewhere).
@@ -338,6 +428,7 @@ function notice(message, error = false) {
   const el = document.querySelector('#notice');
   el.textContent = message;
   el.classList.toggle('error', error);
+  el.setAttribute('role', error ? 'alert' : 'status');
   // Re-promote into the top layer so the toast always sits above open dialogs.
   if (el.matches(':popover-open')) el.hidePopover();
   el.showPopover();
@@ -460,7 +551,7 @@ function table(columns, rows, { group, empty } = {}) {
 function metric(label, value, hint, { tone, html, icon } = {}) {
   return `<div class="card metric-card${tone ? ` tone-${tone}` : ''}"><div class="label">${icon ? ico(icon, 14) : ''}${esc(label)}</div><div class="metric">${html ? value : esc(value)}</div>${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
 }
-// A compact label/value list. Values are HTML; escape them at the call site.
+// A compact label/value list. Values are HTML, so escape them at the call site.
 const facts = items => `<dl class="facts">${items.filter(Boolean).map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${value}</dd></div>`).join('')}</dl>`;
 function emptyState(title, text, icon = 'inbox') {
   return `<div class="empty"><span class="empty-icon">${ico(icon, 20)}</span><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
@@ -472,7 +563,7 @@ function loading(text = 'Loading...') {
 /* Skeletons ---------------------------------------------------------------------
    Placeholder shapes that mirror the real layout (same cards, grids, and row
    heights) so content replaces them without layout shift. They are inert for
-   assistive tech apart from one polite "Loading" status; the busy region carries
+   assistive tech apart from one polite "Loading" status. The busy region carries
    aria-busy while a request is in flight. */
 const skel = (cls = 'skel-line', n = 1) => `<span class="skel ${cls}"></span>`.repeat(n);
 const skeleton = (inner, label = 'Loading', cls = 'skeleton-body') =>
@@ -509,7 +600,7 @@ const SKELETON_VIEWS = {
     ? `${skSeg(3)}<div class="bill-body"><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div><div class="plan-tiles">${skel('skel-tile', 3)}</div></div><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div><div class="ways">${skel('skel-way', 2)}</div></div>${skel('skel-more')}</div>`
     : billingSub === 'history'
       ? `${skSeg(3)}<div class="bill-body"><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div>${skTable(3, 5, true)}</div>${skel('skel-more', 2)}</div>`
-      : `${skSeg(3)}<div class="bill-body">${skHero()}<div class="plan-chip-row">${skel('skel-pill')}</div>${skel('skel-more')}${skel('skel-note')}</div>`,
+      : `${skSeg(3)}<div class="bill-body">${skHero()}<div class="balance-grid">${skCard(`${skel('skel-label')}${skel('skel-metric')}${skel('skel-line md')}`)}${skCard(`${skel('skel-label')}${skel('skel-metric')}${skel('skel-line md')}`)}${skCard(`${skel('skel-label')}${skel('skel-metric')}${skel('skel-line md')}`)}</div></div>`,
   connect: () => `${skHead(true)}${skCard(`${skCardHead()}${skFacts(3)}`)}${skCard(`${skCardHead()}${skTable(3, 5)}`)}${skCard(`${skCardHead()}${skel('skel-tab-row')}${skCode()}`)}<div class="docs-title">${skel('skel-h3')}</div>${skCard(`${skCardHead()}${skel('skel-line lg', 2)}${skel('skel-btn')}${skel('skel-line md', 4)}`)}<div class="section-gap"></div>${skCard(`${skCardHead()}${skTable(2, 4, true)}`)}<div class="docs-title">${skel('skel-h3')}</div><div class="docs-split">${skCard(skel('skel-code'))}${skCard(skel('skel-code'))}</div>`,
   plans: () => `${skHead(true)}${skTable(5, 7, true)}`,
   codes: () => `${skHead(true)}${skTable(5, 5, true)}`,
@@ -523,7 +614,7 @@ const plansSkeleton = () => skeleton(skPlans(3), 'Loading plans');
 const docNavSkeleton = n => `<div class="skel-nav">${skel('skel-eyebrow')}${skel('skel-navlink', n)}<div class="skel-nav-legal">${skel('skel-navlink', 2)}</div></div>`;
 const docsSkeleton = () => skeleton(`${docNavSkeleton(9)}<div class="skel-article"><div class="skel-doc-hero"><div>${skel('skel-eyebrow')}${skel('skel-title')}${skel('skel-line lg', 2)}${skel('skel-btn')}</div>${skel('skel-block')}</div>${skel('skel-h2')}<div class="skel-steps">${skel('skel-step', 3)}</div>${skCode()}</div>`, 'Loading documentation', 'skel-docs');
 const legalSkeleton = () => skeleton(`${docNavSkeleton(legalKind === 'privacy' ? 12 : 17)}<div class="skel-article">${skel('skel-line sm')}${skel('skel-title')}${skel('skel-line md')}${skel('skel-line lg', 3)}${skel('skel-h2')}${skel('skel-line lg', 5)}${skel('skel-h2')}${skel('skel-line lg', 4)}</div>`, 'Loading document', 'skel-docs');
-const landingSkeleton = () => skeleton(`<div class="skel-landing"><div>${skel('skel-eyebrow')}${skel('skel-hero', 2)}${skel('skel-line lg', 3)}<div class="actions section">${skel('skel-btn', 2)}</div></div>${skel('skel-block')}</div><div class="section">${skel('skel-eyebrow')}${skel('skel-title')}<div class="skel-steps">${skel('skel-step', 3)}</div>${skCard(`${skCardHead(true)}${skCode()}`)}</div><div class="section">${skel('skel-eyebrow')}${skel('skel-title')}${skPlans(3)}</div><div class="skel-steps section">${skel('skel-step', 3)}</div>`, 'Loading');
+const landingSkeleton = () => skeleton(`<div class="skel-landing"><div>${skel('skel-eyebrow')}${skel('skel-hero', 2)}${skel('skel-line lg', 3)}<div class="actions start">${skel('skel-btn', 2)}</div></div>${skel('skel-block')}</div><div class="home-section">${skel('skel-eyebrow')}${skel('skel-title')}<div class="skel-steps">${skel('skel-step', 3)}</div></div><div class="home-section">${skel('skel-eyebrow')}${skel('skel-title')}${skCard(`${skCardHead(true)}${skCode()}`)}</div><div class="home-section">${skel('skel-eyebrow')}${skel('skel-title')}${skPlans(3)}</div>`, 'Loading');
 const consentSkeleton = () => skeleton(`<div class="card consent-card"><div class="skel-center">${skel('skel-circle', 2)}</div>${skel('skel-consent-title', 2)}${skel('skel-line lg')}<div class="consent-section">${skel('skel-line sm')}${skel('skel-line lg', 2)}</div><div class="consent-section">${skel('skel-line sm')}${skel('skel-seg-bar')}${skel('skel-input')}</div><div class="skel-buttons">${skel('skel-btn', 2)}</div></div>`, 'Loading authorization request', 'skel-consent');
 const shellSkeleton = () => `${tabsSkeleton()}<section id="content" aria-busy="true">${viewSkeleton('overview')}</section>`;
 // Painted before any data is known, so every route has a shaped placeholder at once.
@@ -535,10 +626,25 @@ function bootSkeleton() {
   return landingSkeleton();
 }
 
-function modal(title, content, setup, size) {
+/* Dialogs ------------------------------------------------------------------------
+   One structure everywhere: a header (title, short subtitle, close), a scrolling
+   body, and an action row with the secondary action first and one primary action
+   last, at the bottom right. Escape closes, focus stays inside while open, and
+   focus returns to the control that opened the dialog. */
+let dialogCount = 0;
+function setModalTitle(d, title, subtitle = '') {
+  d.querySelector('.dialog-head h2').textContent = title;
+  const sub = d.querySelector('.dialog-sub');
+  sub.textContent = subtitle;
+  sub.hidden = !subtitle;
+}
+function modal(title, content, setup, size, subtitle = '') {
   const d = document.createElement('dialog');
+  const id = `dialog-${++dialogCount}`;
   if (size) d.classList.add(...size.split(' '));
-  d.innerHTML = `<div class="dialog-head"><h2>${esc(title)}</h2><button type="button" data-close aria-label="Close dialog">&times;</button></div><div class="dialog-content">${content}</div>`;
+  d.setAttribute('aria-labelledby', `${id}-title`);
+  d.innerHTML = `<div class="dialog-head"><div class="dialog-title"><h2 id="${id}-title">${esc(title)}</h2><p class="dialog-sub"${subtitle ? '' : ' hidden'}>${esc(subtitle)}</p></div><button type="button" data-close aria-label="Close dialog">${ico('x', 20)}</button></div><div class="dialog-content">${content}</div>`;
+  const opener = document.activeElement;
   document.body.append(d);
   d.querySelector('[data-close]').onclick = () => d.close();
   // Close on a backdrop click (the dialog box itself fills its own rect).
@@ -547,8 +653,13 @@ function modal(title, content, setup, size) {
     const r = d.getBoundingClientRect();
     if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) d.close();
   });
-  d.addEventListener('close', () => d.remove());
+  d.addEventListener('close', () => {
+    d.remove();
+    if (opener?.isConnected && !document.querySelector('dialog[open]')) opener.focus?.({ preventScroll: true });
+  });
   d.showModal();
+  // Start on the first field so people can type right away.
+  d.querySelector('.dialog-content input:not([type=hidden]):not([type=radio]), .dialog-content textarea, .dialog-content select')?.focus({ preventScroll: true });
   setup?.(d);
   return d;
 }
@@ -640,7 +751,7 @@ function listToolbar(id, state, { placeholder, statuses, sorts, groups }) {
   const options = (items, selected) => items.map(([value, label]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(label)}</option>`).join('');
   return `<form class="toolbar" data-list-form="${id}" role="search">
     <input class="toolbar-search" name="q" type="search" value="${esc(state.q)}" aria-label="Search" placeholder="${esc(placeholder)}">
-    <button type="button" class="ghost toolbar-toggle" data-toolbar-toggle aria-expanded="false" aria-controls="${id}-filters">Filters${state.status || state.group ? ' •' : ''}</button>
+    <button type="button" class="ghost toolbar-toggle" data-toolbar-toggle aria-expanded="false" aria-controls="${id}-filters">Filters${state.status || state.group ? ' (active)' : ''}</button>
     <div class="toolbar-extra" id="${id}-filters">
     <select name="status" aria-label="Filter by status"><option value="">All statuses</option>${options(statuses, state.status)}</select>
     <select name="sort" aria-label="Sort by">${options(sorts, state.sort)}</select>
@@ -652,7 +763,7 @@ function listToolbar(id, state, { placeholder, statuses, sorts, groups }) {
 }
 // A removable filter shown above a list, e.g. "Account: ops@example.com".
 function filterChip(id, field, label, value, extra = '') {
-  return `<div class="filter-chip"><span class="label">${esc(label)}</span><strong>${value}</strong>${extra}<button type="button" class="chip-remove" data-chip-remove="${esc(id)}" data-chip-field="${esc(field)}" aria-label="Remove ${esc(label.toLowerCase())} filter">&times;</button></div>`;
+  return `<div class="filter-chip"><span class="label">${esc(label)}</span><strong>${value}</strong>${extra}<button type="button" class="chip-remove" data-chip-remove="${esc(id)}" data-chip-field="${esc(field)}" aria-label="Remove ${esc(label.toLowerCase())} filter">${ico('x', 14)}</button></div>`;
 }
 function listPager(id, state, total, shown) {
   const start = total ? state.offset + 1 : 0;
@@ -679,14 +790,15 @@ function bindForm(form, handler) {
 function confirmModal(title, message, confirmLabel = 'Confirm', danger = false) {
   return new Promise(resolve => {
     const d = modal(title, `
-      <p class="muted">${esc(message)}</p>
-      <div class="actions section">
+      <p class="confirm-text">${esc(message)}</p>
+      <div class="actions">
         <button type="button" data-cancel class="ghost">Cancel</button>
         <button type="button" data-confirm class="${danger ? 'danger-solid' : 'primary'}">${esc(confirmLabel)}</button>
       </div>`, el => {
       el.querySelector('[data-cancel]').onclick = () => d.close();
       el.querySelector('[data-confirm]').onclick = () => { d.close(); resolve(true); };
-    });
+      el.querySelector('[data-cancel]').focus();
+    }, 'narrow', danger ? 'This cannot be undone.' : '');
     d.addEventListener('close', () => resolve(false));
   });
 }
@@ -694,6 +806,7 @@ function confirmModal(title, message, confirmLabel = 'Confirm', danger = false) 
 const CHECK = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="M3 8.5l3.2 3.2L13 4.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 function planCard(p, badges, cta) {
   const i = planInfo(p);
+  const r = planRequests(i);
   const badge = badges.get(p.code);
   const featured = badge === 'Best value';
   return `<article class="card plan-card${featured ? ' featured' : ''}" aria-label="${esc(p.name)} ${p.kind === 'topup' ? 'top-up' : 'plan'}">
@@ -701,26 +814,23 @@ function planCard(p, badges, cta) {
     <div class="plan-price"><span class="plan-amount">${esc(i.topup ? usdShort(i.price) : perMonthLabel(i))}</span>${!i.topup && i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
     <div class="plan-billed">${esc(billedLine(i))}</div>
     <ul class="plan-features">${i.topup
-      ? `<li>${ico('zap')}<span><strong>${esc(approx(i.credit))} extra requests</strong> that never expire</span></li>
-      <li>${ico('infinity')}<span>Carries over, no deadline</span></li>
-      <li>${ico('list')}<span>Used after your monthly quota</span></li>`
-      : `<li>${ico('zap')}<span><strong>${esc(approx(i.quota))} requests per month</strong></span></li>
-      <li>${ico('refresh')}<span>Quota resets every month</span></li>
+      ? `<li>${ico('zap')}<span><strong>${esc(r.main)}</strong><small>${esc(r.sub)}</small></span></li>
+      <li>${ico('infinity')}<span>Carries over, no deadline</span></li>`
+      : `<li>${ico('zap')}<span><strong>${esc(r.main)}</strong><small>${esc(r.sub)}</small></span></li>
       <li>${ico('calendar')}<span>${esc(monthsLabel(i.months))} prepaid, no auto-renewal</span></li>`}</ul>
     <p class="plan-desc">${esc(p.description || (i.topup ? 'Extra usage that never expires.' : 'Monthly usage quota.'))}</p>
     <div class="plan-cta">${cta || `<a class="button${featured ? ' primary' : ''}" href="/workspace/#billing/add">${p.kind === 'topup' ? 'Add top-up' : 'Choose plan'}</a>`}</div>
   </article>`;
 }
-function planFaq(plans, methods) {
+function planFaq(plans, methods, deposits = false) {
   const topups = plans.some(p => p.kind === 'topup');
-  const crypto = methods.includes('crypto');
-  const extra = [topups && 'add a top-up', crypto && 'send stablecoins to your deposit address', 'redeem a code'].filter(Boolean).join(', ');
+  const extra = [topups && 'add a top-up', deposits && 'send stablecoins to your deposit address', 'redeem a code'].filter(Boolean).join(', ');
   const faq = [
     ['How does the monthly quota work?', 'A plan gives you a quota of usage each month. Each request is priced from its usage (tokens, characters, audio seconds, or images) and counted against the quota. The quota resets every month and unused quota does not carry over. Every key on your account shares it.'],
-    ['How many requests do I get?', 'Plans show an approximate number of requests, based on a typical request. Short requests use less of your quota and long prompts or outputs use more, so the real count varies.'],
+    ['How many requests do I get?', 'Plans show the approximate number of requests for the whole term, based on a typical request. Short requests use less of your quota and long prompts or outputs use more, so the real count varies.'],
     ['What happens when my quota runs out?', `Requests stop with a 402 insufficient_quota error that explains your options. Wait for the quota to reset, or ${extra}, and calls work again right away.`],
     topups && ['Do top-ups expire?', 'No. A top-up is extra usage that never expires and carries over. Your monthly quota is used first, then your top-up balance.'],
-    (topups || crypto) && ['Can I add usage without a plan?', crypto
+    (topups || deposits) && ['Can I add usage without a plan?', deposits
       ? `Yes. ${topups ? 'Buy a top-up, or open' : 'Open'} Billing in your workspace and send stablecoins to your personal deposit address. Any amount you send is added as usage that never expires.`
       : 'Yes. Buy a top-up, or ask the operator for a code.'],
   ].filter(Boolean);
@@ -728,7 +838,7 @@ function planFaq(plans, methods) {
 }
 const methodNames = methods => [methods.includes('stripe') && 'card', methods.includes('crypto') && 'crypto'].filter(Boolean);
 // Plan grid, reassurance row, and a short FAQ. `cta(plan)` renders each button.
-function pricingSection(plans, methods = [], cta) {
+function pricingSection(plans, methods = [], cta, { faq = true, deposits = false } = {}) {
   if (!plans.length) return emptyState('No plans yet', 'An operator has not published any plans.');
   const badges = planBadges(plans);
   const paid = methodNames(methods);
@@ -741,7 +851,7 @@ function pricingSection(plans, methods = [], cta) {
   return `<div class="plans pricing" data-count="${plans.length}">${plans.map(p => planCard(p, badges, cta?.(p))).join('')}</div>
     <ul class="assurance">${assurances.map(a => `<li>${CHECK}${esc(a)}</li>`).join('')}</ul>
     ${estimateNote()}
-    ${planFaq(plans, methods)}`;
+    ${faq ? planFaq(plans, methods, deposits) : ''}`;
 }
 
 /* Checkout ---------------------------------------------------------------------
@@ -755,12 +865,12 @@ function planFacts(p, { paidAt } = {}) {
   return facts(i.topup ? [
     ['Top-up', `<strong>${esc(p.name || p.code)}</strong>`],
     ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">one-time</span>`],
-    ['Extra requests', `<strong>${esc(approx(i.credit))}</strong> <span class="muted">never expire</span>`],
+    ['Extra requests', `<strong>${esc(planRequests(i).short)}</strong> <span class="muted">never expire</span>`],
   ] : [
     ['Plan', `<strong>${esc(p.name || p.code)}</strong>`],
     ['Per month', esc(perMonthLabel(i))],
     ['Total today', `<strong>${esc(usdShort(i.price))}</strong> <span class="muted">${esc(monthsLabel(i.months))}, prepaid</span>`],
-    ['Requests per month', `<strong>${esc(approx(i.quota))}</strong> <span class="muted">resets each month</span>`],
+    ['Requests in total', `<strong>${esc(planRequests(i).short)}</strong> <span class="muted">${esc(planRequests(i).sub)}</span>`],
     ['Term', esc(`${monthsLabel(i.months)}, until ${day((paidAt || nowSeconds()) + i.months * 30.4 * DAY, { dateStyle: 'medium' })}`)],
   ]);
 }
@@ -771,22 +881,23 @@ const METHOD_INFO = {
 function checkout(plan, methods) {
   if (!methods.length) return notice('Online payments are not enabled. Use a code.', true);
   const i = planInfo(plan);
-  modal(`Checkout`, `<div data-pay>
+  const r = planRequests(i);
+  const term = i.topup ? 'One-time top-up' : i.price > 0 ? `${usdShort(i.perMonth)} a month for ${monthsLabel(i.months)}` : monthsLabel(i.months);
+  modal('Checkout', `<div data-pay>
     <form class="checkout">
-      <div class="co-plan">
-        <div><div class="label">Plan</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${i.topup ? 'Top-up, never expires' : `${esc(perMonthLabel(i))}${i.price > 0 ? ' per month' : ''} &middot; ${esc(monthsLabel(i.months))}`}</div></div>
-        <div class="co-total"><div class="label">Total</div><div class="co-price">${esc(usdShort(i.price))}</div></div>
-      </div>
-      <div class="co-credit">${i.topup ? `<span>${ico('zap')}You get <strong>${esc(requestsText(i.credit))}</strong> of extra usage that never expires</span>` : `<span>${ico('zap')}You get <strong>${esc(requestsText(i.quota))}</strong> every month</span>`}</div>
+      <section class="co-plan" aria-label="Order">
+        <div class="co-info"><div class="label">${i.topup ? 'Top-up' : 'Plan'}</div><div class="co-name">${esc(plan.name || plan.code)}</div><div class="hint">${esc(term)}</div></div>
+        <div class="co-total"><div class="label">Total today</div><div class="co-price">${esc(usdShort(i.price))}</div></div>
+      </section>
+      <div class="co-credit">${ico('zap', 20)}<div><strong>${esc(r.main)}</strong><span class="muted">${esc(r.sub)}</span>${estimateNote()}</div></div>
       <fieldset class="method-choice"><legend>Pay with</legend>
         ${methods.map((m, n) => `<label class="method"><input type="radio" name="method" value="${esc(m)}"${n === 0 ? ' checked' : ''}><span class="method-body"><strong>${esc(METHOD_INFO[m]?.[0] || m)}</strong><span class="hint">${esc(METHOD_INFO[m]?.[1] || '')}</span></span></label>`).join('')}
       </fieldset>
-      <details class="more"><summary>Details</summary>
+      <details class="more"><summary>Plan details</summary>
         ${planFacts(plan)}
-        <p class="hint">${i.topup ? 'Top-ups never expire. The monthly quota is used first, then your top-up balance.' : 'Prepaid for the whole term, it does not auto-renew. The quota is shared by all your keys.'}</p>
-        ${estimateNote()}
+        <p class="hint">${i.topup ? 'Top-ups never expire. The monthly quota is used first, then your top-up balance.' : 'Prepaid for the whole term, with no auto-renewal. The quota is shared by all your keys.'}</p>
       </details>
-      <p class="clickwrap">Our ${legalLink('terms', { newTab: true })} and ${legalLink('privacy', { newTab: true })} apply to your purchase.</p>
+      <p class="clickwrap">By continuing, you agree to the ${legalLink('terms', { newTab: true })} and ${legalLink('privacy', { newTab: true })}.</p>
       <div class="actions sticky-actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary" data-submit>Continue</button></div>
     </form>
   </div>`, d => {
@@ -795,7 +906,7 @@ function checkout(plan, methods) {
     const submit = form.querySelector('[data-submit]');
     const label = () => {
       const m = form.elements.method.value;
-      submit.innerHTML = m === 'stripe' ? withIcon('card', `Pay ${usdShort(i.price)} by card`) : withIcon('wallet', 'Continue to crypto payment');
+      submit.innerHTML = m === 'stripe' ? withIcon('card', `Pay ${usdShort(i.price)} by card`) : withIcon('wallet', 'Continue to crypto');
     };
     label();
     form.addEventListener('change', label);
@@ -803,7 +914,7 @@ function checkout(plan, methods) {
     bindForm(form, async b => {
       const v = await api('/v1/account/checkout', 'POST', { plan_code: plan.code, method: b.method });
       if (v.method === 'crypto') {
-        d.querySelector('h2').textContent = 'Pay with crypto';
+        setModalTitle(d, 'Pay with crypto', 'Send the exact amount. This window updates by itself.');
         runOrder(d, v);
         if (tab === 'billing') load();
         return;
@@ -815,7 +926,7 @@ function checkout(plan, methods) {
       location.href = url.href;
       await new Promise(() => {});
     });
-  }, 'wide sheet');
+  }, 'wide sheet', 'Review your plan, then choose how to pay.');
 }
 
 /* Charts ----------------------------------------------------------------------- */
@@ -933,27 +1044,27 @@ function wireShares(root) {
 /* Key creation and secrets ----------------------------------------------------- */
 
 function redeemForm() {
-  modal('Redeem a credit code', `
+  modal('Redeem a code', `
     <form>
-      <div class="redeem-intro"><span class="redeem-icon" aria-hidden="true">+</span><div><h3>Apply credit to your balance</h3><p>Enter the single-use code supplied by your operator. Credit is available immediately after redemption.</p></div></div>
       <label for="redeem-code">Credit code</label>
       <input id="redeem-code" name="code" autocomplete="off" required placeholder="RES-...">
-      <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary">Redeem credit</button></div>
+      <p class="field-help">Codes are single-use. The usage is available as soon as you redeem it.</p>
+      <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button type="submit" class="primary">Redeem code</button></div>
     </form>`, d => {
     d.querySelector('[data-cancel]').onclick = () => d.close();
     bindForm(d.querySelector('form'), async b => {
       await api('/v1/account/redeem', 'POST', b);
       d.close();
-      notice('Credit applied');
+      notice('Code redeemed');
       await load();
     });
-  });
+  }, 'narrow', 'Enter the code from your operator.');
 }
 
 function secrets(v, { embedded = false } = {}) {
   modal('Save your credentials', `
-    <p class="muted">These are shown only once. Keep the dashboard token to manage your account even if you block your API key.</p>
-    ${Number(v.trial_credit_usd) > 0 ? `<p class="trial-note">${ico('zap')}<span>Your account starts with <strong>${esc(approx(v.trial_credit_usd))} free requests</strong> to try the API. <span class="trial-foot">${esc(ESTIMATE_NOTE)}</span></span></p>` : ''}
+    ${alertBox('warn', 'Copy these now', 'They are shown only once. The dashboard token lets you manage your account even if you block your API key.')}
+    ${Number(v.trial_credit_usd) > 0 ? `<div class="trial-note">${ico('zap', 20)}<div><strong>${esc(approx(v.trial_credit_usd))} free requests to try the API</strong>${estimateNote()}</div></div>` : ''}
     <div class="cred-row">
       <span class="cred-label">API key</span>
       <code class="cred-value secret" title="${esc(v.key)}">${esc(v.key)}</code>
@@ -964,9 +1075,9 @@ function secrets(v, { embedded = false } = {}) {
       <code class="cred-value" title="${esc(v.dashboard_token)}">${esc(v.dashboard_token)}</code>
       <button type="button" class="small" data-copy="token">${withIcon('copy', 'Copy token')}</button>
     </div>
-    <div class="actions section">
+    <div class="actions">
       <button type="button" data-copy-all class="ghost">${withIcon('copy', 'Copy both')}</button>
-      ${admin || embedded ? '' : `<button type="button" data-open class="ghost">${withIcon('grid', 'Open workspace')}</button>`}
+      ${admin || embedded ? '' : `<button type="button" data-open class="primary">${withIcon('grid', 'Open workspace')}</button>`}
     </div>`, d => {
     const wire = (selector, text, label) => {
       const button = d.querySelector(selector);
@@ -988,7 +1099,7 @@ function secrets(v, { embedded = false } = {}) {
       sessionStorage.setItem(CUSTOMER_STORE, v.dashboard_token);
       location.href = '/workspace/';
     });
-  }, 'wide');
+  }, 'wide', 'Your account is ready.');
 }
 
 function keyForm() {
@@ -999,29 +1110,32 @@ function keyForm() {
       <input id="key-name" name="name" maxlength="80" value="${esc(suggestedName())}" placeholder="My application" required>
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
-      <p class="field-help">${signedIn ? 'The new key shares your account balance.' : 'New accounts receive evaluation credit. Additional keys share the same balance.'}</p>
-      <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
-      <div class="actions"><button class="primary" type="submit">${withIcon('plus', 'Create key')}</button></div>
+      <p class="field-help">${signedIn ? 'The new key shares your account balance.' : 'New accounts get free trial usage. More keys share the same balance.'}</p>
+      <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Checking that you are human...</span></div><progress max="100" value="0"></progress></div>
       ${signedIn ? '' : clickwrap('Create key')}
-    </form>`, d => bindForm(d.querySelector('form'), async b => {
-    const pow = d.querySelector('.pow');
-    const bar = pow.querySelector('progress');
-    const ctl = new AbortController();
-    d.addEventListener('close', () => ctl.abort(), { once: true });
-    let v;
-    try {
-      if (signedIn) v = await api('/v1/keys', 'POST', b);
-      else {
-        pow.hidden = false;
-        v = await signup({ name: b.name, contact: b.contact, accept_terms: true }, p => { bar.value = Math.round(p * 100); }, ctl.signal);
+      <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button class="primary" type="submit">${withIcon('plus', 'Create key')}</button></div>
+    </form>`, d => {
+    d.querySelector('[data-cancel]').onclick = () => d.close();
+    bindForm(d.querySelector('form'), async b => {
+      const pow = d.querySelector('.pow');
+      const bar = pow.querySelector('progress');
+      const ctl = new AbortController();
+      d.addEventListener('close', () => ctl.abort(), { once: true });
+      let v;
+      try {
+        if (signedIn) v = await api('/v1/keys', 'POST', b);
+        else {
+          pow.hidden = false;
+          v = await signup({ name: b.name, contact: b.contact, accept_terms: true }, p => { bar.value = Math.round(p * 100); }, ctl.signal);
+        }
+      } finally {
+        pow.hidden = true;
       }
-    } finally {
-      pow.hidden = true;
-    }
-    d.close();
-    secrets(v);
-    if (document.querySelector('#content')) await load();
-  }));
+      d.close();
+      secrets(v);
+      if (document.querySelector('#content')) await load();
+    });
+  }, 'narrow', signedIn ? 'Give it a name you will recognize.' : 'No card needed. You get a key and a dashboard token.');
 }
 
 /* Key details ------------------------------------------------------------------ */
@@ -1255,13 +1369,13 @@ function manageAccount(aid) {
 
 function creditTable(credits) {
   return table([
-    ['Source', c => esc(sourceLabel(c.source))],
+    ['Source', c => sourceCell(c.source)],
     [admin ? 'Amount' : 'Requests', c => admin ? `<span class="num">${esc(usd(c.amount_usd))}</span>` : `<span class="num">${esc(approx(c.amount_usd))}</span>`, 'end'],
     [admin ? 'Remaining' : 'Remaining requests', c => admin ? `<span class="num">${esc(usd(c.remaining_usd))}</span>` : `<span class="num">${esc(approx(c.remaining_usd))}</span><div class="hint">${esc(usd(c.remaining_usd))}</div>`, 'end'],
     ['State', c => pill(lotState(c))],
     ['Expires', c => c.expires_at ? esc(date(c.expires_at)) : '<span class="muted">Never</span>'],
     ['Note', c => c.note ? esc(c.note) : DASH, 'wrap'],
-  ], credits, { empty: ['No credit yet', 'Entries appear after a plan, top-up, or grant.'] });
+  ], credits, { empty: ['No usage added yet', 'Plans, top-ups, and grants show up here.'] });
 }
 
 function creditForm(aid, done) {
@@ -2116,21 +2230,31 @@ function legal() {
 
 /* Landing and sign-in ------------------------------------------------------------ */
 
+const FEATURES = [
+  ['terminal', 'OpenAI-compatible', 'Use the SDK you already have. Change the base URL and the key.'],
+  ['grid', 'Text, speech, and images', 'Chat, transcription, speech, and image models behind one endpoint.'],
+  ['list', 'Every request on record', 'See tokens, status, and charges for each call in your workspace.'],
+  ['key', 'Keys you control', 'Create, rename, block, and rotate keys without touching your apps.'],
+  ['link', 'MCP ready', 'Connect Claude, ChatGPT, Cursor, or VS Code and approve in your browser.'],
+  ['shield', 'Prepaid and predictable', 'Plans are prepaid with no auto-renewal, so there are no surprise bills.'],
+];
+const sectionTitle = (eyebrow, title, sub = '') => `<div class="section-title"><div class="eyebrow">${esc(eyebrow)}</div><h2>${esc(title)}</h2>${sub ? `<p>${esc(sub)}</p>` : ''}</div>`;
+
 async function landing() {
   main.innerHTML = `
     <section class="hero">
-      <div>
-        <div class="eyebrow">${esc(brand.hero_eyebrow || 'ONE ENDPOINT, ENDLESS POSSIBILITIES')}</div>
+      <div class="hero-copy">
+        <div class="eyebrow">${esc(brand.hero_eyebrow || 'One endpoint, many models')}</div>
         <h1>${brand.hero_title ? esc(brand.hero_title) : 'Intelligence,<br>on your terms<span class="accent">.</span>'}</h1>
         <p>${esc(brand.hero_text || 'Language, speech, audio, and images through one familiar API. Create a key, connect your app, and stay in control of every request.')}</p>
-        <div class="actions section">
-          <button type="button" class="primary" id="create">${withIcon('key', 'Get an API key')}</button>
-          <a class="button ghost" href="/docs/">${withIcon('book', 'Read the docs')}</a>
+        <div class="actions start">
+          <button type="button" class="primary large" id="create">${withIcon('key', 'Get an API key')}</button>
+          <a class="button large" href="/docs/">${withIcon('book', 'Read the docs')}</a>
         </div>
-        <ul class="chips" aria-label="Highlights"><li>OpenAI-compatible</li><li>Monthly plans</li><li>MCP ready</li><li>Per-request history</li></ul>
+        <ul class="chips" aria-label="Highlights"><li>${ico('check')}OpenAI-compatible</li><li>${ico('check')}No card to start</li><li>${ico('check')}MCP ready</li><li>${ico('check')}Per-request history</li></ul>
       </div>
       <div class="terminal">
-        <div class="bar">${ico('terminal')}<span>QUICK START / cURL</span></div>
+        <div class="bar">${ico('terminal')}<span>Quick start: cURL</span></div>
         <pre><span class="accent">curl</span> ${esc(location.origin)}/v1/chat/completions \\
   -H "Authorization: Bearer $RESELLER_KEY" \\
   -H "Content-Type: application/json" \\
@@ -2144,38 +2268,52 @@ async function landing() {
   }'</pre>
       </div>
     </section>
-    <section class="section get-started" id="get-started">
-      <div class="eyebrow">GET STARTED</div>
-      <h2>Your first request in three steps</h2>
+    <section class="home-section" id="how-it-works">
+      ${sectionTitle('How it works', 'Your first request in three steps')}
       <ol class="start-steps">
-        <li class="card"><span class="step-num">1</span><div><h3>Create a key</h3><p>Choose Get an API key. A short proof of work runs in your browser. No card needed.</p></div></li>
-        <li class="card"><span class="step-num">2</span><div><h3>Call the API</h3><p>Point any OpenAI SDK at <code>${esc(location.origin)}/v1</code> and send the key as a bearer token.</p></div></li>
-        <li class="card"><span class="step-num">3</span><div><h3>Connect an agent</h3><p>Paste <code>${esc(location.origin)}/mcp</code> into Claude, ChatGPT, Cursor, or VS Code and approve in your browser.</p></div></li>
+        <li class="card"><span class="step-icon">${ico('key', 20)}</span><div><h3><span class="step-count">1.</span> Create a key</h3><p>Choose Get an API key. A short check runs in your browser. No card needed.</p></div></li>
+        <li class="card"><span class="step-icon">${ico('terminal', 20)}</span><div><h3><span class="step-count">2.</span> Call the API</h3><p>Point any OpenAI SDK at <code>${esc(location.origin)}/v1</code> and send the key as a bearer token.</p></div></li>
+        <li class="card"><span class="step-icon">${ico('link', 20)}</span><div><h3><span class="step-count">3.</span> Connect an agent</h3><p>Paste <code>${esc(location.origin)}/mcp</code> into Claude, ChatGPT, Cursor, or VS Code and approve in your browser.</p></div></li>
       </ol>
+    </section>
+    <section class="home-section get-started" id="get-started">
+      ${sectionTitle('Quick start', 'Copy, paste, run')}
       <div class="card">
         <div class="card-head"><h3>Call the API</h3><a class="button ghost small" href="/docs/#examples">${withIcon('book', 'All examples')}</a></div>
         ${snippetTabs(apiSnippets())}
       </div>
     </section>
-    <section class="section">
-      <div class="row">
-        <div><div class="eyebrow">ROOM TO BUILD</div><h2>Choose your plan</h2></div>
-        <span class="muted">A monthly quota of usage.</span>
-      </div>
-      <div class="section" id="plans" aria-busy="true">${plansSkeleton()}</div>
+    <section class="home-section" id="features">
+      ${sectionTitle('Features', 'Everything you need, nothing you do not')}
+      <ul class="features">${FEATURES.map(([icon, title, text]) => `<li class="card feature"><span class="step-icon">${ico(icon, 20)}</span><h3>${esc(title)}</h3><p>${esc(text)}</p></li>`).join('')}</ul>
     </section>
-    <section class="steps section">
-      <div class="card step"><div class="eyebrow">01 / CONNECT ONCE</div><p>Use your existing OpenAI SDK. Change the base URL and API key.</p></div>
-      <div class="card step"><div class="eyebrow">02 / SEE EVERY REQUEST</div><p>Track tokens, request history, and spending in your workspace.</p></div>
-      <div class="card step"><div class="eyebrow">03 / STAY IN CONTROL</div><p>Rotate keys, add a top-up, and keep your applications running.</p></div>
+    <section class="home-section" id="pricing">
+      ${sectionTitle('Pricing', 'Choose your plan', 'Prepaid plans with a monthly quota of usage.')}
+      <div id="plans" aria-busy="true">${plansSkeleton()}</div>
+    </section>
+    <section class="home-section" id="faq" hidden>
+      ${sectionTitle('FAQ', 'Common questions')}
+      <div id="faq-slot"></div>
+    </section>
+    <section class="home-section final-cta">
+      <div class="card cta-card">
+        <div><h2>Ready to build?</h2><p>Create a key in under a minute and make your first request.</p></div>
+        <div class="actions"><a class="button" href="/docs/">${withIcon('book', 'Read the docs')}</a><button type="button" class="primary" id="create-final">${withIcon('key', 'Get an API key')}</button></div>
+      </div>
     </section>`;
   document.querySelector('#create').onclick = keyForm;
+  document.querySelector('#create-final').onclick = keyForm;
   wireDocs(main);
   const slot = document.querySelector('#plans');
   try {
     const v = await api('/v1/plans');
     setRequestEstimate(v.request_estimate_usd);
-    slot.innerHTML = pricingSection(v.plans, v.payment_methods || []);
+    const methods = v.payment_methods || [];
+    slot.innerHTML = pricingSection(v.plans, methods, undefined, { faq: false });
+    if (v.plans.length) {
+      document.querySelector('#faq-slot').innerHTML = planFaq(v.plans, methods);
+      document.querySelector('#faq').hidden = false;
+    }
   } catch (e) {
     slot.innerHTML = `<div class="card error"><strong>Plans could not be loaded</strong><p>${esc(e.message)}</p></div>`;
   } finally {
@@ -2186,12 +2324,12 @@ async function landing() {
 function login() {
   const intro = admin
     ? `<section class="auth-intro">
-        <div class="eyebrow">OPERATOR CONSOLE</div>
+        <div class="eyebrow">Operator console</div>
         <h1>Run the<br>platform<span class="accent">.</span></h1>
         <p class="muted">Manage accounts, plans, redeem codes, payments, and every request from one place.</p>
       </section>`
     : `<section class="auth-intro">
-        <div class="eyebrow">YOUR API WORKSPACE</div>
+        <div class="eyebrow">Your API workspace</div>
         <h1>Your keys.<br>Your usage.<span class="accent"> One balance.</span></h1>
         <p class="muted">Sign in with an API key or dashboard token to manage keys, redeem credit, and watch every request.</p>
         <ul class="auth-points">
@@ -2205,7 +2343,7 @@ function login() {
       ${intro}
       <section class="auth-panel">
         <form class="card auth-card">
-          <div class="eyebrow">${esc(admin ? `${brandName} administrator` : `Sign in to ${brandName}`).toUpperCase()}</div>
+          <div class="eyebrow">${esc(admin ? `${brandName} administrator` : `Sign in to ${brandName}`)}</div>
           <h2>Welcome back<span class="accent">.</span></h2>
           <label for="login-token">${admin ? 'Administrator token' : 'API key or dashboard token'}</label>
           <input id="login-token" name="token" type="password" autocomplete="off" required>
@@ -2216,7 +2354,7 @@ function login() {
         <div class="auth-alt">
           <div>
             <div class="label">New here?</div>
-            <div class="hint">Create an account and get evaluation credit. No card required.</div>
+            <div class="hint">Create an account and get free trial usage. No card required.</div>
           </div>
           <button type="button" id="create" class="button ghost">${withIcon('plus', 'Create a new account')}</button>
         </div>`}
@@ -2560,7 +2698,7 @@ const views = {
     return `${pageHead('Requests', admin ? 'Every proxied request with its usage and charge.' : 'Every request made with your keys and what it was billed.', `<button type="button" data-refresh class="ghost small">${withIcon('refresh', 'Refresh')}</button>`)}
       <form class="toolbar" data-list-form="requests" role="search">
         <input class="toolbar-search" name="q" type="search" value="${esc(state.q)}" aria-label="Search model, route, or request ID" placeholder="Search model, route, or request ID">
-        <button type="button" class="ghost toolbar-toggle" data-toolbar-toggle aria-expanded="false" aria-controls="requests-filters">Filters${state.model || state.kind || state.status ? ' •' : ''}</button>
+        <button type="button" class="ghost toolbar-toggle" data-toolbar-toggle aria-expanded="false" aria-controls="requests-filters">Filters${state.model || state.kind || state.status ? ' (active)' : ''}</button>
         <div class="toolbar-extra" id="requests-filters">
         <select name="model" aria-label="Model"><option value="">All models</option>${[...new Set([state.model, ...models].filter(Boolean))].map(m => option(m, m, state.model)).join('')}</select>
         <select name="kind" aria-label="Kind">${option('', 'All kinds', state.kind)}${Object.entries(KIND_LABELS).map(([k, l]) => option(k, l, state.kind)).join('')}</select>
@@ -2626,7 +2764,7 @@ function planTile(plan, badges, methods) {
     <div class="plan-top"><h4 class="plan-name">${esc(plan.name)}</h4>${badge ? `<span class="plan-flag${featured ? '' : ' soft'}">${esc(badge)}</span>` : ''}${tip(detail)}</div>
     <div class="plan-price"><span class="plan-amount">${esc(i.topup ? usdShort(i.price) : perMonthLabel(i))}</span>${!i.topup && i.price > 0 ? '<span class="plan-unit">/mo</span>' : ''}</div>
     <div class="plan-billed">${esc(billedLine(i))}</div>
-    <div class="plan-credit">${ico('zap')}<span>${i.topup ? `<strong>${esc(approx(i.credit))}</strong> extra requests, never expire` : `<strong>${esc(approx(i.quota))}</strong> requests per month`}</span></div>
+    <div class="plan-credit">${ico('zap')}<span><strong>${esc(planRequests(i).main)}</strong><small>${esc(planRequests(i).sub)}</small></span></div>
     ${methods.length ? `<button type="button" class="${featured ? 'primary' : ''}" data-checkout="${esc(plan.code)}">${i.topup ? 'Buy' : 'Choose'} ${esc(plan.name)}</button>` : ''}
   </article>`;
 }
@@ -2634,7 +2772,7 @@ function renderBilling() {
   const { v, p, orders, methods } = billingData;
   const a = v.account;
   const topUp = v.top_up || {};
-  const hasTopUp = topUp.available === false || Boolean(topUp.networks?.length);
+  const hasTopUp = Boolean(topUp.networks?.length);
   const lots = v.credits.filter(c => lotState(c) === 'active');
   const trial = lots.filter(c => c.source === 'free');
   const trialLeft = trial.reduce((sum, c) => sum + Number(c.remaining_usd), 0);
@@ -2661,52 +2799,71 @@ function renderBilling() {
           <div class="card way"><div><strong>Redeem a code</strong> ${tip('Apply a single-use code from the operator. The usage is available immediately.')}</div><p>Have a code?</p><button type="button" class="small" data-redeem>${withIcon('ticket', 'Redeem a code')}</button></div>
         </div>
       </div>
-      <details class="more faq-more"><summary>Common questions</summary>${planFaq(p.plans, methods)}</details>`;
+      <details class="more faq-more"><summary>Common questions</summary>${planFaq(p.plans, methods, hasTopUp)}</details>`;
   } else if (billingSub === 'history') {
     const dep = topUp.recent || [];
     body = `<div class="bill-section">
         <div class="section-head"><h3>Payments</h3><span class="hint">${esc(plural(orders.payments.length, 'payment'))}</span></div>
         ${table([
           ['Date', r => when(r.created_at)],
-          ['Plan', r => `<strong>${esc(planName(r.plan_code))}</strong><div class="hint">${esc(methodLabel(r.method))} &middot; ${r.kind === 'topup' ? 'Top-up' : `${esc(monthsLabel(Number(r.months) || 1))}`}</div>`],
+          ['Plan', r => `<strong>${esc(planName(r.plan_code))}</strong><div class="hint">${esc(methodLabel(r.method))}, ${r.kind === 'topup' ? 'top-up' : esc(monthsLabel(Number(r.months) || 1))}</div>`],
           ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
           ['Status', r => pill(r.refunded_at ? 'refunded' : r.status)],
           ['', r => `<div class="actions">${r.method === 'crypto' && r.status === 'pending' ? `<button type="button" class="small primary" data-order="${esc(r.id)}">Pay</button>` : ''}<button type="button" class="small" data-receipt="${esc(r.id)}" aria-label="Details of payment ${esc(shortId(r.id))}">Details</button></div>`, 'end'],
         ], orders.payments, { empty: ['No payments yet', 'Plan purchases appear here with their status and a receipt.'] })}
       </div>
-      <details class="more"><summary>Usage ledger (${count(v.credits.length)})</summary>
-        <p class="hint">Your monthly quota resets each month. Top-ups never expire. The quota is used first, then top-ups.</p>
+      <div class="bill-section">
+        <div class="section-head"><h3>Usage ledger</h3><span class="hint">${esc(plural(v.credits.length, 'entry'))}</span></div>
+        <p class="hint ledger-note">Your monthly quota resets each month and top-ups never expire. The quota is used first, then top-ups.</p>
         ${creditTable(v.credits)}
-      </details>
-      ${dep.length ? `<details class="more"><summary>Stablecoin deposits (${count(dep.length)})</summary>${depositsTable(dep)}</details>` : ''}`;
+      </div>
+      ${dep.length ? `<div class="bill-section"><div class="section-head"><h3>Stablecoin deposits</h3><span class="hint">${esc(plural(dep.length, 'deposit'))}</span></div>${depositsTable(dep)}</div>` : ''}`;
   } else {
+    const quotaLeft = Number(a.quota_remaining_usd), topupLeft = Number(a.topup_remaining_usd);
+    const quotaMax = sub ? Number(sub.monthly_quota_usd) : 0;
+    const quotaPct = quotaMax > 0 ? Math.max(0, Math.min(100, Math.round((Number(sub.quota_remaining_usd) / quotaMax) * 100))) : 0;
     const line = debt ? `Outstanding debt of ${usd(a.debt_usd)} is repaid from your next top-up.`
       : empty ? 'Nothing left. API calls are refused until you get a plan or top-up.'
       : 'Shared by every key on your account.';
-    const notes = [
-      `Monthly quota left: ${requestsText(a.quota_remaining_usd)} (${usd(a.quota_remaining_usd)}). It resets each month and unused quota does not carry over.`,
-      `Top-up balance: ${requestsText(a.topup_remaining_usd)} (${usd(a.topup_remaining_usd)}). Top-ups never expire and are used after the quota.`,
-      trialLeft > 0 && `Includes ${requestsText(trialLeft)} of trial usage${Number.isFinite(trialEnds) ? `, valid until ${date(trialEnds)}` : ''}.`,
-      `Spent so far: ${usd(a.billed_usd)} across all keys.`,
-    ].filter(Boolean);
     const subLine = s => {
       const left = `${approx(s.quota_remaining_usd)} of ${approx(s.monthly_quota_usd)} requests left this month${s.quota_resets_at ? `, resets ${date(s.quota_resets_at)}` : ''}`;
       const term = `${s.auto_renew ? 'Renews' : 'Ends'} ${date(s.expires_at)}${s.provider === 'app_store' ? ' (App Store)' : s.provider === 'google_play' ? ' (Google Play)' : ''}`;
       return `<div class="sub-line"><strong>${esc(s.plan_name || s.plan_code)}</strong> ${s.status && s.status !== 'active' ? pill(s.status) : ''}<div class="hint">${esc(left)}. ${esc(term)}.</div></div>`;
     };
-    body = `${refunded ? '<div class="callout warn"><p><strong>Account suspended.</strong> This account was suspended after a refund through the App Store or Google Play. Contact the operator to restore access.</p></div>' : ''}
+    body = `${refunded ? alertBox('warn', 'Account suspended', 'This account was suspended after a refund through the App Store or Google Play. Contact the operator to restore access.', { live: true }) : ''}
       <section class="card balance-hero${empty || debt ? ' warn' : ''}" aria-labelledby="balance-label">
         <div class="balance-main">
-          <div class="label" id="balance-label">${ico('zap', 14)}Requests left</div>
+          <div class="label" id="balance-label">${ico('zap', 16)}Requests left</div>
           <div class="metric balance-amount">${esc(requestsText(a.balance_usd))}</div>
-          <p class="balance-line${empty || debt ? ' warn' : ''}">${esc(line)}${debt || empty ? '' : ` <span class="muted">Balance ${esc(usd(a.balance_usd))}.</span>`}</p>
+          ${estimateNote()}
+          <p class="balance-line${empty || debt ? ' warn' : ''}">${esc(line)}</p>
+          ${!debt && !empty ? `<p class="balance-exact">Exact balance: <strong>${esc(usd(a.balance_usd))}</strong></p>` : ''}
         </div>
-        <div class="actions"><button type="button" class="primary" data-bsub-go="add">${sub ? 'Add a top-up' : 'Get a plan'}</button></div>
+        <div class="actions"><button type="button" class="primary" data-bsub-go="add">${withIcon(sub ? 'plus' : 'tag', sub ? 'Add a top-up' : 'Get a plan')}</button></div>
       </section>
-      <div class="plan-chip-row"><span class="plan-chip${sub ? ' active' : ''}">${sub ? `${esc(sub.plan_name || sub.plan_code)} plan &middot; ${esc(approx(sub.quota_remaining_usd))} of ${esc(approx(sub.monthly_quota_usd))} requests left${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}` : 'No active plan'}</span>${sub ? `<span class="hint">${sub.auto_renew ? 'Renews' : 'Ends'} ${esc(date(sub.expires_at))}</span>` : ''}</div>
-      ${subs.length > 1 ? `<div class="bill-section">${subs.map(subLine).join('')}</div>` : ''}
-      <details class="more"><summary>Balance details</summary><ul class="balance-notes">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></details>
-      ${estimateNote()}`;
+      <div class="balance-grid">
+        <section class="card balance-card" aria-label="This month">
+          <div class="label">${ico('refresh', 16)}This month</div>
+          <div class="metric">${sub ? esc(requestsText(sub.quota_remaining_usd)) : '0 requests'}</div>
+          ${sub ? `<div class="share-bar meter" role="img" aria-label="${quotaPct}% of this month's quota left"><i data-share="${quotaPct}"></i></div>
+          <div class="hint">of ${esc(approx(sub.monthly_quota_usd))} a month${sub.quota_resets_at ? `, resets ${esc(date(sub.quota_resets_at))}` : ''}</div>
+          <div class="hint">Exact: ${esc(usd(sub.quota_remaining_usd))}</div>` : `<div class="hint">${quotaLeft > 0 ? esc(`Exact: ${usd(quotaLeft)}`) : 'No active plan'}</div>`}
+        </section>
+        <section class="card balance-card" aria-label="Extra usage">
+          <div class="label">${ico('infinity', 16)}Extra usage</div>
+          <div class="metric">${esc(requestsText(a.topup_remaining_usd))}</div>
+          <div class="hint">${topupLeft > 0 ? 'Never expires. Used after your monthly quota.' : 'Top-ups never expire.'}</div>
+          ${topupLeft > 0 ? `<div class="hint">Exact: ${esc(usd(a.topup_remaining_usd))}</div>` : ''}
+        </section>
+        <section class="card balance-card" aria-label="Plan">
+          <div class="label">${ico('tag', 16)}Plan</div>
+          <div class="metric">${sub ? esc(sub.plan_name || sub.plan_code) : 'None'}</div>
+          <div class="hint">${sub ? `${sub.auto_renew ? 'Renews' : 'Ends'} ${esc(date(sub.expires_at))}` : 'Choose a plan to get a monthly quota.'}</div>
+        </section>
+      </div>
+      ${trialLeft > 0 ? alertBox('info', `Includes ${requestsText(trialLeft)} of trial usage`, Number.isFinite(trialEnds) ? `Valid until ${date(trialEnds)}.` : '') : ''}
+      ${subs.length > 1 ? `<div class="bill-section"><div class="section-head"><h3>All plans</h3></div>${subs.map(subLine).join('')}</div>` : ''}
+      <p class="hint spent-line">Spent so far: ${esc(usd(a.billed_usd))} across all keys.</p>`;
   }
   return `${billingTabs()}<div class="bill-body">${body}</div>`;
 }
@@ -3031,7 +3188,7 @@ function qrSvg(text, label = 'QR code') {
 /* Crypto helpers ---------------------------------------------------------------
    Used by the stablecoin top-up card and the "Pay with crypto" dialog. Every link
    comes from server-supplied explorer templates and must be https. */
-const DASH = '<span class="muted" title="Not available">&mdash;</span>';
+const DASH = '<span class="muted" title="Not available">-</span>';
 const joinOr = names => names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
 function explorerHref(links, kind, value) {
   const template = links?.[kind];
@@ -3105,7 +3262,7 @@ function netPanel(n, t) {
     n.confirmations ? `${plural(n.confirmations, 'confirmation')}` : null,
     n.eta_minutes ? `usually about ${plural(n.eta_minutes, 'minute')}` : null,
   ].filter(Boolean).join(', ');
-  return `<p class="send-line">Send <strong>${esc(joinOr(symbols))}</strong> on <strong>${esc(n.chain_name)}</strong></p>
+  return `<p class="send-line">Send <strong>${esc(joinOr(symbols))}</strong> on <strong>${esc(n.chain_name)}</strong>.</p>
     <div class="addr-main">
       <div class="qr-box">${qrSvg(n.address, `QR code of your ${n.chain_name} deposit address`)}</div>
       <div class="addr-body">
@@ -3114,7 +3271,7 @@ function netPanel(n, t) {
         <button type="button" class="primary big" data-copy-value="${esc(n.address)}" data-copy-label="${esc(n.chain_name)} address">${withIcon('copy', 'Copy address')}</button>
       </div>
     </div>
-    <p class="warn-line">Send only ${esc(joinOr(symbols))} on ${esc(n.chain_name)}. Other tokens or networks can be lost.</p>
+    ${alertBox('warn', `Send only ${joinOr(symbols)} on ${n.chain_name}`, 'Other tokens or networks can be lost.')}
     <details class="more"><summary>Details</summary>
       ${facts([
         ['Network', `${esc(n.chain_name)}${n.chain_id ? ` <span class="hint">chain ID ${esc(n.chain_id)}</span>` : ''}`],
@@ -3137,11 +3294,7 @@ function netPanel(n, t) {
 // The stablecoin top-up lives in a dialog, opened from the Add credit section.
 function topUpModal() {
   const t = billingData?.v?.top_up;
-  if (!t) return;
-  if (t.available === false) {
-    modal('Top up with stablecoins', `<div class="callout warn"><p>Your deposit addresses are temporarily unavailable. Try again in a moment.</p></div>`, null, 'sheet');
-    return;
-  }
+  if (!t?.networks?.length) return;
   if (!t.networks.some(n => n.chain === topUpState.chain)) topUpState.chain = t.networks[0].chain;
   modal('Top up with stablecoins', `<div data-topup>
     ${t.networks.length > 1 ? `<div class="net-tabs" role="tablist" aria-label="Network">${t.networks.map(n => `<button type="button" role="tab" data-net="${esc(n.chain)}" aria-selected="${n.chain === topUpState.chain}" aria-controls="net-panel" tabindex="${n.chain === topUpState.chain ? 0 : -1}">${esc(n.chain_name)}</button>`).join('')}</div>` : ''}
@@ -3171,7 +3324,7 @@ function topUpModal() {
         select(tabs[(target + tabs.length) % tabs.length].dataset.net, true);
       };
     });
-  }, 'wide sheet');
+  }, 'wide sheet', 'Send stablecoins to your personal address. Any amount is added as usage that never expires.');
 }
 function wireTopUp(root) {
   root.querySelectorAll('[data-topup-open]').forEach(b => b.onclick = topUpModal);
@@ -3203,7 +3356,7 @@ const planOfOrder = o => {
 const orderGrant = (o, dollars = false) => {
   const i = planInfo(planOfOrder(o));
   if (dollars) return i.topup ? `${usd(i.credit)} of extra usage that never expires` : `${usd(i.quota)} of usage per month for ${monthsLabel(i.months)}`;
-  return i.topup ? `${requestsText(i.credit)} of extra usage that never expire` : `${requestsText(i.quota)} per month for ${monthsLabel(i.months)}`;
+  return i.topup ? `${requestsText(i.credit)} of extra usage that never expires` : `${planRequests(i).main} over ${monthsLabel(i.months)}`;
 };
 // pending, confirming, underpaid, review, paid, expired, or failed.
 function orderState(o) {
@@ -3216,7 +3369,8 @@ function orderState(o) {
   if (confirmed.length) return 'review';
   return o.status === 'expired' ? 'expired' : 'pending';
 }
-const STATE_ICONS = { paid: CHECK, expired: '!', failed: '&times;', review: '!', underpaid: '!', pending: '<span class="spinner" aria-hidden="true"></span>', confirming: '<span class="spinner" aria-hidden="true"></span>' };
+const STATE_ICONS = { paid: CHECK, expired: ico('clock', 18), failed: ico('x', 18), review: ico('alert', 18), underpaid: ico('alert', 18), pending: '<span class="spinner" aria-hidden="true"></span>', confirming: '<span class="spinner" aria-hidden="true"></span>' };
+const STATE_LABELS = { pending: 'Waiting', confirming: 'Confirming', paid: 'Paid', expired: 'Expired', failed: 'Failed', review: 'Needs review', underpaid: 'Partly paid' };
 const STATE_TONES = { paid: 'ok', expired: 'warn', failed: 'danger', review: 'warn', underpaid: 'warn' };
 function orderMessage(o, state, i) {
   const quotes = o.quotes || [];
@@ -3230,7 +3384,7 @@ function orderMessage(o, state, i) {
     case 'confirming': return ['Payment detected', `The network has seen your transfer. Waiting for ${confirmations ? plural(confirmations, 'confirmation') : 'network confirmations'}. You can close this window: credit is added automatically.`];
     case 'underpaid': return ['Payment received, but it is not enough yet', `${usd(received)} of ${usd(price)} has been confirmed. Send the remaining ${usd(Math.max(0, price - received))} in any listed token to finish the order.${tolerance && Number(tolerance) > 0 ? ` Shortfalls up to ${tolerance}% are accepted.` : ''}${o.status === 'expired' ? ' The quote has expired: stablecoin transfers still count, native coin transfers need the operator.' : ''}`];
     case 'review': return ['A transfer needs review', `${flagged ? `${noteLabel(flagged.note)}. ` : ''}It was not counted towards this order. Contact the operator with the transaction hash shown below.`];
-    case 'paid': return ['Payment confirmed', `${i.topup ? `${requestsText(i.credit)} of extra usage were added. They never expire.` : `Your plan is active with ${requestsText(i.quota)} per month for ${monthsLabel(i.months)}.`}${received > price + 0.01 ? ` You sent ${usd(received)}: the purchase is applied once, so ask the operator about the extra ${usd(received - price)}.` : ''}`];
+    case 'paid': return ['Payment confirmed', `${i.topup ? `${requestsText(i.credit)} of extra usage were added and never expire.` : `Your plan is active for ${monthsLabel(i.months)} with ${planRequests(i).main} in total.`}${received > price + 0.01 ? ` You sent ${usd(received)}: the purchase is applied once, so ask the operator about the extra ${usd(received - price)}.` : ''}`];
     case 'expired': return ['This quote expired', 'Quotes are valid for a limited time. If you already sent a stablecoin it is still counted once it confirms. Otherwise start a new payment to get fresh amounts.'];
     default: return ['Payment not completed', 'This order was cancelled or failed. Contact the operator if you already sent funds.'];
   }
@@ -3262,28 +3416,33 @@ function payDetails(o, q, sel, state) {
     ${q ? `<p class="hint">Send the amount in one transfer. Several smaller transfers or tokens add up, and anything above the price is not credited.</p>` : ''}
     ${facts(rows)}
     <h4 class="sub-head">Order</h4>${planFacts(plan, { paidAt: o.paid_at })}
-    ${q ? `<div class="seg" role="group" aria-label="QR code content"><button type="button" data-qr="link" aria-pressed="${sel.qr === 'link'}">QR: payment request</button><button type="button" data-qr="address" aria-pressed="${sel.qr === 'address'}">QR: address only</button></div>
-    <p class="hint">${sel.qr === 'link' ? 'The payment request fills in the network, token, and amount in wallets that support it.' : 'Works with any wallet or exchange. Enter the amount yourself.'}</p>` : ''}
     ${transfersTable(o)}
   </details>`;
 }
+// One labelled value with its own copy button.
+const payField = (label, valueHtml, copy, copyLabel) => `<div class="pay-field"><div class="label">${esc(label)}</div><div class="pay-value">${valueHtml}<button type="button" class="small ghost" data-copy-value="${esc(copy)}" data-copy-label="${esc(copyLabel)}" aria-label="Copy ${esc(copyLabel.toLowerCase())}">${withIcon('copy', 'Copy')}</button></div></div>`;
 function payScreen(o, q, sel, state, banner) {
-  const content = sel.qr === 'link' ? paymentUri(q) : q.address;
+  const request = sel.qr === 'link' && Boolean(q.chain_id);
+  const content = request ? paymentUri(q) : q.address;
+  const change = (o.quotes || []).length > 1 && state === 'pending' ? '<button type="button" class="link" data-pay-change>Change</button>' : '';
   return `${banner}
     <div class="pay-main">
       <div class="pay-fields">
-        <div class="pay-row"><span class="label">Send exactly</span>
-          <div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span><button type="button" class="small primary" data-copy-value="${esc(q.amount)}" data-copy-label="${esc(q.symbol)} amount">${withIcon('copy', 'Copy')}</button></div>
-          <div class="pay-chip-row"><span class="net-chip">${esc(q.chain_name)}</span>${(o.quotes || []).length > 1 && state === 'pending' ? '<button type="button" class="link" data-pay-change>Change</button>' : ''}</div>
+        ${payField('Amount to send', `<span class="pay-amount-line"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span></span>`, q.amount, `${q.symbol} amount`)}
+        <div class="pay-pair">
+          ${payField('Network', `<span class="pay-text">${esc(q.chain_name)}</span>`, q.chain_name, 'Network')}
+          ${payField('Token', `<span class="pay-text">${esc(q.symbol)}</span>`, q.symbol, 'Token')}
         </div>
-        <div class="pay-row"><span class="label">To address</span>
-          <div class="pay-addr"><code>${esc(q.address)}</code></div>
-          <button type="button" class="small" data-copy-value="${esc(q.address)}" data-copy-label="${esc(q.chain_name)} address">${withIcon('copy', 'Copy address')}</button>
-        </div>
+        ${change}
+        ${payField('Address', `<code class="pay-addr-text">${esc(q.address)}</code>`, q.address, `${q.chain_name} address`)}
       </div>
-      <div class="pay-qr">${qrSvg(content, `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}`) || qrSvg(q.address)}</div>
+      <div class="pay-qr">
+        <div class="qr-frame">${qrSvg(content, request ? `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}` : `QR code of the ${q.chain_name} address`) || qrSvg(q.address)}</div>
+        ${q.chain_id ? `<div class="seg-group"><span class="seg-label" id="qr-mode-label">QR code contains</span><div class="seg" role="group" aria-labelledby="qr-mode-label"><button type="button" data-qr="link" aria-pressed="${sel.qr === 'link'}">Payment request</button><button type="button" data-qr="address" aria-pressed="${sel.qr === 'address'}">Address only</button></div></div>` : ''}
+        <p class="hint qr-caption" aria-live="polite">${request ? `Encodes the network, token, and amount. Wallets that support payment requests fill them in.` : 'Encodes the address only. Enter the amount yourself.'}</p>
+      </div>
     </div>
-    <p class="warn-line">Send only ${esc(q.symbol)} on ${esc(q.chain_name)}. Other tokens or networks can be lost.</p>`;
+    ${alertBox('warn', `Send only ${q.symbol} on ${q.chain_name}`, 'Other tokens or networks can be lost.')}`;
 }
 function cryptoView(o, sel) {
   const state = orderState(o);
@@ -3306,7 +3465,7 @@ function cryptoView(o, sel) {
   const waiting = state === 'pending' && o.expires_at;
   const banner = `<div class="pay-state tone-${STATE_TONES[state] || 'info'}" role="status">
       <span class="pay-state-icon" aria-hidden="true">${STATE_ICONS[state]}</span>
-      <div><strong>${esc(title)}</strong><p>${esc(text)}</p></div>
+      <div><span class="pay-status">${pill(STATE_LABELS[state] || state, STATE_TONES[state] || 'info')}</span><strong>${esc(title)}</strong><p>${esc(text)}</p></div>
       ${waiting ? `<span class="pay-timer" title="Quote valid until ${esc(date(o.expires_at))}"><span class="hint">Expires in</span><strong data-countdown="${esc(o.expires_at)}">${esc(countdown(o.expires_at - nowSeconds()))}</strong></span>` : ''}
     </div>`;
   // Step A: pick the network and token when there is a choice to make.
@@ -3319,14 +3478,14 @@ function cryptoView(o, sel) {
         <div><label for="pay-chain">Network</label><select id="pay-chain" data-pick-chain>${networks.map(([chain, name]) => `<option value="${esc(chain)}"${chain === q.chain ? ' selected' : ''}>${esc(name)}</option>`).join('')}</select></div>
         <div><label for="pay-asset">Token</label><select id="pay-asset" data-pick-asset>${tokens.map(x => `<option value="${esc(x.asset)}"${x.asset === q.asset ? ' selected' : ''}>${esc(x.symbol)}</option>`).join('')}</select></div>
       </div>
-      <div class="pick-amount"><span class="label">You will send</span><div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span></div><span class="hint">on ${esc(q.chain_name)} &middot; ${esc(RATE_NOTE(q))}</span></div>
+      <div class="pick-amount"><span class="label">You will send</span><div class="pay-big"><span class="pay-num">${esc(q.amount)}</span><span class="pay-sym">${esc(q.symbol)}</span></div><span class="hint">on ${esc(q.chain_name)}, ${esc(RATE_NOTE(q))}</span></div>
       <div class="actions sticky-actions"><button type="button" class="ghost" data-pay-cancel>Cancel</button><button type="submit" class="primary" data-pay-go>Continue</button></div>
     </form>`;
   }
   let main, actions;
   if (q) {
     main = payScreen(o, q, sel, state, banner);
-    actions = '<button type="button" class="primary" data-pay-done>I have sent it</button>';
+    actions = `${state === 'pending' ? '<button type="button" class="ghost" data-pay-later>Pay later</button>' : ''}<button type="button" class="primary" data-pay-done>${state === 'pending' ? 'I have sent it' : 'Close'}</button>`;
   } else {
     main = banner;
     actions = state === 'paid' ? '<button type="button" class="primary" data-pay-done>Done</button>'
@@ -3363,6 +3522,7 @@ function runOrder(d, initial) {
       d.close();
     });
     box.querySelector('[data-pay-cancel]')?.addEventListener('click', () => d.close());
+    box.querySelector('[data-pay-later]')?.addEventListener('click', () => d.close());
     box.querySelector('[data-pay-again]')?.addEventListener('click', () => {
       const plan = planCatalog.plans.find(p => p.code === order.plan_code);
       d.close();
@@ -3416,7 +3576,7 @@ function runOrder(d, initial) {
   });
 }
 function cryptoOrder(initial) {
-  modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'wide sheet');
+  modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'wide sheet', 'Send the exact amount. This window updates by itself.');
 }
 // A customer's view of one of their payments, card or crypto.
 async function receiptModal(id) {
@@ -3560,7 +3720,7 @@ function consentFrame(inner) {
 }
 function consentMessage({ ok = false, title, text, redirect = '', returnLabel = 'Return to app' }) {
   consentFrame(`<div class="consent-state" role="${ok ? 'status' : 'alert'}">
-      <div class="badge${ok ? '' : ' bad'}" aria-hidden="true">${ok ? '&#10003;' : '!'}</div>
+      <div class="badge${ok ? '' : ' bad'}" aria-hidden="true">${ico(ok ? 'check' : 'alert', 26)}</div>
       <h1 id="consent-title">${esc(title)}</h1>
       <p>${esc(text)}</p>
       <div class="actions">${redirect
@@ -3631,13 +3791,13 @@ async function oauthConsent() {
             <input id="consent-name" name="name" maxlength="80" value="${esc(clientName.slice(0, 80))}" autocomplete="off">
             <label for="consent-contact">Contact (optional)</label>
             <input id="consent-contact" name="contact" type="email" placeholder="you@example.com" autocomplete="email">
-            <p class="field-help">New accounts receive evaluation credit. No card needed.</p>
-            <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span>Verifying you're human...</span></div><progress max="100" value="0"></progress></div>
-            <div class="actions"><button type="button" class="ghost" data-make-account>${withIcon('plus', 'Create account')}</button></div>
+            <p class="field-help">New accounts get free trial usage. No card needed.</p>
+            <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span>Checking that you are human...</span></div><progress max="100" value="0"></progress></div>
             ${clickwrap('Create account')}
+            <div class="actions"><button type="button" class="primary" data-make-account>${withIcon('plus', 'Create account')}</button></div>
           </div>
           <div data-created hidden>
-            <div class="callout info"><strong>Account created</strong><p>Save your credentials, then choose Allow to finish connecting.</p><div class="actions"><button type="button" class="small" data-show-secrets>Show credentials</button></div></div>
+            ${alertBox('success', 'Account created', 'Save your credentials, then choose Allow to finish connecting.', { actions: '<button type="button" class="small" data-show-secrets>Show credentials</button>' })}
           </div>
         </div>
       </div>

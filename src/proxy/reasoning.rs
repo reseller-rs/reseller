@@ -6,7 +6,7 @@
 //! upstream model:
 //!
 //! - A configured model with levels: an unsupported requested level is a 400
-//!   before anything is sent upstream; a missing level gets the model's
+//!   before anything is sent upstream, and a missing level gets the model's
 //!   `default`.
 //! - A configured model without levels has no reasoning control: the
 //!   parameter is removed, so the upstream cannot reject it.
@@ -92,7 +92,7 @@ fn higher(level: &str, than: &str) -> bool {
     matches!((effort_rank(level), effort_rank(than)), (Some(a), Some(b)) if a > b)
 }
 
-/// Applies the policy for `model` to `body`. `free` caps the level;
+/// Applies the policy for `model` to `body`. `free` caps the level, and
 /// `strict` turns an unsupported level into a 400 (the requested model)
 /// rather than mapping it down (fallback models).
 pub fn apply(
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(b, json!({"reasoning_effort":"low"}));
         let b = run(json!({}), CHAT, "r1", true, true).unwrap();
         assert_eq!(b, json!({"reasoning_effort":"low"}));
-        // Lower requests stay; a model without "low" gets its lowest level.
+        // Lower requests stay, and a model without "low" gets its lowest level.
         let b = run(json!({"reasoning_effort":"low"}), CHAT, "r1", true, true).unwrap();
         assert_eq!(b, json!({"reasoning_effort":"low"}));
         let b = run(json!({}), CHAT, "mini", true, true).unwrap();

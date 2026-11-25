@@ -287,7 +287,7 @@ public_url = "http://localhost:56787"
 # free_effort = "low"
 
 # Levels each upstream model accepts. An unsupported level is rejected with 400
-# before forwarding; efforts = [] removes the parameter for models without
+# before forwarding. efforts = [] removes the parameter for models without
 # reasoning control. Unlisted models pass the client's value through.
 # [reasoning.models."deepseek/deepseek-v4.1-flash-1017"]
 # efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -645,8 +645,8 @@ api_key = "sk-replace-with-your-upstream-key"
 # [payroof]
 
 # Give every account a standing deposit address. Confirmed USDC or USDT
-# transfers credit the account once. Default: true.
-# deposits = true
+# transfers credit the account once. Default: false.
+# deposits = false
 
 # Typical minutes from a deposit until it is credited, shown to customers.
 # Must be between 1 and 1440. Default: 5.

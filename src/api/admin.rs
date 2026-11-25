@@ -143,7 +143,7 @@ async fn list_accounts(app: &App, q: &Query) -> Result<Value> {
         _ => "created_at",
     };
     // `order` and the direction come from fixed whitelists. `balance_micro`
-    // matches `db::balance`; `billed_micro` is the lifetime spend of all keys.
+    // matches `db::balance`, and `billed_micro` is the lifetime spend of all keys.
     let sql = format!(
         "SELECT a.*,\
            COALESCE((SELECT SUM(c.remaining_micro) FROM credits c WHERE c.account_id=a.id \

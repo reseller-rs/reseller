@@ -285,7 +285,7 @@ mod tests {
         assert!(page.contains("a=1&amp;b=2"));
         assert!(!page.contains("</script><script>alert"));
         assert!(!page.contains("{{"));
-        // The default theme follows the device; the app applies it.
+        // The default theme follows the device, and the app applies it.
         assert!(page.contains("name=\"color-scheme\" content=\"dark light\""));
         assert!(page.contains("\"request_estimate_usd\":\"0.001\""));
     }

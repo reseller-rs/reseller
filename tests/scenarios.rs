@@ -40,7 +40,7 @@ impl Test {
                 ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
-                // Halving is on by default; these tests expect full trial credit.
+                // Halving is on by default, but these tests expect full trial credit.
                 free_credit_halving: false,
                 ..Default::default()
             },
@@ -1470,8 +1470,8 @@ async fn markup_resolution_prefers_key_then_account_then_global() {
 // Settings and credentials
 // ---------------------------------------------------------------------------
 
-/// Changing the key pepper invalidates existing keys and unredeemed codes;
-/// the admin token is unaffected. Freshly issued credentials work.
+/// Changing the key pepper invalidates existing keys and unredeemed codes.
+/// The admin token is unaffected. Freshly issued credentials work.
 #[tokio::test]
 async fn key_pepper_rotation_invalidates_keys_and_unredeemed_codes() {
     let t = Test::new().await;
@@ -3591,9 +3591,9 @@ async fn admin_top_ups_are_idempotent_by_key() {
 }
 
 /// Signing up with `accept_terms` records acceptance of the Terms and
-/// Privacy Policy (and with it the consumption-data consent); the plan
+/// Privacy Policy (and with it the consumption-data consent). The plan
 /// catalogue seeds only the three subscriptions and carries the request
-/// estimate the UI uses; the legal pages are served.
+/// estimate the UI uses, and the legal pages are served.
 #[tokio::test]
 async fn signup_terms_acceptance_plans_and_legal_pages() {
     let t = Test::new().await;

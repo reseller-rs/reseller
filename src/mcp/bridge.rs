@@ -436,7 +436,7 @@ impl Bridge {
     /// Handles one JSON-RPC message. Returns `None` for notifications and responses.
     ///
     /// Era selection follows the stdio rules: a request with modern `_meta`
-    /// is served statelessly; `initialize` opens the legacy 2025-11-25 era
+    /// is served statelessly, and `initialize` opens the legacy 2025-11-25 era
     /// for the rest of the process. Anything else without `_meta` is
     /// malformed.
     pub async fn handle(&self, message: Value) -> Option<Value> {

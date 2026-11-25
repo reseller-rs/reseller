@@ -62,7 +62,7 @@ pub struct Payroof {
     /// Accepted underpayment, in percent of the order price.
     pub underpayment_tolerance_pct: String,
     /// Give every account a standing deposit address. Stablecoin transfers
-    /// to it are credited automatically.
+    /// to it are credited automatically. Off by default.
     pub deposits: bool,
     /// Typical minutes from a deposit until it is credited. Shown to
     /// customers only.
@@ -98,7 +98,7 @@ impl Default for Payroof {
             native_rates_usd: BTreeMap::new(),
             quote_ttl_minutes: 60,
             underpayment_tolerance_pct: "0.5".into(),
-            deposits: true,
+            deposits: false,
             deposit_eta_minutes: 5,
         }
     }

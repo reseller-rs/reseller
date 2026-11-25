@@ -419,7 +419,9 @@ async fn configure_payroof(t: &Test, base: &str) {
             json!({"payroof": {
                 "api_url": base, "project": "shop", "token": "prf_test_token",
                 "webhook_secret": WHSEC, "rate_url": format!("{base}/simple/price"),
-                "chains": ["eip155:1", "eip155:56"]
+                "chains": ["eip155:1", "eip155:56"],
+                // Standing deposit addresses are off by default.
+                "deposits": true
             }}),
         )
         .await;
@@ -1455,7 +1457,7 @@ async fn new_accounts_get_the_default_or_configured_trial_credit() {
     let t = Test::new().await;
     let k = t.key().await;
     assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.1");
-    // Halving is on by default; this test is about the configured amount only.
+    // Halving is on by default, but this test is about the configured amount only.
     t.app.config_mut().await.signup.free_credit_halving = false;
     t.app.config_mut().await.signup.free_credit_usd = "0.75".into();
     let k = t.key().await;
@@ -1488,7 +1490,7 @@ async fn halving_gives_each_further_signup_from_one_ip_half_the_trial() {
         assert_eq!(v["trial_credit_usd"], expected);
         assert_eq!(t.balance(v["account_id"].as_str().unwrap()).await, expected);
     }
-    // The fifth is over the monthly allowance; another IP starts at full credit.
+    // The fifth is over the monthly allowance. Another IP starts at full credit.
     assert!(signup("203.0.113.9").await.is_err());
     let other = signup("198.51.100.4").await.unwrap();
     assert_eq!(other["trial_credit_usd"], "0.1");
@@ -1506,7 +1508,7 @@ async fn halving_gives_each_further_signup_from_one_ip_half_the_trial() {
 #[tokio::test]
 async fn overview_splits_credit_and_keys_by_account_status() {
     let t = Test::new().await;
-    // Halving is on by default; both keys must get the full trial credit here.
+    // Halving is on by default, but both keys must get the full trial credit here.
     t.app.config_mut().await.signup.free_credit_halving = false;
     let active = t.key().await;
     let suspended = t.key().await;
@@ -2180,7 +2182,7 @@ async fn apple_verify_credits_once_and_binds_the_account() {
 }
 
 /// A transaction id is looked up with the Server API (signed with the .p8
-/// key); without the key the lookup is unavailable.
+/// key). Without the key the lookup is unavailable.
 #[tokio::test]
 async fn apple_verify_by_transaction_id_calls_the_server_api() {
     let e = apple_env().await;
@@ -2250,7 +2252,7 @@ async fn apple_verify_by_transaction_id_calls_the_server_api() {
     );
 }
 
-/// The store endpoint hands out a stable token and the sellable plans;
+/// The store endpoint hands out a stable token and the sellable plans, and
 /// consent can be set and withdrawn.
 #[tokio::test]
 async fn account_store_info_and_consumption_consent() {
@@ -3050,8 +3052,8 @@ async fn google_one_time_verify_credits_quantity_and_consumes() {
 }
 
 /// Renewal notifications extend the subscription once per purchase and the
-/// same Pub/Sub message is never applied twice; cancellation stops renewal;
-/// notifications for another package are ignored.
+/// same Pub/Sub message is never applied twice. Cancellation stops renewal,
+/// and notifications for another package are ignored.
 #[tokio::test]
 async fn google_renewal_notifications_grant_once_and_dedupe_messages() {
     let e = google_env().await;

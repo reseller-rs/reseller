@@ -170,21 +170,21 @@ Defaults appear in parentheses.
 
 | Section | Purpose |
 |---|---|
-| Top level | `public_url` (`http://localhost:56787`), `admin_token`, `key_pepper` (both at least 24 characters, generated if unset), `model_policy` and `voice_policy` (`default`, `force`, or `passthrough`; default `default`), `markup_pct` (`30`), `require_key` (`true`), `accept_any_token` (`false`), `trust_proxy` (`false`), `cors_origin` (empty), `max_json_body_bytes` (50 MiB), `max_stream_body_bytes` (512 MiB), `upstream_timeout_seconds` (300), `log_retention_days` (30), `max_log_entries` (5000) |
+| Top level | `public_url` (`http://localhost:56787`), `admin_token`, `key_pepper` (both at least 24 characters, generated if unset), `model_policy` and `voice_policy` (`default`, `force`, or `passthrough`, default `default`), `markup_pct` (`30`), `require_key` (`true`), `accept_any_token` (`false`), `trust_proxy` (`false`), `cors_origin` (empty), `max_json_body_bytes` (50 MiB), `max_stream_body_bytes` (512 MiB), `upstream_timeout_seconds` (300), `log_retention_days` (30), `max_log_entries` (5000) |
 | `[branding]` | White-label name, copy, logos, colours, and CSS (see [Branding and themes](#branding-and-themes)) |
-| `[llm]`, `[tts]`, `[stt]`, `[image]` | Upstreams: `base_url` (`https://api.openai.com/v1`), `api_key`, `model`, `fallbacks` (max 10), `timeout_seconds` (0 uses `upstream_timeout_seconds`, max 3600), and `headers` (max 20; credential and framing headers are refused). `[tts]` also has `voice`. |
+| `[llm]`, `[tts]`, `[stt]`, `[image]` | Upstreams: `base_url` (`https://api.openai.com/v1`), `api_key`, `model`, `fallbacks` (max 10), `timeout_seconds` (0 uses `upstream_timeout_seconds`, max 3600), and `headers` (max 20, credential and framing headers are refused). `[tts]` also has `voice`. |
 | `[prices.<model>]` | Upstream prices in USD (see [Pricing and metering](#pricing-and-metering)) |
-| `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.10"`), `free_credit_halving` (`true`; when true each further signup from the same IP in a calendar month gets half the previous trial credit, so with `ip_limit_per_month = 4` and `"0.1"` the signups get $0.1, $0.05, $0.025, and $0.0125), `free_credit_expiry_days` (30; 0 means never; max 3650), `ip_limit_per_month` (4; 0 turns it off), `cooldown_seconds` (30; 0 turns it off), `global_hourly_limit` (100; 0 turns it off), `pow_max_number` (100000; 0 disables proof of work; max 10000000), `pow_ttl_seconds` (300; 10 to 86400), `adaptive_pow` (`true`), `pow_max_number_ceiling` (1000000; from `pow_max_number` to 10000000), `adaptive_pow_reset_minutes` (30; 1 to 1440), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
-| `[keys]` | `max_per_account` (10 active keys; must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours; 0 turns it off), `rotate_cooldown_seconds` (300; 0 turns it off; max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new account's first key; child keys inherit their parent's limits) |
+| `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.10"`), `free_credit_halving` (`true`, when true each further signup from the same IP in a calendar month gets half the previous trial credit, so with `ip_limit_per_month = 4` and `"0.1"` the signups get $0.1, $0.05, $0.025, and $0.0125), `free_credit_expiry_days` (30, 0 means never, max 3650), `ip_limit_per_month` (4, 0 turns it off), `cooldown_seconds` (30, 0 turns it off), `global_hourly_limit` (100, 0 turns it off), `pow_max_number` (100000, 0 disables proof of work, max 10000000), `pow_ttl_seconds` (300, 10 to 86400), `adaptive_pow` (`true`), `pow_max_number_ceiling` (1000000, from `pow_max_number` to 10000000), `adaptive_pow_reset_minutes` (30, 1 to 1440), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
+| `[keys]` | `max_per_account` (10 active keys, must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours, 0 turns it off), `rotate_cooldown_seconds` (300, 0 turns it off, max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new account's first key, child keys inherit their parent's limits) |
 | `[rate_limits]` | `management_per_minute` (120), `auth_failures_per_hour` (20), `max_concurrent_requests` (8), `checkouts_per_hour` (10), `redeem_failures_per_hour` (10), `challenges_per_minute` (10), `new_account_hours` (48) and `new_account_daily_spend_pct` (`"20"`): the new-account spending cap (see [Refund protection](#refund-protection)). 0 disables each one. |
 | `[reasoning]` | `free_effort` (`"low"`) and `[reasoning.models."<upstream model>"]` with `efforts` and `default` (see [Reasoning effort](#reasoning-effort)) |
-| `[billing]` | `request_estimate_usd` (`"0.001"`, the typical billed cost of one request, used to show customers approximate request counts), `default_max_output_tokens` (4096, held for LLM requests without an output limit), `min_hold_usd` (`"0.01"`, the smallest hold per request), `refund_ip_block_days` (30; 0 turns the address block off), `refund_decline_pct` (50; share of a purchase that must be used before refund answers ask the store to decline) |
-| `[mcp]` | `enabled` (`true`), `oauth` (`true`; OAuth sign-in for `/mcp`, see [MCP](#mcp)), and `max_media_bytes` (16 MiB; 1 byte to 256 MiB), the largest audio or image returned inline |
+| `[billing]` | `request_estimate_usd` (`"0.001"`, the typical billed cost of one request, used to show customers approximate request counts), `default_max_output_tokens` (4096, held for LLM requests without an output limit), `min_hold_usd` (`"0.01"`, the smallest hold per request), `refund_ip_block_days` (30, 0 turns the address block off), `refund_decline_pct` (50, share of a purchase that must be used before refund answers ask the store to decline) |
+| `[mcp]` | `enabled` (`true`), `oauth` (`true`, OAuth sign-in for `/mcp`, see [MCP](#mcp)), and `max_media_bytes` (16 MiB, 1 byte to 256 MiB), the largest audio or image returned inline |
 | `[stripe]` | `secret_key`, `webhook_secret` |
 | `[[models]]` | Public model catalog: `id`, `upstream`, `aliases`, `enabled`, `name`, `description`, `owned_by`, `created`, `context_length`, `input_modalities`, `output_modalities` (left empty, they derive from the upstream route that serves the model: chat text to text, TTS text to audio, STT audio to text, image text to image), `show_pricing` |
 | `[apple]` | App Store purchases: `bundle_id`, `app_apple_id`, `environment` (`production` or `sandbox`), `issuer_id`, `key_id`, `private_key` (the `.p8` PEM), `api_url` (empty uses Apple's host for the environment), `consumption_reporting` (`false`) |
 | `[google]` | Google Play purchases: `package_name`, `service_account_json`, `pubsub_audience` (empty uses `<public_url>/webhooks/google`), `pubsub_service_account`, `refund_review` (`false`), `api_url`, `certs_url` |
-| `[payroof]` | Crypto payments: `deposits` (`true`), `deposit_eta_minutes` (`5`), `project`, `token`, `webhook_secret`, `stablecoins`, `native_coins`, `chains`, rate source, `quote_ttl_minutes`, and `underpayment_tolerance_pct` (`0.5`) |
+| `[payroof]` | Crypto payments: `deposits` (`false`), `deposit_eta_minutes` (`5`), `project`, `token`, `webhook_secret`, `stablecoins`, `native_coins`, `chains`, rate source, `quote_ttl_minutes`, and `underpayment_tolerance_pct` (`0.5`) |
 
 ### Value formats
 
@@ -310,8 +310,8 @@ The held usage is priced like real usage, at the caller's markup, and never belo
 - **Admission.** The balance minus the holds of the account's requests in flight must cover the new hold. Key `requests`, `tokens`, and `spend` windows count settled usage plus in-flight holds plus the new request. So concurrent requests cannot overdraw the balance or overshoot a limit, whatever `max_concurrent_requests` allows.
 - **Settlement.** Settlement debits the actual cost and closes the row, which releases the hold. Each row settles exactly once (`finished=0` guard) and is retried in the background if the database is busy. Rows left unfinished by a crash are closed at startup and release their holds.
 - **Residual overrun.** A single request can still cost more than its hold:
-  - when the client set no output limit and the reply is longer than `default_max_output_tokens`;
-  - when a provider-reported `usage.cost` is higher than the price table;
+  - when the client set no output limit and the reply is longer than `default_max_output_tokens`
+  - when a provider-reported `usage.cost` is higher than the price table
   - for realtime sessions and uploads, whose usage is unknown up front.
 
   Such an overrun becomes account debt, and holds stop concurrency from multiplying it.
@@ -673,7 +673,7 @@ Failures use the OpenAI shape `{ "error": { "message": "...", "type": "...", "pa
 
 Agents can use the service through the Model Context Protocol. There are two ways to connect.
 
-- **Remote endpoint:** a stateless Streamable HTTP endpoint at `POST /mcp`. It supports protocol `2026-07-28` (current) and the legacy `2025-11-25` handshake. An `initialize` that asks for an older revision is answered with `2025-11-25`; requests that name an older revision in `MCP-Protocol-Version` are refused. Every request needs a credential: without one the answer is `401` with a `WWW-Authenticate` header that points OAuth clients to `/.well-known/oauth-protected-resource/mcp`.
+- **Remote endpoint:** a stateless Streamable HTTP endpoint at `POST /mcp`. It supports protocol `2026-07-28` (current) and the legacy `2025-11-25` handshake. An `initialize` that asks for an older revision is answered with `2025-11-25`. Requests that name an older revision in `MCP-Protocol-Version` are refused. Every request needs a credential: without one the answer is `401` with a `WWW-Authenticate` header that points OAuth clients to `/.well-known/oauth-protected-resource/mcp`.
 - **Local bridge:** `reseller mcp` runs next to the agent. It keeps credentials and the signup proof of work on the agent's machine.
 
 **Connect with OAuth.** Add `https://HOST/mcp` as a remote MCP server in Claude, ChatGPT, Cursor, or VS Code. The client registers itself (RFC 7591), and a browser page on this server asks you to sign in with an API key or dashboard token (or create an account) and to allow the connection. It uses PKCE `S256`, resource indicators, one-hour access tokens (`mcp_at_...`), and rotating refresh tokens that expire after 90 days idle. Tokens are bound to your key, stop working when the key does, and are valid on `/mcp` only. Customers revoke apps in the dashboard. `[mcp].oauth = false` turns this off. **Static bearer alternative:** send an API key or dashboard token as `Authorization: Bearer ...`. The administrator token works for generation tools only.
@@ -712,7 +712,7 @@ All routes live under `/admin/api`. They require the administrator token, sent a
 | `POST` | `/accounts/:id/credits` | Add credit: `amount_usd`, `source`, optional `expires_at` and `note`. Requires an `Idempotency-Key` header (see below) |
 | `POST` | `/accounts/:id/subscriptions` | Grant a plan (`plan_code`): a subscription starting now, or a top-up. Requires an `Idempotency-Key` header |
 | `GET` | `/plans` | List plans |
-| `POST` | `/plans` | Upsert a plan: `code`, `name`, `kind` (`subscription` or `topup`), `price_usd`, `monthly_quota_usd` and `months` (1 to 12) for a subscription or `credit_usd` for a top-up, optional `apple_product_id`, `google_product_id` (null clears; `409 product_id_in_use` when taken), `active`, and `description` |
+| `POST` | `/plans` | Upsert a plan: `code`, `name`, `kind` (`subscription` or `topup`), `price_usd`, `monthly_quota_usd` and `months` (1 to 12) for a subscription or `credit_usd` for a top-up, optional `apple_product_id`, `google_product_id` (null clears, `409 product_id_in_use` when taken), `active`, and `description` |
 | `DELETE` | `/plans/:code` | Delete only while unreferenced. Otherwise deactivate. |
 
 | `GET` | `/codes` | List redeem codes |
@@ -796,7 +796,7 @@ Customer-facing pages can be rebranded without rebuilding. Edit `branding` in **
 | `name`, `tagline`, `description` | Header, footer, page title (`name - tagline`), and meta description |
 | `logo_url`, `favicon_url` | A site path (for example `/theme/logo.svg`) or an `http(s)` URL. Empty uses the built-in mark. |
 | `theme_color` | Browser UI colour |
-| `color_scheme`, `theme_toggle` | Default theme for visitors who have not chosen one (`system` follows the device, or `dark` or `light`; default `system`), and whether the header shows the light/dark toggle (default `true`). The choice is kept in the browser's local storage. |
+| `color_scheme`, `theme_toggle` | Default theme for visitors who have not chosen one (`system` follows the device, or `dark` or `light`, default `system`), and whether the header shows the light/dark toggle (default `true`). The choice is kept in the browser's local storage. |
 | `legal_name`, `contact_email` | Operator name and contact used in the built-in Terms of Service (`/terms`) and Privacy Policy (`/privacy`) |
 | `terms_url`, `privacy_url` | External legal pages. These replace the built-in ones in links. |
 | `css_vars` | Overrides of the built-in CSS custom properties, written without `--`. Common keys include `accent`, `accent-2`, `accent-ink`, `bg`, `bg-soft`, `panel`, `panel-2`, `border`, `text`, `muted`, and `radius`. |
@@ -899,7 +899,7 @@ At checkout, Reseller allocates the order's Payroof reference. It stores a quote
 - Fixed `native_rates_usd` override the feed. Set `rate_source = "static"` to disable the feed.
 - Quotes hold for `quote_ttl_minutes`.
 
-Each account also has a standing deposit reference `acct-<account_id>`, unless `payroof.deposits` is `false`. `GET /v1/account` returns `top_up` with the addresses, assets, and `eta_minutes` (`payroof.deposit_eta_minutes`, default 5), plus `networks` (per chain: address, chain id, confirmations, accepted `tokens` with contract and decimals, explorer link templates) and `recent` deposits with a `state` of `confirming`, `credited`, or `not_credited`. A confirmed stablecoin transfer on an allowed chain credits the account once and never expires. Other assets are noted as `unsupported_asset` and not credited. An empty balance returns `402 insufficient_quota` with these instructions.
+With `payroof.deposits = true` (off by default), each account also has a standing deposit reference `acct-<account_id>`. `GET /v1/account` returns `top_up` with the addresses, assets, and `eta_minutes` (`payroof.deposit_eta_minutes`, default 5), plus `networks` (per chain: address, chain id, confirmations, accepted `tokens` with contract and decimals, explorer link templates) and `recent` deposits with a `state` of `confirming`, `credited`, or `not_credited`. A confirmed stablecoin transfer on an allowed chain credits the account once and never expires. Other assets are noted as `unsupported_asset` and not credited. An empty balance returns `402 insufficient_quota` with these instructions.
 
 The payment dialog shows each asset, network, amount, and deposit address. It updates itself until the order is paid.
 
@@ -919,7 +919,7 @@ Sweep received funds from your own wallet.
 Server-side setup:
 
 1. In App Store Connect, create the in-app purchases:
-   - an auto-renewable subscription for each subscription plan, in one subscription group;
+   - an auto-renewable subscription for each subscription plan, in one subscription group
    - a consumable for each top-up.
 2. Put the product ids into the plans' `apple_product_id` field (**Admin > Plans**).
 3. Set `apple.bundle_id`, `apple.app_apple_id`, and `apple.environment`. Use `sandbox` for TestFlight and Xcode testing, and `production` for the live app.
@@ -978,8 +978,8 @@ Store orders are `payments` rows with `provider` set to `apple` or `google` and 
 
 Several unique indexes stop the same charge from crediting twice, whether the app, a retry, or a store notification delivers it, and in any order:
 
-- `(provider, external_id)`, where `external_id` is the App Store `transactionId` or the Google Play `orderId` (each renewal has its own);
-- the Google Play one-time `purchase_token`;
+- `(provider, external_id)`, where `external_id` is the App Store `transactionId` or the Google Play `orderId` (each renewal has its own)
+- the Google Play one-time `purchase_token`
 - the subscription's `original_transaction_id` and `purchase_token`.
 
 ### Refund protection
@@ -990,18 +990,18 @@ Apple and Google decide refunds, not the customer, and the usage behind a refund
 
   20% per day means at most about 40% of a month's allowance can be used before the window closes. That is still far more than a typical day (a uniform month uses about 3.3% per day), so honest new customers rarely hit it. It also keeps a buy-burn-refund evening well below a full allowance. Accounts with only trial credit are already bounded by that credit.
 - **Refund or voided purchase.** The following happens at once:
-  - every credit lot is zeroed;
-  - subscriptions end;
-  - the account is suspended (`suspended_reason: "refund"`) and its keys are blocked;
-  - the signup address may not open new accounts for `billing.refund_ip_block_days` (30; 0 turns this off);
+  - every credit lot is zeroed
+  - subscriptions end
+  - the account is suspended (`suspended_reason: "refund"`) and its keys are blocked
+  - the signup address may not open new accounts for `billing.refund_ip_block_days` (30, 0 turns this off)
   - for the App Store, the subscription's `originalTransactionId` is blocked, so a later purchase by the same Apple ID on a new account suspends that account too.
 
   Google Play exposes no stable customer id across accounts, so the address block is the only cross-account guard there. Reactivate a wrongly blocked account in **Admin > Accounts**.
 - **Apple Consumption Information.** The server can answer Apple's `CONSUMPTION_REQUEST` with **Send Consumption Information v2** (`PUT /inApps/v2/transactions/consumption/{transactionId}`). Apple expects an answer within 12 hours, and the server sends it at once. To enable it, set `apple.consumption_reporting = true`, which needs the API key. The body has these fields:
-  - `customerConsented: true`;
-  - `consumptionPercentage`, the share of the purchase used in thousandths of a percent (omitted for auto-renewable subscriptions, as Apple requires);
-  - `deliveryStatus: "DELIVERED"`;
-  - `sampleContentProvided`, true when signup grants trial credit;
+  - `customerConsented: true`
+  - `consumptionPercentage`, the share of the purchase used in thousandths of a percent (omitted for auto-renewable subscriptions, as Apple requires)
+  - `deliveryStatus: "DELIVERED"`
+  - `sampleContentProvided`, true when signup grants trial credit
   - `refundPreference`: `GRANT_FULL` when nothing was used, `DECLINE` from `billing.refund_decline_pct` (50%) used, and `GRANT_PRORATED` in between.
 
   Apple accepts consumption data only with the customer's consent. The server answers only for accounts with `consumption_consent` set.
