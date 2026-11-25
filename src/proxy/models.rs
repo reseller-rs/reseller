@@ -100,16 +100,30 @@ fn entry(config: &Config, identity: Option<&Identity>, model: &Model) -> Value {
     if let Some(length) = model.context_length {
         out["context_length"] = length.into();
     }
-    if !model.input_modalities.is_empty() && !model.output_modalities.is_empty() {
-        out["architecture"] = json!({
-            "input_modalities": model.input_modalities,
-            "output_modalities": model.output_modalities,
-            "modality": format!(
+    let resolved = model.resolved(config);
+    let mut architecture = serde_json::Map::new();
+    if !resolved.input.is_empty() {
+        architecture.insert("input_modalities".into(), json!(resolved.input));
+    }
+    if !resolved.output.is_empty() {
+        architecture.insert("output_modalities".into(), json!(resolved.output));
+    }
+    if !resolved.input.is_empty() && !resolved.output.is_empty() {
+        architecture.insert(
+            "modality".into(),
+            format!(
                 "{}->{}",
-                model.input_modalities.join("+"),
-                model.output_modalities.join("+")
-            ),
-        });
+                resolved.input.join("+"),
+                resolved.output.join("+")
+            )
+            .into(),
+        );
+    }
+    if let Some(capability) = resolved.capability {
+        architecture.insert("capability".into(), capability.as_str().into());
+    }
+    if !architecture.is_empty() {
+        out["architecture"] = architecture.into();
     }
     if model.show_pricing
         && let Some(pricing) = pricing(config, identity, model.upstream_name())
@@ -140,6 +154,14 @@ fn pricing(config: &Config, identity: Option<&Identity>, upstream: &str) -> Opti
         out["input_cache_read"] = unit(cached, 1_000_000)?.into();
     }
     out["image"] = unit(&price.image, 1)?.into();
+    for (key, usd, per) in [
+        ("audio_second", &price.audio_second, 1),
+        ("characters", &price.characters, 1_000_000),
+    ] {
+        if !money::decimal(usd).ok()?.is_zero() {
+            out[key] = unit(usd, per)?.into();
+        }
+    }
     if !money::decimal(&price.request).ok()?.is_zero() {
         out["request"] = unit(&price.request, 1)?.into();
     }
@@ -198,6 +220,7 @@ mod tests {
                 created: 1_700_000_000,
                 context_length: Some(128_000),
                 input_modalities: vec!["text".into(), "image".into()],
+                output_modalities: vec!["text".into()],
                 show_pricing: true,
                 ..model("fast")
             },
@@ -247,7 +270,13 @@ mod tests {
         let plain = &list["data"][1];
         assert_eq!(plain["owned_by"], "Acme", "empty owner is the brand");
         assert_eq!(plain["created"], 0);
-        for absent in ["name", "description", "context_length", "pricing"] {
+        for absent in [
+            "name",
+            "description",
+            "context_length",
+            "pricing",
+            "architecture",
+        ] {
             assert!(plain.get(absent).is_none(), "{absent}");
         }
         assert!(!list.to_string().contains("vendor/fast-1"), "upstream name");
@@ -276,6 +305,19 @@ mod tests {
         // Optional prices are left out when unset or zero.
         config.prices.get_mut("vendor/fast-1").unwrap().cached_input = None;
         config.prices.get_mut("vendor/fast-1").unwrap().request = "0".into();
+        assert!(
+            list(&config, None)["data"][0]["pricing"]
+                .get("characters")
+                .is_none()
+        );
+        let price = config.prices.get_mut("vendor/fast-1").unwrap();
+        price.audio_second = "0.001".into();
+        price.characters = "15".into();
+        let speech = &list(&config, None)["data"][0]["pricing"];
+        assert_eq!(speech["audio_second"], "0.0013");
+        assert_eq!(speech["characters"], "0.0000195");
+        let price = config.prices.get_mut("vendor/fast-1").unwrap();
+        (price.audio_second, price.characters) = ("0".into(), "0".into());
         let pricing = &list(&config, None)["data"][0]["pricing"];
         assert!(pricing.get("input_cache_read").is_none() && pricing.get("request").is_none());
     }
@@ -336,7 +378,24 @@ mod tests {
         assert_eq!(ids(&list), ["m", "backup", "tts-1"]);
         assert_eq!(
             list["data"][0],
-            json!({"id": "m", "object": "model", "created": 0, "owned_by": "Acme"})
+            json!({
+                "id": "m", "object": "model", "created": 0, "owned_by": "Acme",
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"],
+                    "modality": "text->text",
+                    "capability": "chat",
+                },
+            })
+        );
+        assert_eq!(
+            list["data"][2]["architecture"],
+            json!({
+                "input_modalities": ["text"],
+                "output_modalities": ["audio"],
+                "modality": "text->audio",
+                "capability": "speech",
+            })
         );
         let key = identity(&["BACKUP"], "30");
         assert_eq!(ids(&super::list(&config, Some(&key))), ["backup"]);

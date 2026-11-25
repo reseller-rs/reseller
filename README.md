@@ -179,7 +179,7 @@ Defaults appear in parentheses.
 | `[rate_limits]` | `management_per_minute` (120), `auth_failures_per_hour` (20), `max_concurrent_requests` (8), `checkouts_per_hour` (10), `redeem_failures_per_hour` (10), `challenges_per_minute` (10). 0 disables each one. |
 | `[mcp]` | `enabled` (`true`), `oauth` (`true`; OAuth sign-in for `/mcp`, see [MCP](#mcp)), and `max_media_bytes` (16 MiB; 1 byte to 256 MiB), the largest audio or image returned inline |
 | `[stripe]` | `secret_key`, `webhook_secret` |
-| `[[models]]` | Public model catalog: `id`, `upstream`, `aliases`, `enabled`, `name`, `description`, `owned_by`, `created`, `context_length`, `input_modalities`, `output_modalities`, `show_pricing` |
+| `[[models]]` | Public model catalog: `id`, `upstream`, `aliases`, `enabled`, `name`, `description`, `owned_by`, `created`, `context_length`, `input_modalities`, `output_modalities` (left empty, they derive from the upstream route that serves the model: chat text to text, TTS text to audio, STT audio to text, image text to image), `show_pricing` |
 | `[payroof]` | Crypto payments: `deposits` (`true`), `deposit_eta_minutes` (`5`), `project`, `token`, `webhook_secret`, `stablecoins`, `native_coins`, `chains`, rate source, `quote_ttl_minutes`, and `underpayment_tolerance_pct` (`0.5`) |
 
 ### Value formats
@@ -424,7 +424,7 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `GET` | `/v1/keys/:id` | Any | One of the caller's keys with its 30-day usage series |
 | `PATCH` | `/v1/keys/:id` | Any | Rename or block (`{"name"?, "status":"blocked"}`). Customers cannot reactivate a key. |
 | `POST` | `/v1/keys/:id/rotate` | Any | Replace the key and keep its limits, pricing, expiry, usage windows (so rotating does not reset limits), and connected OAuth apps. The old key is blocked. |
-| `GET` | `/v1/models` | Key | Model catalog, local and not metered |
+| `GET` | `/v1/models` | Key | Model catalog, local and not metered. `architecture` carries modalities and a `capability` (`chat`, `speech`, `transcription`, `image`) |
 | `GET` | `/v1/models/:id` | Key | One catalog entry, or `404 model_not_found` |
 | `GET` | `/v1/account/models` | Any | The `/v1/models` list for the caller's key, also with a dashboard token |
 | `GET` | `/v1/account` | Any | Account, balance, lifetime `billed_usd`, credit lots, subscription, and `top_up` instructions |
@@ -765,7 +765,7 @@ At checkout, Reseller allocates the order's Payroof reference. It stores a quote
 - Fixed `native_rates_usd` override the feed. Set `rate_source = "static"` to disable the feed.
 - Quotes hold for `quote_ttl_minutes`.
 
-Each account also has a standing deposit reference `acct-<account_id>`, unless `payroof.deposits` is `false`. `GET /v1/account` returns `top_up` with the addresses, assets, and `eta_minutes` (`payroof.deposit_eta_minutes`, default 5). A confirmed stablecoin transfer on an allowed chain credits the account once and never expires. Other assets are noted as `unsupported_asset` and not credited. An empty balance returns `429 insufficient_quota` with these instructions.
+Each account also has a standing deposit reference `acct-<account_id>`, unless `payroof.deposits` is `false`. `GET /v1/account` returns `top_up` with the addresses, assets, and `eta_minutes` (`payroof.deposit_eta_minutes`, default 5), plus `networks` (per chain: address, chain id, confirmations, accepted `tokens` with contract and decimals, explorer link templates) and `recent` deposits with a `state` of `confirming`, `credited`, or `not_credited`. A confirmed stablecoin transfer on an allowed chain credits the account once and never expires. Other assets are noted as `unsupported_asset` and not credited. An empty balance returns `429 insufficient_quota` with these instructions.
 
 The payment dialog shows each asset, network, amount, and deposit address. It updates itself until the order is paid.
 

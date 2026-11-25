@@ -39,7 +39,10 @@ pub struct Model {
     /// Context window in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u64>,
+    /// Input modalities. Empty derives them from the upstream the entry
+    /// serves, see [`Model::resolved`].
     pub input_modalities: Vec<String>,
+    /// Output modalities. Empty derives them like `input_modalities`.
     pub output_modalities: Vec<String>,
     /// List the price, with the caller's markup applied.
     pub show_pricing: bool,
@@ -57,8 +60,8 @@ impl Default for Model {
             owned_by: String::new(),
             created: 0,
             context_length: None,
-            input_modalities: vec!["text".into()],
-            output_modalities: vec!["text".into()],
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
             show_pricing: false,
         }
     }
@@ -80,14 +83,33 @@ impl Model {
             || self.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
     }
 
-    /// A minimal enabled entry for a configured route model. It lists no
-    /// modalities.
+    /// A minimal enabled entry for a configured route model. Its modalities
+    /// are derived from the upstream it serves.
     fn route(id: &str) -> Self {
         Self {
             id: id.to_owned(),
-            input_modalities: Vec::new(),
-            output_modalities: Vec::new(),
             ..Self::default()
+        }
+    }
+
+    /// The capability, input and output modalities of this entry. Explicit
+    /// modalities win. Empty ones come from the upstream route that serves
+    /// the entry's upstream model, and stay empty when no route does.
+    pub fn resolved(&self, config: &Config) -> Resolved {
+        let capability = config.capability_of(self.upstream_name());
+        let pick = |explicit: &[String], derived: Option<&[&str]>| -> Vec<String> {
+            if !explicit.is_empty() {
+                explicit.to_vec()
+            } else {
+                derived
+                    .map(|d| d.iter().map(|m| (*m).to_owned()).collect())
+                    .unwrap_or_default()
+            }
+        };
+        Resolved {
+            capability,
+            input: pick(&self.input_modalities, capability.map(|c| c.input())),
+            output: pick(&self.output_modalities, capability.map(|c| c.output())),
         }
     }
 
@@ -126,18 +148,61 @@ impl Model {
             ("output_modalities", &self.output_modalities),
         ] {
             anyhow::ensure!(
-                (1..=MAX_MODALITIES).contains(&list.len())
+                list.len() <= MAX_MODALITIES
                     && list.iter().all(|m| {
                         (1..=MAX_MODALITY_CHARS).contains(&m.len())
                             && m.bytes()
                                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
                     }),
-                "models.{}: {field} needs 1-{MAX_MODALITIES} lowercase names such as \"text\"",
+                "models.{}: {field} takes at most {MAX_MODALITIES} lowercase names such as \"text\"",
                 self.id
             );
         }
         Ok(())
     }
+}
+
+/// What a model does, decided by the upstream route it is configured on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capability {
+    Chat,
+    Speech,
+    Transcription,
+    Image,
+}
+
+impl Capability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Speech => "speech",
+            Self::Transcription => "transcription",
+            Self::Image => "image",
+        }
+    }
+
+    fn input(self) -> &'static [&'static str] {
+        match self {
+            Self::Chat | Self::Speech | Self::Image => &["text"],
+            Self::Transcription => &["audio"],
+        }
+    }
+
+    fn output(self) -> &'static [&'static str] {
+        match self {
+            Self::Chat | Self::Transcription => &["text"],
+            Self::Speech => &["audio"],
+            Self::Image => &["image"],
+        }
+    }
+}
+
+/// A model's capability and modalities after derivation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub capability: Option<Capability>,
+    pub input: Vec<String>,
+    pub output: Vec<String>,
 }
 
 /// Checks one public or upstream model name.
@@ -177,15 +242,35 @@ impl Config {
             return Cow::Borrowed(&self.models);
         }
         let mut routes: Vec<&str> = Vec::new();
-        let configured = std::iter::once(&self.llm.model)
-            .chain(&self.llm.fallbacks)
-            .chain([&self.tts.model, &self.stt.model, &self.image.model]);
+        let configured = [&self.llm, &self.tts, &self.stt, &self.image]
+            .into_iter()
+            .flat_map(|u| std::iter::once(&u.model).chain(&u.fallbacks));
         for name in configured.filter(|m| !m.is_empty()) {
             if !routes.iter().any(|r| r.eq_ignore_ascii_case(name)) {
                 routes.push(name);
             }
         }
         Cow::Owned(routes.into_iter().map(Model::route).collect())
+    }
+
+    /// The capability of the upstream model `upstream`: the first route
+    /// (chat, speech, transcription, image) that lists it as its model or a
+    /// fallback.
+    pub fn capability_of(&self, upstream: &str) -> Option<Capability> {
+        let routes = [
+            (Capability::Chat, &self.llm),
+            (Capability::Speech, &self.tts),
+            (Capability::Transcription, &self.stt),
+            (Capability::Image, &self.image),
+        ];
+        routes
+            .into_iter()
+            .find(|(_, u)| {
+                std::iter::once(&u.model)
+                    .chain(&u.fallbacks)
+                    .any(|m| !m.is_empty() && m.eq_ignore_ascii_case(upstream))
+            })
+            .map(|(c, _)| c)
     }
 
     /// Whether a key with `limits` may use the upstream model `upstream`.
@@ -249,7 +334,7 @@ mod tests {
                 ..model("a")
             },
             Model {
-                input_modalities: Vec::new(),
+                input_modalities: vec!["text".into(); 9],
                 ..model("a")
             },
             Model {
@@ -286,10 +371,67 @@ mod tests {
         config.llm.fallbacks = vec!["backup".into(), "M".into()];
         config.stt.model = "whisper-1".into();
         config.image.model = "backup".into();
+        config.tts.fallbacks = vec!["voice-b".into()];
         let ids: Vec<_> = config.catalog().iter().map(|m| m.id.clone()).collect();
-        assert_eq!(ids, ["m", "backup", "whisper-1"]);
+        assert_eq!(ids, ["m", "backup", "voice-b", "whisper-1"]);
         config.models = vec![model("only")];
         assert_eq!(config.catalog().len(), 1);
+    }
+
+    #[test]
+    fn modalities_derive_from_the_serving_route() {
+        let mut config = Config::default();
+        config.llm.model = "chat-1".into();
+        config.llm.fallbacks = vec!["chat-2".into()];
+        config.tts.model = "voice-1".into();
+        config.tts.fallbacks = vec!["voice-2".into()];
+        config.stt.model = "ears-1".into();
+        config.image.model = "paint-1".into();
+        let strs = |v: &[String]| v.iter().map(String::as_str).collect::<Vec<_>>().join("+");
+        for (id, kind, input, output) in [
+            ("chat-1", Capability::Chat, "text", "text"),
+            ("CHAT-2", Capability::Chat, "text", "text"),
+            ("voice-1", Capability::Speech, "text", "audio"),
+            ("voice-2", Capability::Speech, "text", "audio"),
+            ("ears-1", Capability::Transcription, "audio", "text"),
+            ("paint-1", Capability::Image, "text", "image"),
+        ] {
+            let r = model(id).resolved(&config);
+            assert_eq!(r.capability, Some(kind), "{id}");
+            assert_eq!(
+                (strs(&r.input).as_str(), strs(&r.output).as_str()),
+                (input, output)
+            );
+        }
+        // An alias entry derives from its upstream, not its id.
+        let aliased = Model {
+            upstream: "voice-1".into(),
+            ..model("speaker")
+        };
+        assert_eq!(
+            aliased.resolved(&config).capability,
+            Some(Capability::Speech)
+        );
+        // Explicit modalities win, per side.
+        let explicit = Model {
+            input_modalities: vec!["text".into(), "image".into()],
+            ..model("chat-1")
+        };
+        let r = explicit.resolved(&config);
+        assert_eq!(
+            (strs(&r.input), strs(&r.output)),
+            ("text+image".into(), "text".into())
+        );
+        // No route, no guess.
+        let r = model("unknown").resolved(&config);
+        assert_eq!(
+            r,
+            Resolved {
+                capability: None,
+                input: vec![],
+                output: vec![]
+            }
+        );
     }
 
     #[test]

@@ -278,8 +278,8 @@ public_url = "http://localhost:56787"
 # owned_by = "Example"              # Default: branding.name.
 # created = 1735689600              # Unix seconds. Default: 0.
 # context_length = 128000
-# input_modalities = ["text", "image"]  # Default: ["text"].
-# output_modalities = ["text"]          # Default: ["text"].
+# input_modalities = ["text", "image"]  # Default: derived from the upstream
+# output_modalities = ["text"]          # route that serves it (chat, tts, stt, image).
 # show_pricing = false              # Show prices with your markup. Default: false.
 
 # =============================================================================

@@ -13,7 +13,9 @@
 //! The order is paid once the confirmed value covers the price, within the
 //! configured underpayment tolerance. Payments in several assets, or several
 //! transfers, add up.
-use super::{complete, create_order, deposits, first_delivery, provider_error, unavailable};
+use super::{
+    chains, complete, create_order, deposits, first_delivery, provider_error, unavailable,
+};
 use crate::{
     App,
     config::{Config, Payroof, RateSource},
@@ -60,6 +62,9 @@ pub struct Asset {
     pub id: String,
     pub symbol: String,
     pub decimals: u32,
+    /// Display name, when the catalog has one.
+    #[serde(default)]
+    pub name: String,
 }
 
 /// One chain in the project's public catalog.
@@ -489,10 +494,16 @@ pub(super) async fn checkout(
 pub fn quote_json(r: &SqliteRow) -> Value {
     let amount: String = r.get("amount");
     let decimals = u32::try_from(r.get::<i64, _>("decimals")).unwrap_or(0);
+    let chain: String = r.get("chain");
+    let asset: String = r.get("asset");
     json!({
-        "chain": r.get::<String, _>("chain"),
+        "chain_id": chains::eip155(&chain),
+        "contract": chains::contract(&asset),
+        "native": chains::contract(&asset).is_none(),
+        "explorer": chains::links(&chain),
+        "chain": chain,
         "chain_name": r.get::<String, _>("chain_name"),
-        "asset": r.get::<String, _>("asset"),
+        "asset": asset,
         "symbol": r.get::<String, _>("symbol"),
         "decimals": decimals,
         "address": r.get::<String, _>("address"),
@@ -504,9 +515,11 @@ pub fn quote_json(r: &SqliteRow) -> Value {
 
 /// Customer view of an observed transfer.
 pub fn transfer_json(r: &SqliteRow) -> Value {
+    let chain: String = r.get("chain");
     json!({
         "id": r.get::<String, _>("id"),
-        "chain": r.get::<String, _>("chain"),
+        "explorer": chains::links(&chain),
+        "chain": chain,
         "asset": r.get::<String, _>("asset"),
         "transaction": r.get::<String, _>("tx_hash"),
         "amount_units": r.get::<String, _>("amount"),

@@ -5,7 +5,10 @@
 //! are stored per chain. A confirmed transfer of a configured stablecoin to
 //! one of them credits the account its face value, once per transfer.
 //! Other assets are recorded with a note and not credited.
-use super::payroof::{Chain, Event, call, catalog, display_units, project_path};
+use super::{
+    chains,
+    payroof::{Chain, Event, call, catalog, display_units, project_path},
+};
 use crate::{
     App, billing,
     config::{Config, Payroof},
@@ -44,7 +47,11 @@ pub(super) async fn account_exists(conn: &mut SqliteConnection, account: &str) -
 struct Asset {
     chain: String,
     chain_name: String,
+    /// CAIP-19 asset id.
+    id: String,
     symbol: String,
+    name: String,
+    decimals: u32,
     confirmations: u64,
 }
 
@@ -53,6 +60,8 @@ struct Info {
     assets: Vec<Asset>,
     /// `(chain, address)` for every chain that has an asset.
     addresses: Vec<(String, String)>,
+    /// The whole project catalog, to name assets of recent transfers.
+    catalog: std::sync::Arc<Vec<Chain>>,
 }
 
 fn is_stablecoin(settings: &Payroof, symbol: &str) -> bool {
@@ -129,7 +138,10 @@ async fn info(app: &App, settings: &Payroof, account: &str) -> Result<Info> {
             .map(|a| Asset {
                 chain: chain.id.clone(),
                 chain_name: chain.name.clone(),
+                id: a.id.clone(),
                 symbol: a.symbol.clone(),
+                name: a.name.clone(),
+                decimals: a.decimals,
                 confirmations: chain.confirmations,
             });
         let before = assets.len();
@@ -138,10 +150,96 @@ async fn info(app: &App, settings: &Payroof, account: &str) -> Result<Info> {
             addresses.push((chain.id.clone(), address.clone()));
         }
     }
-    Ok(Info { assets, addresses })
+    Ok(Info {
+        assets,
+        addresses,
+        catalog: chains,
+    })
+}
+
+/// The newest transfers to the account's deposit addresses, as customers see
+/// them. `state` is `confirming`, `credited`, or `not_credited` (with `note`).
+async fn recent(app: &App, info: &Info, account: &str) -> Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT id,chain,asset,tx_hash,amount,status,credited_micro,note,seen_at,confirmed_at \
+         FROM deposit_transfers WHERE account_id=? ORDER BY seen_at DESC,id DESC LIMIT 20",
+    )
+    .bind(account)
+    .fetch_all(&app.db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let chain: String = r.get("chain");
+            let asset: String = r.get("asset");
+            let amount: String = r.get("amount");
+            let found = info.catalog.iter().find(|c| c.id == chain);
+            let known = found.and_then(|c| c.assets.iter().find(|a| a.id == asset));
+            let credited: i64 = r.get("credited_micro");
+            let status: String = r.get("status");
+            let state = match (status.as_str(), credited) {
+                ("confirmed", 1..) => "credited",
+                ("confirmed", _) => "not_credited",
+                _ => "confirming",
+            };
+            json!({
+                "id": r.get::<String, _>("id"),
+                "chain": chain,
+                "chain_name": found.map(|c| c.name.as_str()),
+                "symbol": known.map(|a| a.symbol.as_str()),
+                "amount": known.map(|a| display_units(&amount, a.decimals)),
+                "transaction": r.get::<String, _>("tx_hash"),
+                "explorer": chains::links(&chain),
+                "status": status,
+                "state": state,
+                "credited_usd": crate::money::display(credited),
+                "note": r.get::<String, _>("note"),
+                "seen_at": r.get::<i64, _>("seen_at"),
+                "confirmed_at": r.get::<Option<i64>, _>("confirmed_at"),
+            })
+        })
+        .collect())
+}
+
+/// One network a customer can deposit on.
+fn network(info: &Info, chain: &str, address: &str, eta_minutes: u32) -> Value {
+    let tokens: Vec<Value> = info
+        .assets
+        .iter()
+        .filter(|a| a.chain == chain)
+        .map(|a| {
+            json!({
+                "symbol": a.symbol,
+                "name": if a.name.is_empty() { &a.symbol } else { &a.name },
+                "asset": a.id,
+                "contract": chains::contract(&a.id),
+                "native": false,
+                "decimals": a.decimals,
+                "rate_usd": "1",
+                "credit": format!("1 {} = 1 USD of credit", a.symbol),
+            })
+        })
+        .collect();
+    let first = info.assets.iter().find(|a| a.chain == chain);
+    json!({
+        "chain": chain,
+        "chain_id": chains::eip155(chain),
+        "chain_name": first.map_or("", |a| a.chain_name.as_str()),
+        "address": address,
+        "confirmations": first.map(|a| a.confirmations),
+        "eta_minutes": eta_minutes,
+        "min_deposit_usd": null,
+        "tokens": tokens,
+        "explorer": chains::links(chain),
+    })
 }
 
 /// The `top_up` object of `GET /v1/account`.
+///
+/// `networks` lists, per chain, the account's deposit address and the tokens
+/// that are credited 1:1. Native coins and other tokens are not credited.
+/// `recent` holds the latest transfers. `assets` and `addresses` repeat the
+/// same data flat.
 ///
 /// Without Payroof deposits it only carries the workspace link. When Payroof
 /// cannot be reached, it adds `"available": false` and no addresses.
@@ -152,6 +250,10 @@ pub async fn top_up(app: &App, config: &Config, account: &str) -> Value {
         "eta_minutes": settings.deposit_eta_minutes,
         "assets": [],
         "addresses": [],
+        "networks": [],
+        "recent": [],
+        "min_deposit_usd": null,
+        "credited_assets": "stablecoins",
         "workspace_url": workspace_url(config),
     });
     if !settings.deposits_enabled() {
@@ -183,6 +285,17 @@ pub async fn top_up(app: &App, config: &Config, account: &str) -> Value {
                     })
                 })
                 .collect();
+            out["networks"] = info
+                .addresses
+                .iter()
+                .map(|(chain, address)| {
+                    network(&info, chain, address, settings.deposit_eta_minutes)
+                })
+                .collect();
+            match recent(app, &info, account).await {
+                Ok(list) => out["recent"] = list.into(),
+                Err(e) => tracing::warn!(error = %e, "recent deposits unavailable"),
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, "deposit addresses unavailable");
@@ -397,7 +510,10 @@ mod tests {
         Asset {
             chain: chain.into(),
             chain_name: name.into(),
+            id: format!("{chain}/erc20:0x{symbol}"),
             symbol: symbol.into(),
+            name: String::new(),
+            decimals: 6,
             confirmations: 1,
         }
     }
@@ -413,7 +529,29 @@ mod tests {
                 .iter()
                 .map(|(c, a)| ((*c).into(), (*a).into()))
                 .collect(),
+            catalog: Default::default(),
         }
+    }
+
+    #[test]
+    fn networks_list_tokens_with_contracts_and_explorers() {
+        let n = network(
+            &info(&[("eip155:8453", "0xabc")]),
+            "eip155:8453",
+            "0xabc",
+            5,
+        );
+        assert_eq!(n["chain_id"], 8453);
+        assert_eq!(n["chain_name"], "Base");
+        assert_eq!(n["confirmations"], 1);
+        assert_eq!(n["tokens"].as_array().unwrap().len(), 2);
+        assert_eq!(n["tokens"][0]["contract"], "0xUSDC");
+        assert_eq!(n["tokens"][0]["credit"], "1 USDC = 1 USD of credit");
+        assert_eq!(
+            n["explorer"]["address"],
+            "https://basescan.org/address/{address}"
+        );
+        assert!(n["min_deposit_usd"].is_null());
     }
 
     #[test]

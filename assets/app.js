@@ -337,6 +337,8 @@ const skToolbar = () => `<div class="toolbar">${skel('skel-input wide')}${skel('
 const skTable = (rows = 6, cols = 5) => `<div class="skel-table"><div class="skel-row head cols-${cols}">${skel('skel-line sm', cols)}</div>${Array.from({ length: rows }, () => `<div class="skel-row cols-${cols}">${skel('skel-line md')}${skel('skel-line sm', cols - 1)}</div>`).join('')}</div>`;
 const skFacts = n => `<div class="skel-facts">${Array.from({ length: n }, () => `<div class="skel-fact">${skel('skel-line sm')}${skel('skel-line lg')}</div>`).join('')}</div>`;
 const skPlans = n => `<div class="plans pricing" data-count="${n}">${Array.from({ length: n }, () => `<div class="card plan-card skel-plan"><div class="plan-top">${skel('skel-line sm')}</div>${skel('skel-metric')}${skel('skel-line md')}<div class="skel-feats">${skel('skel-line lg', 3)}</div>${skel('skel-line lg')}${skel('skel-btn wide')}</div>`).join('')}</div><div class="assurance skel-assure">${skel('skel-line md', 3)}</div>`;
+const skHero = () => `<div class="card balance-hero"><div class="balance-main">${skel('skel-line sm')}${skel('skel-metric')}${skel('skel-line md')}</div><div class="actions">${skel('skel-btn')}</div></div>`;
+const skWays = () => `<div class="ways">${Array.from({ length: 3 }, () => `<div class="card way">${skel('skel-line md')}${skel('skel-line lg', 2)}${skel('skel-btn')}</div>`).join('')}</div>`;
 const skCard = body => `<div class="card">${body}</div>`;
 
 const SKELETON_VIEWS = {
@@ -348,7 +350,7 @@ const SKELETON_VIEWS = {
   payments: () => `${skHead(true)}${skToolbar()}${skTable(7, 6)}`,
   requests: () => `${skHead(true)}${skToolbar()}${skTable(8, 6)}`,
   usage: () => `${skHead()}${skStats(3)}${skChart()}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(4, 4)}`)}`,
-  billing: () => `${skBanner()}${skPlans(3)}${skTable(3, 5)}`,
+  billing: () => `${skHero()}${skStats(3)}${skWays()}${skPlans(3)}${skTable(3, 5)}${skTable(3, 5)}`,
   connect: () => `${skHead(true)}${skCard(skFacts(3))}${skCard(`<div class="card-head">${skel('skel-title')}</div>${skTable(3, 5)}`)}${skCard(skel('skel-code'))}`,
   plans: () => `${skHead(true)}${skTable(5, 6)}`,
   codes: () => `${skHead(true)}${skTable(5, 5)}`,
@@ -1268,21 +1270,27 @@ function wireDocs(root) {
   });
 }
 
-// Example model names: the caller's catalog when known, else placeholders.
+// Example model names for the snippets, chosen by what each model really does.
+// `known` is false when no model list is available: placeholders are then shown.
 function exampleModels(models = []) {
-  const pick = (output, input) => models.find(m => (m.architecture?.output_modalities || ['text']).includes(output)
-    && (!input || (m.architecture?.input_modalities || ['text']).includes(input)))?.id;
+  const first = {};
+  models.forEach(m => {
+    const kind = modelKind(m);
+    if (kind && !first[kind]) first[kind] = m.id;
+  });
   return {
-    chat: pick('text', 'text') || 'your-model',
-    tts: pick('audio') || 'your-tts-model',
-    stt: pick('text', 'audio') || 'your-stt-model',
-    image: pick('image') || 'your-image-model',
+    chat: first.chat || 'your-model',
+    tts: first.speech || 'your-tts-model',
+    stt: first.transcription || 'your-stt-model',
+    image: first.image || 'your-image-model',
+    has: Object.fromEntries(Object.keys(CAPABILITIES).map(k => [k, Boolean(first[k])])),
+    known: models.length > 0,
   };
 }
 
 function apiSnippets(m = exampleModels()) {
   const base = `${location.origin}/v1`;
-  return [
+  const all = [
     { label: 'cURL', code: `curl ${base}/chat/completions \\
   -H "Authorization: Bearer $RESELLER_KEY" \\
   -H "Content-Type: application/json" \\
@@ -1328,6 +1336,9 @@ console.log(reply.choices[0].message.content);` },
   -H "Content-Type: application/json" \\
   -d '{"model": "${m.image}", "prompt": "A lighthouse at dusk", "size": "1024x1024"}'` },
   ];
+  // With a known model list, only offer examples the account can actually run.
+  const kinds = { cURL: 'chat', Python: 'chat', Node: 'chat', Streaming: 'chat', Speech: 'speech', Transcription: 'transcription', Image: 'image' };
+  return all.filter(x => !m.known || m.has[kinds[x.label]]);
 }
 
 // OAuth: the client discovers everything from the URL and opens the consent page.
@@ -1450,15 +1461,58 @@ const endpointTable = rows => table([
   ['Description', r => esc(r[2]), 'wrap'],
 ], rows);
 
+// What a model does, as reported by the server (`architecture.capability`). When a
+// server predates that field, the modalities are used. Anything else is unknown.
+const CAPABILITIES = {
+  chat: ['Chat', 'POST /v1/chat/completions'],
+  speech: ['Text-to-speech', 'POST /v1/audio/speech'],
+  transcription: ['Speech-to-text', 'POST /v1/audio/transcriptions'],
+  image: ['Image', 'POST /v1/images/generations'],
+};
+function modelKind(m) {
+  const a = m.architecture || {};
+  if (CAPABILITIES[a.capability]) return a.capability;
+  const input = a.input_modalities || [], output = a.output_modalities || [];
+  if (output.includes('image')) return 'image';
+  if (output.includes('audio')) return 'speech';
+  if (input.includes('audio') && output.includes('text')) return 'transcription';
+  return input.includes('text') && output.includes('text') ? 'chat' : null;
+}
+const modalityText = list => list?.length ? list.map(x => x.charAt(0).toUpperCase() + x.slice(1)).join(', ') : DASH;
+// Prices arrive per unit in USD. Show them in the unit people compare.
+const perMillion = v => `$${Number((Number(v) * 1e6).toPrecision(4)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
+const perUnit = v => `$${Number(Number(v).toPrecision(4)).toLocaleString(undefined, { maximumFractionDigits: 6 })}`;
+function modelPrice(m, kind) {
+  const p = m.pricing;
+  if (!p) return DASH;
+  const parts = [];
+  if (kind === 'chat' || !kind) {
+    if (p.prompt && p.completion) parts.push(`${perMillion(p.prompt)} in / ${perMillion(p.completion)} out per 1M tokens`);
+  } else if (kind === 'speech') {
+    if (isPositive(p.characters)) parts.push(`${perMillion(p.characters)} per 1M characters`);
+    if (isPositive(p.audio_second)) parts.push(`${perUnit(Number(p.audio_second) * 60)} per audio minute`);
+  } else if (kind === 'transcription') {
+    if (isPositive(p.audio_second)) parts.push(`${perUnit(Number(p.audio_second) * 60)} per audio minute`);
+  } else if (kind === 'image' && isPositive(p.image)) {
+    parts.push(`${perUnit(p.image)} per image`);
+  }
+  if (isPositive(p.request)) parts.push(`${perUnit(p.request)} per request`);
+  return parts.length ? parts.map(esc).join('<br>') : DASH;
+}
 function modelCatalog(models) {
   if (!models.length) return emptyState('No models listed', 'The operator has not published a model catalog.');
-  return table([
-    ['Model ID', m => copyable(m.id, 'Model ID'), 'wrap'],
-    ['Name', m => `${esc(m.name || m.id)}${m.description ? `<div class="hint">${esc(m.description)}</div>` : ''}`, 'wrap'],
-    ['Input', m => esc((m.architecture?.input_modalities || ['text']).join(', '))],
-    ['Output', m => esc((m.architecture?.output_modalities || ['text']).join(', '))],
-    ['Context', m => m.context_length ? `<span class="num">${count(m.context_length)}</span>` : '<span class="muted">-</span>', 'end'],
-  ], models);
+  const groups = Object.keys(CAPABILITIES).map(kind => [kind, models.filter(m => modelKind(m) === kind)]);
+  const other = models.filter(m => !modelKind(m));
+  if (other.length) groups.push(['', other]);
+  return `<div class="model-groups">${groups.filter(([, list]) => list.length).map(([kind, list]) => `<section class="model-group" aria-label="${esc(kind ? CAPABILITIES[kind][0] : 'Other')} models">
+    <div class="model-group-head"><span class="cap-badge cap-${kind || 'other'}">${esc(kind ? CAPABILITIES[kind][0] : 'Other')}</span>${kind ? `<code>${esc(CAPABILITIES[kind][1])}</code>` : '<span class="hint">Capability not reported</span>'}<span class="hint">${esc(plural(list.length, 'model'))}</span></div>
+    ${table([
+      ['Model', m => `<div class="model-cell">${m.name && m.name !== m.id ? `<strong>${esc(m.name)}</strong>` : ''}<div>${copyable(m.id, 'Model ID')}</div>${m.description ? `<div class="hint">${esc(m.description)}</div>` : ''}</div>`, 'wrap'],
+      ['Input', m => modalityText(m.architecture?.input_modalities)],
+      ['Output', m => modalityText(m.architecture?.output_modalities)],
+      ['Context', m => m.context_length ? `<span><span class="num">${count(m.context_length)}</span> <span class="hint">tokens</span></span>` : DASH, 'end'],
+      ['Price', m => modelPrice(m, kind), 'wrap'],
+    ], list)}</section>`).join('')}</div>`;
 }
 
 /* Docs page ---------------------------------------------------------------------- */
@@ -2111,35 +2165,73 @@ const views = {
     const a = v.account;
     const methods = p.payment_methods || [];
     planCatalog = { plans: p.plans, methods };
-    const topUp = v.top_up;
+    const topUp = v.top_up || {};
+    const hasTopUp = topUp.available === false || Boolean(topUp.networks?.length);
+    const badges = planBadges(p.plans);
     const cta = plan => methods.length
-      ? `<button type="button" class="${planBadges(p.plans).get(plan.code) === 'Best value' ? 'primary' : ''}" data-checkout="${esc(plan.code)}">Choose ${esc(plan.name)}</button>`
+      ? `<button type="button" class="${badges.get(plan.code) === 'Best value' ? 'primary' : ''}" data-checkout="${esc(plan.code)}">Choose ${esc(plan.name)}</button>`
       : '<span class="hint">Online payments are not enabled. Use a credit code.</span>';
-    return `<div class="banner">
-        <div><div class="label">Available balance</div><div class="metric">${esc(usd(a.balance_usd))}</div><div class="hint">${isPositive(a.debt_usd) ? `Debt ${esc(usd(a.debt_usd))} is repaid from the next top-up.` : `Spent so far: ${esc(usd(a.billed_usd))}`}</div></div>
-        <div class="actions"><button type="button" class="ghost" data-redeem>Redeem a code</button></div>
+    const lots = v.credits.filter(c => lotState(c) === 'active');
+    const trial = lots.filter(c => c.source === 'free');
+    const trialLeft = trial.reduce((sum, c) => sum + Number(c.remaining_usd), 0);
+    const trialEnds = Math.min(...trial.map(c => c.expires_at || Infinity));
+    const nextExpiry = lots.filter(c => c.expires_at).sort((x, y) => x.expires_at - y.expires_at)[0];
+    const sub = a.subscription;
+    const subPlan = sub && p.plans.find(x => x.code === sub.plan_code);
+    const daysLeft = sub ? Math.max(0, Math.ceil((sub.expires_at - nowSeconds()) / DAY)) : 0;
+    const empty = !isPositive(a.balance_usd);
+    const debt = isPositive(a.debt_usd);
+    const planName = code => p.plans.find(x => x.code === code)?.name || code;
+    const ways = [
+      methods.includes('stripe') && ['Card', 'Pay for a plan on Stripe\'s secure checkout page.', '<button type="button" class="small" data-scroll="plans">Choose a plan</button>'],
+      methods.includes('crypto') && ['Crypto checkout', 'Pay for a plan with USDC, USDT, or native coins on a supported network.', '<button type="button" class="small" data-scroll="plans">Choose a plan</button>'],
+      hasTopUp && ['Stablecoin top-up', 'Send stablecoins to your personal address. Any amount, no plan needed.', '<button type="button" class="small" data-scroll="topup">Show my address</button>'],
+      ['Redeem a code', 'Apply a single-use credit code from the operator.', '<button type="button" class="small" data-redeem>Redeem a code</button>'],
+    ].filter(Boolean);
+    return `<section class="card balance-hero${empty || debt ? ' warn' : ''}" aria-labelledby="balance-label">
+        <div class="balance-main">
+          <div class="label" id="balance-label">Available balance</div>
+          <div class="metric balance-amount">${esc(usd(a.balance_usd))}</div>
+          <ul class="balance-notes">
+            ${debt ? `<li class="warn">Outstanding debt of ${esc(usd(a.debt_usd))} is repaid from your next top-up.</li>` : ''}
+            ${empty && !debt ? '<li class="warn">Your balance is empty. API calls are refused until you add credit.</li>' : ''}
+            ${trialLeft > 0 ? `<li>Includes ${esc(usd(trialLeft))} of trial credit${Number.isFinite(trialEnds) ? `, valid until ${esc(date(trialEnds))}` : ''}.</li>` : ''}
+            ${nextExpiry && nextExpiry !== trial[0] ? `<li>Next credit expiry: ${esc(usd(nextExpiry.remaining_usd))} on ${esc(date(nextExpiry.expires_at))}. Credit that expires first is spent first.</li>` : ''}
+            <li>Shared by every key on your account.</li>
+          </ul>
+        </div>
+        <div class="actions"><button type="button" class="${empty ? 'primary' : 'ghost'}" data-scroll="${hasTopUp || methods.length ? 'ways' : 'plans'}">Add credit</button></div>
+      </section>
+      <div class="stats">
+        ${metric('Current plan', sub ? (subPlan?.name || sub.plan_code) : 'No active plan', sub ? `Active until ${esc(date(sub.expires_at))}, ${esc(plural(daysLeft, 'day'))} left` : 'Pay as you go. Buy a plan below to add bundled credit.')}
+        ${metric('Spent so far', usd(a.billed_usd), 'Across all your keys')}
+        ${metric('Credit lots in use', count(lots.length), 'Soonest-expiring credit is spent first')}
       </div>
-      ${topUp?.addresses?.length ? `<div class="card">
-        <div class="card-head"><h3>Top up with stablecoins</h3><span class="hint">Credited automatically in about ${count(topUp.eta_minutes)} minutes</span></div>
-        <p>Send ${esc([...new Set(topUp.assets.map(x => x.symbol))].join(' or '))} to your personal address on one of these networks. Any amount is credited 1:1 in USD.</p>
-        ${facts(topUp.addresses.map(x => [x.chain_name, copyable(x.address, `${x.chain_name} address`)]))}
-      </div>` : ''}
-      <section class="billing-catalog">
-        <div class="catalog-head"><h3>Prepaid plans</h3><p>Non-renewing packages. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto checkout accepts USDC, USDT, and native coins on supported networks.' : ''}</p></div>
+      <section class="billing-ways" id="ways" tabindex="-1" aria-labelledby="ways-title">
+        <div class="section-head"><h3 id="ways-title">Ways to add credit</h3></div>
+        <div class="ways">${ways.map(([title, text, action]) => `<div class="card way"><strong>${esc(title)}</strong><p>${esc(text)}</p>${action}</div>`).join('')}</div>
+      </section>
+      <section class="billing-catalog" id="plans" tabindex="-1" aria-labelledby="plans-title">
+        <div class="catalog-head"><h3 id="plans-title">Prepaid plans</h3><p>Non-renewing packages. Credit is shared by every key on your account.${methods.includes('crypto') ? ' Crypto checkout accepts USDC, USDT, and native coins on supported networks.' : ''}</p></div>
         ${pricingSection(p.plans, methods, cta)}
       </section>
-      ${orders.payments.length ? `<h3 class="section">Your payments</h3>
-      ${table([
-        ['Created', r => when(r.created_at)],
-        ['Plan', r => `<code>${esc(r.plan_code)}</code>`],
-        ['Method', r => esc(methodLabel(r.method))],
-        ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
-        ['Received', r => `<span class="num">${esc(usd(r.received_usd))}</span>`, 'end'],
-        ['Status', r => pill(r.status)],
-        ['', r => r.method === 'crypto' ? `<button type="button" class="small${r.status === 'pending' ? ' primary' : ''}" data-order="${esc(r.id)}">${r.status === 'pending' ? 'Pay' : 'Details'}</button>` : '', 'end'],
-      ], orders.payments)}` : ''}
-      <h3 class="section">Credit ledger</h3>
-      ${creditTable(v.credits)}`;
+      ${topUpCard(topUp)}
+      <section class="billing-section" aria-labelledby="history-title">
+        <div class="section-head"><h3 id="history-title">Payment history</h3><span class="hint">Latest ${esc(plural(orders.payments.length, 'payment'))}</span></div>
+        ${table([
+          ['Date', r => when(r.created_at)],
+          ['Plan', r => `<strong>${esc(planName(r.plan_code))}</strong><div class="hint">${esc(plural(r.duration_days, 'day'))}, ${esc(usd(r.credit_usd))} credit</div>`],
+          ['Method', r => esc(methodLabel(r.method))],
+          ['Amount', r => `<span class="num">${esc(usd(r.price_usd))}</span>`, 'end'],
+          ['Received', r => r.method === 'crypto' ? `<span class="num">${esc(usd(r.received_usd))}</span>` : DASH, 'end'],
+          ['Status', r => pill(r.status)],
+          ['', r => `<div class="actions">${r.method === 'crypto' && r.status === 'pending' ? `<button type="button" class="small primary" data-order="${esc(r.id)}">Pay</button>` : ''}<button type="button" class="small" data-receipt="${esc(r.id)}" aria-label="Details of payment ${esc(shortId(r.id))}">Details</button></div>`, 'end'],
+        ], orders.payments, { empty: ['No payments yet', 'Plan purchases appear here with their status and a receipt.'] })}
+      </section>
+      <section class="billing-section" aria-labelledby="ledger-title">
+        <div class="section-head"><h3 id="ledger-title">Credit ledger</h3><span class="hint">Each top-up, plan, or grant is one lot with its own expiry</span></div>
+        ${creditTable(v.credits)}
+      </section>`;
   },
   async settings(signal) {
     const v = await get(endpoint('settings'), signal);
@@ -2237,70 +2329,505 @@ function wireCopies(root) {
     b.onclick = () => copyText(b.dataset.copyValue, b.dataset.copyLabel || 'Value').then(ok => ok && flash(b));
   });
 }
-function transfersTable(transfers) {
-  if (!transfers?.length) return '';
+/* QR code ------------------------------------------------------------------------
+   A small dependency-free encoder: byte mode, error correction level M, versions
+   1 to 10 (up to 213 bytes). Enough for addresses and EIP-681 payment links.
+   qrSvg(text) returns an inline SVG (black on white, with the 4-module quiet zone
+   scanners need, so it also works on dark themes) or '' when the text is too long. */
+// Per version at level M: [data codewords, EC codewords per block, blocks in group 1, data per block in group 1, blocks in group 2].
+const QR_M = [null, [16, 10, 1, 16, 0], [28, 16, 1, 28, 0], [44, 26, 1, 44, 0], [64, 18, 2, 32, 0], [86, 24, 2, 43, 0], [108, 16, 4, 27, 0], [124, 18, 4, 31, 0], [154, 22, 2, 38, 2], [182, 22, 3, 36, 2], [216, 26, 4, 43, 1]];
+const QR_ALIGN = [null, [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
+const QR_EXP = new Uint8Array(512);
+const QR_LOG = new Uint8Array(256);
+for (let i = 0, x = 1; i < 255; i++) {
+  QR_EXP[i] = x;
+  QR_LOG[x] = i;
+  x <<= 1;
+  if (x & 256) x ^= 0x11d;
+}
+for (let i = 255; i < 512; i++) QR_EXP[i] = QR_EXP[i - 255];
+const qrMul = (a, b) => a && b ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0;
+function qrReedSolomon(data, degree) {
+  let gen = [1];
+  for (let i = 0; i < degree; i++) {
+    const next = new Array(gen.length + 1).fill(0);
+    gen.forEach((c, j) => {
+      next[j] ^= c;
+      next[j + 1] ^= qrMul(c, QR_EXP[i]);
+    });
+    gen = next;
+  }
+  const rest = new Array(degree).fill(0);
+  for (const byte of data) {
+    const factor = byte ^ rest.shift();
+    rest.push(0);
+    for (let j = 0; j < degree; j++) rest[j] ^= qrMul(gen[j + 1], factor);
+  }
+  return rest;
+}
+function qrBch(value, poly, bits) {
+  let r = value << bits;
+  for (let i = 31 - Math.clz32(r); i >= bits; i = 31 - Math.clz32(r)) r ^= poly << (i - bits);
+  return (value << bits) | r;
+}
+const QR_MASKS = [
+  (r, c) => (r + c) % 2 === 0,
+  (r) => r % 2 === 0,
+  (r, c) => c % 3 === 0,
+  (r, c) => (r + c) % 3 === 0,
+  (r, c) => (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0,
+  (r, c) => ((r * c) % 2) + ((r * c) % 3) === 0,
+  (r, c) => (((r * c) % 2) + ((r * c) % 3)) % 2 === 0,
+  (r, c) => (((r + c) % 2) + ((r * c) % 3)) % 2 === 0,
+];
+function qrPenalty(m) {
+  const n = m.length;
+  let score = 0;
+  const runs = line => {
+    let s = 0, run = 1;
+    for (let i = 1; i <= line.length; i++) {
+      if (i < line.length && line[i] === line[i - 1]) run++;
+      else {
+        if (run >= 5) s += run - 2;
+        run = 1;
+      }
+    }
+    return s;
+  };
+  const finder = line => {
+    let s = 0;
+    const a = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0], b = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+    for (let i = 0; i + 11 <= line.length; i++) {
+      if (a.every((v, j) => line[i + j] === v)) s += 40;
+      if (b.every((v, j) => line[i + j] === v)) s += 40;
+    }
+    return s;
+  };
+  for (let i = 0; i < n; i++) {
+    const row = m[i], col = m.map(r => r[i]);
+    score += runs(row) + runs(col) + finder(row) + finder(col);
+  }
+  for (let r = 0; r < n - 1; r++) for (let c = 0; c < n - 1; c++) {
+    if (m[r][c] === m[r][c + 1] && m[r][c] === m[r + 1][c] && m[r][c] === m[r + 1][c + 1]) score += 3;
+  }
+  const dark = m.reduce((s, row) => s + row.reduce((t, v) => t + v, 0), 0);
+  return score + Math.floor(Math.abs(dark * 20 - n * n * 10) / (n * n)) * 10;
+}
+function qrMatrix(text) {
+  const bytes = [...new TextEncoder().encode(text)];
+  const version = QR_M.findIndex((v, i) => v && bytes.length <= v[0] - (i < 10 ? 2 : 3));
+  if (version < 1) return null;
+  const [total, ecLen, g1, d1, g2] = QR_M[version];
+  // Bit stream: mode 0100, length, data, terminator, padding.
+  const bits = [];
+  const push = (value, n) => { for (let i = n - 1; i >= 0; i--) bits.push((value >> i) & 1); };
+  push(4, 4);
+  push(bytes.length, version < 10 ? 8 : 16);
+  bytes.forEach(b => push(b, 8));
+  push(0, Math.min(4, total * 8 - bits.length));
+  while (bits.length % 8) bits.push(0);
+  const words = [];
+  for (let i = 0; i < bits.length; i += 8) words.push(parseInt(bits.slice(i, i + 8).join(''), 2));
+  for (let pad = 0xec; words.length < total; pad ^= 0xec ^ 0x11) words.push(pad);
+  // Split into blocks, add EC, interleave.
+  const blocks = [];
+  let at = 0;
+  for (let i = 0; i < g1 + g2; i++) {
+    const size = i < g1 ? d1 : d1 + 1;
+    const data = words.slice(at, at + size);
+    at += size;
+    blocks.push({ data, ec: qrReedSolomon(data, ecLen) });
+  }
+  const stream = [];
+  for (let i = 0; i < d1 + 1; i++) blocks.forEach(b => { if (i < b.data.length) stream.push(b.data[i]); });
+  for (let i = 0; i < ecLen; i++) blocks.forEach(b => stream.push(b.ec[i]));
+  // Function patterns.
+  const n = 17 + 4 * version;
+  const m = Array.from({ length: n }, () => new Array(n).fill(0));
+  const fixed = Array.from({ length: n }, () => new Array(n).fill(false));
+  const set = (r, c, v) => { m[r][c] = v ? 1 : 0; fixed[r][c] = true; };
+  const finderAt = (r0, c0) => {
+    for (let dr = -1; dr <= 7; dr++) for (let dc = -1; dc <= 7; dc++) {
+      const r = r0 + dr, c = c0 + dc;
+      if (r < 0 || c < 0 || r >= n || c >= n) continue;
+      const edge = Math.max(Math.abs(dr - 3), Math.abs(dc - 3));
+      set(r, c, edge !== 2 && edge !== 4);
+    }
+  };
+  finderAt(0, 0);
+  finderAt(0, n - 7);
+  finderAt(n - 7, 0);
+  for (let i = 8; i < n - 8; i++) {
+    set(6, i, i % 2 === 0);
+    set(i, 6, i % 2 === 0);
+  }
+  const centers = QR_ALIGN[version];
+  centers.forEach(cr => centers.forEach(cc => {
+    const last = centers[centers.length - 1];
+    if ((cr === 6 && (cc === 6 || cc === last)) || (cr === last && cc === 6)) return; // overlaps a finder
+    for (let dr = -2; dr <= 2; dr++) for (let dc = -2; dc <= 2; dc++) set(cr + dr, cc + dc, Math.max(Math.abs(dr), Math.abs(dc)) !== 1);
+  }));
+  // Reserve format and version areas, and the dark module.
+  for (let i = 0; i < 9; i++) { fixed[8][i] = true; fixed[i][8] = true; }
+  for (let i = 0; i < 8; i++) { fixed[8][n - 1 - i] = true; fixed[n - 1 - i][8] = true; }
+  set(n - 8, 8, true);
+  if (version >= 7) {
+    const info = qrBch(version, 0x1f25, 12);
+    for (let i = 0; i < 18; i++) {
+      const bit = (info >> i) & 1, a = Math.floor(i / 3), b = (i % 3) + n - 11;
+      set(a, b, bit);
+      set(b, a, bit);
+    }
+  }
+  // Data bits in the zig-zag order, right to left in column pairs.
+  const dataBits = [];
+  stream.forEach(w => { for (let i = 7; i >= 0; i--) dataBits.push((w >> i) & 1); });
+  const cells = [];
+  for (let right = n - 1, up = true; right >= 1; right -= 2, up = !up) {
+    if (right === 6) right = 5;
+    for (let k = 0; k < n; k++) {
+      const r = up ? n - 1 - k : k;
+      for (const c of [right, right - 1]) if (!fixed[r][c]) cells.push([r, c]);
+    }
+  }
+  cells.forEach(([r, c], i) => { m[r][c] = dataBits[i] || 0; });
+  // Pick the mask with the lowest penalty and write the format bits.
+  let best = null;
+  QR_MASKS.forEach((mask, id) => {
+    const t = m.map(row => row.slice());
+    cells.forEach(([r, c]) => { if (mask(r, c)) t[r][c] ^= 1; });
+    const format = qrBch((0 << 3) | id, 0x537, 10) ^ 0x5412; // level M = 00
+    writeFormat(t, n, format);
+    const score = qrPenalty(t);
+    if (!best || score < best.score) best = { score, t };
+  });
+  return best.t;
+}
+// Format bits (15): copy 1 around the top-left finder, copy 2 split between the other two.
+function writeFormat(t, n, format) {
+  for (let i = 0; i < 15; i++) {
+    const bit = (format >> i) & 1;
+    // Copy 1.
+    if (i < 6) t[i][8] = bit;
+    else if (i < 8) t[i + 1][8] = bit;
+    else if (i === 8) t[8][7] = bit;
+    else t[8][14 - i] = bit;
+    // Copy 2.
+    if (i < 8) t[8][n - 1 - i] = bit;
+    else t[n - 15 + i][8] = bit;
+  }
+  t[n - 8][8] = 1;
+}
+function qrSvg(text, label = 'QR code') {
+  const m = qrMatrix(text);
+  if (!m) return '';
+  const n = m.length, size = n + 8;
+  let path = '';
+  m.forEach((row, r) => {
+    for (let c = 0; c < n; c++) {
+      if (!row[c]) continue;
+      let end = c;
+      while (end + 1 < n && row[end + 1]) end++;
+      path += `M${c + 4} ${r + 4}h${end - c + 1}v1h-${end - c + 1}z`;
+      c = end;
+    }
+  });
+  return `<svg class="qr" viewBox="0 0 ${size} ${size}" role="img" aria-label="${esc(label)}" shape-rendering="crispEdges"><rect width="${size}" height="${size}" fill="#fff"/><path d="${path}" fill="#000"/></svg>`;
+}
+
+/* Crypto helpers ---------------------------------------------------------------
+   Used by the stablecoin top-up card and the "Pay with crypto" dialog. Every link
+   comes from server-supplied explorer templates and must be https. */
+const DASH = '<span class="muted" title="Not available">&mdash;</span>';
+const joinOr = names => names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
+function explorerHref(links, kind, value) {
+  const template = links?.[kind];
+  if (!template || !value) return '';
+  try {
+    const url = new URL(template.replace(`{${kind}}`, encodeURIComponent(value)));
+    return url.protocol === 'https:' ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+function explorerLink(links, kind, value, label = 'Explorer') {
+  const href = explorerHref(links, kind, value);
+  return href ? `<a class="ext-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(label)}<span class="sr-only"> on ${esc(links.name)} (opens in a new tab)</span></a>` : '';
+}
+// Base units to a decimal string, without floating point: ("19990000", 6) is "19.99".
+function fromUnits(units, decimals) {
+  try {
+    const digits = BigInt(units).toString().padStart(decimals + 1, '0');
+    const whole = digits.slice(0, digits.length - decimals);
+    const frac = digits.slice(digits.length - decimals).replace(/0+$/, '');
+    return frac ? `${whole}.${frac}` : whole;
+  } catch {
+    return String(units);
+  }
+}
+// EIP-681 payment request that wallets can scan: a token transfer, or a native
+// coin transfer. Without a chain id there is nothing to encode but the address.
+function paymentUri(q) {
+  if (!q.chain_id) return q.address;
+  return q.contract
+    ? `ethereum:${q.contract}@${q.chain_id}/transfer?address=${q.address}&uint256=${q.amount_units}`
+    : `ethereum:${q.address}@${q.chain_id}?value=${q.amount_units}`;
+}
+const contractCell = (links, contract) => contract
+  ? `<span class="contract">${copyable(contract, 'Contract address', shortHash(contract))}${explorerLink(links, 'token', contract)}</span>`
+  : '<span class="muted">Native coin, no contract</span>';
+const NOTE_LABELS = {
+  unsupported_asset: 'Token is not credited',
+  invalid_amount: 'Amount could not be valued',
+  unquoted_asset: 'Not an asset this order accepts',
+  address_mismatch: 'Sent to another address or network',
+  late: 'Arrived after the quote expired',
+};
+const noteLabel = n => NOTE_LABELS[n] || String(n).replace(/_/g, ' ');
+const countdown = seconds => {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${m}:${String(r).padStart(2, '0')}`;
+};
+
+/* Stablecoin top-up -------------------------------------------------------------
+   Standing per-account addresses. The server lists, per network, the address and
+   the tokens it credits 1:1. Anything else sent there is recorded, not credited. */
+let topUpState = { data: null, chain: '' };
+const DEPOSIT_STATES = { confirming: ['Confirming', 'info'], credited: ['Credited', 'ok'], not_credited: ['Not credited', 'warn'] };
+function depositsTable(rows) {
+  return table([
+    ['Seen', r => when(r.seen_at)],
+    ['Network', r => esc(r.chain_name || r.chain)],
+    ['Amount', r => r.amount ? `<span class="num">${esc(r.amount)} ${esc(r.symbol)}</span>` : DASH, 'end'],
+    ['Status', r => { const [label, tone] = DEPOSIT_STATES[r.state] || [r.state, 'muted']; return `${pill(label, tone)}${r.note ? `<div class="hint">${esc(noteLabel(r.note))}</div>` : ''}`; }],
+    ['Credited', r => isPositive(r.credited_usd) ? `<span class="num">${esc(usd(r.credited_usd))}</span>` : DASH, 'end'],
+    ['Transaction', r => `<span class="contract">${copyable(r.transaction, 'Transaction hash', shortHash(r.transaction))}${explorerLink(r.explorer, 'tx', r.transaction)}</span>`],
+  ], rows, { empty: ['No deposits yet', 'Transfers to your address show up here as soon as the network reports them.'] });
+}
+function netPanel(n, t) {
+  const symbols = [...new Set(n.tokens.map(x => x.symbol))];
+  const minimum = n.min_deposit_usd ? `${usd(n.min_deposit_usd)} per transfer` : 'None enforced. You pay the network fee, so very small transfers are rarely worth sending.';
+  const timing = [
+    n.confirmations ? `${plural(n.confirmations, 'confirmation')}` : null,
+    n.eta_minutes ? `usually about ${plural(n.eta_minutes, 'minute')}` : null,
+  ].filter(Boolean).join(', ');
+  return `<div class="callout warn" role="note"><p><strong>Send only these tokens on ${esc(n.chain_name)}.</strong> Other tokens or networks can be lost. Native coins and any other token sent here are recorded but not credited.</p></div>
+    <div class="addr-card">
+      <div class="qr-box">${qrSvg(n.address, `QR code of your ${n.chain_name} deposit address`)}<span class="hint">Scan to read the address</span></div>
+      <div class="addr-body">
+        <div class="label">Your ${esc(n.chain_name)} deposit address</div>
+        <div class="addr-value">${copyable(n.address, `${n.chain_name} address`)}</div>
+        <div class="actions"><button type="button" class="small" data-copy-value="${esc(n.address)}" data-copy-label="${esc(n.chain_name)} address">Copy address</button>${explorerLink(n.explorer, 'address', n.address, 'View on explorer')}</div>
+        <p class="hint">The address is personal to your account and does not change. Send ${esc(joinOr(symbols))} on the ${esc(n.chain_name)} network only.</p>
+      </div>
+    </div>
+    ${facts([
+      ['Network', `${esc(n.chain_name)}${n.chain_id ? ` <span class="hint">chain ID ${esc(n.chain_id)}</span>` : ''}`],
+      ['Credit', `Each accepted token is credited 1:1 in USD (for example 1 ${esc(symbols[0] || 'USDC')} = ${esc(usd(1))}).`],
+      timing && ['Credited after', esc(timing)],
+      ['Minimum', esc(minimum)],
+    ])}
+    <h4 class="sub-head">Accepted tokens on ${esc(n.chain_name)}</h4>
+    ${table([
+      ['Token', x => `<div class="model-cell"><strong>${esc(x.symbol)}</strong>${x.name && x.name !== x.symbol ? `<span class="hint">${esc(x.name)}</span>` : ''}</div>`],
+      ['Contract address', x => contractCell(n.explorer, x.contract), 'wrap'],
+      ['Decimals', x => `<span class="num">${esc(x.decimals)}</span>`, 'end'],
+      ['Credited as', x => esc(x.credit)],
+    ], n.tokens)}`;
+}
+function topUpCard(t) {
+  if (t.available === false) {
+    return `<section class="card" id="topup" aria-labelledby="topup-title"><div class="card-head"><h3 id="topup-title">Top up with stablecoins</h3></div>
+      <div class="callout warn"><p>Your deposit addresses are temporarily unavailable. Try again in a moment.</p><div class="actions"><button type="button" class="small" data-refresh>Try again</button></div></div></section>`;
+  }
+  if (!t.networks?.length) return '';
+  topUpState.data = t;
+  if (!t.networks.some(n => n.chain === topUpState.chain)) topUpState.chain = t.networks[0].chain;
+  const symbols = [...new Set(t.networks.flatMap(n => n.tokens.map(x => x.symbol)))];
+  const steps = [
+    ['Pick a network', 'Choose the network your wallet or exchange will send on.'],
+    ['Send a supported token', `Send ${joinOr(symbols)} to your personal address. Anything else is not credited.`],
+    ['Credit appears', `Once the network confirms the transfer (usually about ${plural(t.eta_minutes, 'minute')}), the amount is added to your balance 1:1 in USD.`],
+  ];
+  return `<section class="card topup" id="topup" aria-labelledby="topup-title" data-topup>
+    <div class="card-head"><h3 id="topup-title">Top up with stablecoins</h3><span class="hint">Any amount, no plan needed</span></div>
+    <ol class="how-steps">${steps.map(([title, text], n) => `<li><span class="step-dot">${n + 1}</span><div><strong>${esc(title)}</strong><p>${esc(text)}</p></div></li>`).join('')}</ol>
+    <div class="net-tabs" role="tablist" aria-label="Network">${t.networks.map(n => `<button type="button" role="tab" id="net-tab-${esc(n.chain.replace(/\W/g, '-'))}" data-net="${esc(n.chain)}" aria-selected="${n.chain === topUpState.chain}" aria-controls="net-panel" tabindex="${n.chain === topUpState.chain ? 0 : -1}">${esc(n.chain_name)}</button>`).join('')}</div>
+    <div id="net-panel" role="tabpanel" data-net-panel>${netPanel(t.networks.find(n => n.chain === topUpState.chain), t)}</div>
+    <h4 class="sub-head">Recent deposits</h4>
+    ${depositsTable(t.recent || [])}
+  </section>`;
+}
+function wireTopUp(root) {
+  const box = root.querySelector('[data-topup]');
+  if (!box) return;
+  const tabs = [...box.querySelectorAll('[data-net]')];
+  const select = (chain, focus) => {
+    topUpState.chain = chain;
+    tabs.forEach(b => {
+      b.setAttribute('aria-selected', String(b.dataset.net === chain));
+      b.tabIndex = b.dataset.net === chain ? 0 : -1;
+      if (focus && b.dataset.net === chain) b.focus();
+    });
+    const panel = box.querySelector('[data-net-panel]');
+    panel.innerHTML = netPanel(topUpState.data.networks.find(n => n.chain === chain), topUpState.data);
+    wireCopies(panel);
+  };
+  tabs.forEach((b, i) => {
+    b.onclick = () => select(b.dataset.net);
+    b.onkeydown = e => {
+      const target = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+      if (target === undefined) return;
+      e.preventDefault();
+      select(tabs[(target + tabs.length) % tabs.length].dataset.net, true);
+    };
+  });
+}
+
+/* Pay with crypto ---------------------------------------------------------------- */
+function transfersTable(o) {
+  const transfers = o.transfers || [];
+  if (!transfers.length) return '';
+  const quote = t => (o.quotes || []).find(q => q.asset === t.asset);
   return `<section class="detail-section"><h4>Transfers</h4>${table([
-    ['Seen', r => esc(date(r.seen_at))],
-    ['Network', r => `<code>${esc(r.chain)}</code>`],
-    ['Transaction', r => copyable(r.transaction, 'Transaction hash', shortHash(r.transaction))],
-    ['Status', r => pill(r.status)],
-    ['Credited', r => `<span class="num">${esc(usd(r.value_usd))}</span>`, 'end'],
-    ['Note', r => r.note ? pill(r.note.replace(/_/g, ' '), 'warn') : ''],
+    ['Seen', r => when(r.seen_at)],
+    ['Amount', r => { const q = quote(r); return q ? `<span class="num">${esc(fromUnits(r.amount_units, q.decimals))} ${esc(q.symbol)}</span><div class="hint">${esc(q.chain_name)}</div>` : DASH; }],
+    ['Transaction', r => `<span class="contract">${copyable(r.transaction, 'Transaction hash', shortHash(r.transaction))}${explorerLink(r.explorer, 'tx', r.transaction)}</span>`],
+    ['Status', r => r.status === 'confirmed' ? pill('Confirmed', 'ok') : pill('Detected', 'info')],
+    ['Counted', r => r.status === 'confirmed' ? `<span class="num">${esc(usd(r.value_usd))}</span>` : DASH, 'end'],
+    ['Note', r => r.note ? pill(noteLabel(r.note), 'warn') : ''],
   ], transfers)}</section>`;
 }
 const planOfOrder = o => {
   const known = planCatalog.plans.find(p => p.code === o.plan_code);
   return { code: o.plan_code, name: known?.name || o.plan_code, price_usd: o.price_usd, credit_usd: o.credit_usd, duration_days: o.duration_days };
 };
-// pending, confirming, paid, expired, or failed.
-const orderState = o => o.status === 'paid' ? 'paid'
-  : o.status === 'expired' ? 'expired'
-  : o.status === 'failed' || o.status === 'cancelled' ? 'failed'
-  : isPositive(o.received_usd) || (o.transfers || []).some(t => t.status === 'seen' || t.status === 'confirmed') ? 'confirming'
-  : 'pending';
-const ORDER_STATES = {
-  pending: ['Waiting for your transfer', 'Send one of the amounts below. This page updates by itself.'],
-  confirming: ['Payment detected', 'Waiting for network confirmations. You can close this window, credit is added automatically.'],
-  paid: ['Payment confirmed', 'Your credit is ready to use.'],
-  expired: ['This quote expired', 'Quotes are valid for a limited time. Start a new payment to get fresh amounts.'],
-  failed: ['Payment not completed', 'This order was cancelled or failed. Contact the operator if you already sent funds.'],
-};
-const STATE_ICONS = { paid: CHECK, expired: '!', failed: '&times;', pending: '<span class="spinner" aria-hidden="true"></span>', confirming: '<span class="spinner" aria-hidden="true"></span>' };
-function cryptoView(o) {
+// pending, confirming, underpaid, review, paid, expired, or failed.
+function orderState(o) {
+  if (o.status === 'paid') return 'paid';
+  if (o.status === 'failed' || o.status === 'cancelled') return 'failed';
+  const transfers = o.transfers || [];
+  if (transfers.some(t => t.status === 'seen')) return 'confirming';
+  const confirmed = transfers.filter(t => t.status === 'confirmed');
+  if (confirmed.some(t => isPositive(t.value_usd))) return 'underpaid';
+  if (confirmed.length) return 'review';
+  return o.status === 'expired' ? 'expired' : 'pending';
+}
+const PAY_STEPS = ['Waiting for payment', 'Detected', 'Confirmed', 'Credited'];
+const PAY_PROGRESS = { pending: 0, expired: 0, failed: 0, confirming: 1, underpaid: 2, review: 2, paid: 3 };
+const payTimeline = state => `<ol class="timeline" aria-label="Payment progress">${PAY_STEPS.map((label, n) => {
+  const done = state === 'paid' || n < PAY_PROGRESS[state];
+  const current = !done && n === PAY_PROGRESS[state];
+  return `<li class="${done ? 'done' : current ? 'current' : ''}"${current ? ' aria-current="step"' : ''}><span class="step-dot">${done ? CHECK : n + 1}</span><span class="step-label">${esc(label)}</span></li>`;
+}).join('')}</ol>`;
+const STATE_ICONS = { paid: CHECK, expired: '!', failed: '&times;', review: '!', underpaid: '!', pending: '<span class="spinner" aria-hidden="true"></span>', confirming: '<span class="spinner" aria-hidden="true"></span>' };
+const STATE_TONES = { paid: 'ok', expired: 'warn', failed: 'danger', review: 'warn', underpaid: 'warn' };
+function orderMessage(o, state, i) {
+  const quotes = o.quotes || [];
+  const seen = (o.transfers || []).find(t => t.status === 'seen');
+  const confirmations = quotes.find(q => seen && q.chain === seen.chain)?.confirmations;
+  const price = Number(o.price_usd), received = Number(o.received_usd);
+  const tolerance = o.underpayment_tolerance_pct;
+  const flagged = (o.transfers || []).find(t => t.note);
+  switch (state) {
+    case 'pending': return ['Waiting for your transfer', 'Send the amount shown below from your wallet or exchange. This window updates by itself.'];
+    case 'confirming': return ['Payment detected', `The network has seen your transfer. Waiting for ${confirmations ? plural(confirmations, 'confirmation') : 'network confirmations'}. You can close this window: credit is added automatically.`];
+    case 'underpaid': return ['Payment received, but it is not enough yet', `${usd(received)} of ${usd(price)} has been confirmed. Send the remaining ${usd(Math.max(0, price - received))} in any listed token to finish the order.${tolerance && Number(tolerance) > 0 ? ` Shortfalls up to ${tolerance}% are accepted.` : ''}${o.status === 'expired' ? ' The quote has expired: stablecoin transfers still count, native coin transfers need the operator.' : ''}`];
+    case 'review': return ['A transfer needs review', `${flagged ? `${noteLabel(flagged.note)}. ` : ''}It was not counted towards this order. Contact the operator with the transaction hash shown below.`];
+    case 'paid': return ['Payment confirmed', `${usdShort(i.credit || i.price)} of API credit was added. ${expiryText(i, o.paid_at)}.${received > price + 0.01 ? ` You sent ${usd(received)}: the plan credit is granted once, so ask the operator about the extra ${usd(received - price)}.` : ''}`];
+    case 'expired': return ['This quote expired', 'Quotes are valid for a limited time. If you already sent a stablecoin it is still counted once it confirms. Otherwise start a new payment to get fresh amounts.'];
+    default: return ['Payment not completed', 'This order was cancelled or failed. Contact the operator if you already sent funds.'];
+  }
+}
+function pickQuote(quotes, sel) {
+  const stable = q => q.rate_usd === '1' ? 0 : 1;
+  const chosen = quotes.find(q => q.asset === sel.asset && q.chain === sel.chain)
+    || quotes.filter(q => q.chain === sel.chain).sort((a, b) => stable(a) - stable(b))[0]
+    || quotes.slice().sort((a, b) => stable(a) - stable(b))[0];
+  if (chosen) Object.assign(sel, { chain: chosen.chain, asset: chosen.asset });
+  return chosen;
+}
+function payCard(o, q, sel) {
+  const uri = paymentUri(q);
+  const content = sel.qr === 'link' ? uri : q.address;
+  const confirmations = q.confirmations ? ` after ${plural(q.confirmations, 'confirmation')}` : '';
+  return `<div class="pay-card">
+      <div class="qr-box">${qrSvg(content, `QR code to pay ${q.amount} ${q.symbol} on ${q.chain_name}`) || qrSvg(q.address)}
+        <div class="seg" role="group" aria-label="QR code content"><button type="button" data-qr="link" aria-pressed="${sel.qr === 'link'}">Payment request</button><button type="button" data-qr="address" aria-pressed="${sel.qr === 'address'}">Address only</button></div>
+        <span class="hint">${sel.qr === 'link' ? 'Fills in the network, token, and amount in wallets that support payment requests.' : 'Works with any wallet or exchange: enter the amount yourself.'}</span>
+      </div>
+      <div class="pay-fields">
+        <div class="pay-field"><span class="label">Amount to send</span><div class="pay-amount">${copyable(q.amount, `${q.symbol} amount`)}<span class="pay-symbol">${esc(q.symbol)}</span><button type="button" class="small" data-copy-value="${esc(q.amount)}" data-copy-label="${esc(q.symbol)} amount">Copy</button></div>${q.rate_usd !== '1' ? `<span class="hint">Quoted at ${esc(usd(q.rate_usd))} per ${esc(q.symbol)}</span>` : `<span class="hint">1 ${esc(q.symbol)} = ${esc(usd(1))}</span>`}</div>
+        <div class="pay-field"><span class="label">To this address</span>${copyable(q.address, `${q.chain_name} address`)}<div class="actions"><button type="button" class="small" data-copy-value="${esc(q.address)}" data-copy-label="${esc(q.chain_name)} address">Copy address</button>${explorerLink(q.explorer, 'address', q.address, 'View on explorer')}</div></div>
+        <div class="pay-field"><span class="label">Network</span><span>${esc(q.chain_name)}${q.chain_id ? ` <span class="hint">chain ID ${esc(q.chain_id)}</span>` : ''}</span></div>
+        <div class="pay-field"><span class="label">${q.contract ? `${esc(q.symbol)} token contract` : 'Asset'}</span>${contractCell(q.explorer, q.contract)}</div>
+      </div>
+    </div>
+    <div class="callout warn" role="note"><p><strong>Send only ${esc(q.symbol)} on ${esc(q.chain_name)}.</strong> Other tokens or networks can be lost. Send the amount in one transfer${confirmations ? `. It counts${esc(confirmations)}` : ''}. Several smaller transfers or tokens add up, and anything above the price is not credited.</p></div>`;
+}
+function cryptoView(o, sel) {
   const state = orderState(o);
   const plan = planOfOrder(o);
-  const [title, text] = ORDER_STATES[state];
-  const step = state === 'paid' ? 3 : 1;
-  const i = planInfo(plan);
-  const tone = { paid: 'ok', expired: 'warn', failed: 'danger' }[state] || 'info';
-  return `${stepper(step)}
-    <div class="pay-state tone-${tone}" role="status">
+  const [title, text] = orderMessage(o, state, planInfo(plan));
+  // After a partial payment, every quote shrinks to what is still owed.
+  const price = Math.round(Number(o.price_usd) * 1e6), owed = Math.max(0, price - Math.round(Number(o.received_usd) * 1e6));
+  const quotes = (o.quotes || []).map(x => {
+    if (state !== 'underpaid' || price <= 0) return x;
+    const units = (BigInt(x.amount_units) * BigInt(owed) + BigInt(price) - 1n) / BigInt(price) || 1n;
+    return { ...x, amount_units: units.toString(), amount: fromUnits(units.toString(), x.decimals) };
+  });
+  const open = quotes.length && !['paid', 'failed', 'expired', 'review'].includes(state);
+  // Start on the network and token of the latest transfer, when there is one.
+  const latest = (o.transfers || []).at(-1);
+  if (latest && !sel.chain) Object.assign(sel, { chain: latest.chain, asset: latest.asset });
+  const q = open ? pickQuote(quotes, sel) : null;
+  const networks = [...new Map(quotes.map(x => [x.chain, x.chain_name]))];
+  const waiting = state === 'pending' && o.expires_at;
+  return `${stepper(state === 'paid' ? 3 : 1)}
+    <div class="pay-state tone-${STATE_TONES[state] || 'info'}" role="status">
       <span class="pay-state-icon" aria-hidden="true">${STATE_ICONS[state]}</span>
-      <div><strong>${esc(title)}</strong><p>${esc(state === 'paid' ? `${usdShort(i.credit || i.price)} of API credit was added. ${expiryText(i, o.paid_at)}.` : text)}${state === 'pending' && o.expires_at ? ` Quote valid until ${esc(date(o.expires_at))}.` : ''}</p></div>
-      ${pill(state === 'expired' ? 'expired' : state === 'confirming' ? 'confirming' : o.status)}
+      <div><strong>${esc(title)}</strong><p>${esc(text)}</p>${waiting ? `<p class="pay-timer">Quote valid for <strong data-countdown="${esc(o.expires_at)}">${esc(countdown(o.expires_at - nowSeconds()))}</strong> (until ${esc(date(o.expires_at))})</p>` : ''}</div>
+      ${pill(state === 'confirming' ? 'Detected' : state === 'underpaid' ? 'Underpaid' : state === 'review' ? 'Needs review' : o.status)}
     </div>
-    <div class="checkout-grid pay-grid">
-      <div>
-        ${state === 'pending' || state === 'confirming' ? `<p class="muted pay-note">Send <strong>one</strong> of the amounts below to its address <strong>on the listed network</strong>. Partial payments in several assets add up. Stablecoins count 1:1 in USD, native coins at the quoted rate.</p>
-        <div class="quotes">${(o.quotes || []).map(q => `<div class="quote">
-          <div class="quote-head"><strong>${esc(q.symbol)}</strong><span class="hint">${esc(q.chain_name)}</span></div>
-          <div class="label">Send exactly <span class="hint">(click to copy)</span></div>${copyable(q.amount, `${q.symbol} amount`, `${q.amount} ${q.symbol}`)}${q.rate_usd !== '1' ? `<div class="hint">at ${esc(usd(q.rate_usd))} per ${esc(q.symbol)}</div>` : ''}
-          <div class="label">To address <span class="hint">(click to copy)</span></div>${copyable(q.address, `${q.chain_name} address`)}
-        </div>`).join('')}</div>` : ''}
-        ${state === 'paid' ? `<div class="actions pay-done"><button type="button" class="primary" data-pay-done>Done</button></div>` : ''}
-        ${state === 'expired' ? `<div class="actions pay-done"><button type="button" class="primary" data-pay-again>Start a new payment</button></div>` : ''}
-      </div>
+    ${state === 'failed' || state === 'expired' ? '' : payTimeline(state)}
+    <div class="pay-grid">
       ${orderSummary(plan, { paidAt: o.paid_at })}
+      <div>
+        ${q ? `<fieldset class="pay-choose"><legend>1. Choose a network</legend>
+          <div class="net-tabs" role="radiogroup" aria-label="Network">${networks.map(([chain, name]) => `<button type="button" role="radio" aria-checked="${chain === q.chain}" data-pick-chain="${esc(chain)}">${esc(name)}</button>`).join('')}</div></fieldset>
+        <fieldset class="pay-choose"><legend>2. Choose what to pay with</legend>
+          <div class="token-options" role="radiogroup" aria-label="Token">${quotes.filter(x => x.chain === q.chain).map(x => `<button type="button" role="radio" class="token-option" aria-checked="${x.asset === q.asset}" data-pick-asset="${esc(x.asset)}"><strong>${esc(x.amount)} ${esc(x.symbol)}</strong><span class="hint">${x.rate_usd === '1' ? 'Stablecoin, 1:1 with USD' : `Native coin at ${esc(usd(x.rate_usd))}`}</span></button>`).join('')}</div></fieldset>
+        <h4 class="sub-head">3. Send the payment</h4>
+        ${payCard(o, q, sel)}` : ''}
+        ${state === 'paid' ? '<div class="actions pay-done"><button type="button" class="primary" data-pay-done>Done</button></div>' : ''}
+        ${state === 'expired' || state === 'failed' ? '<div class="actions pay-done"><button type="button" class="primary" data-pay-again>Start a new payment</button></div>' : ''}
+      </div>
     </div>
-    ${transfersTable(o.transfers)}`;
+    ${transfersTable(o)}`;
 }
-// Shows a crypto order in a dialog and keeps it fresh until it settles.
+// Shows a crypto order in a dialog and keeps it fresh until it settles. Polling
+// backs off after errors and stops when the dialog closes or the order is final.
 function runOrder(d, initial) {
   const box = d.querySelector('[data-pay]');
-  let order = initial;
-  let timer;
+  const sel = { chain: '', asset: '', qr: 'link' };
+  const control = new AbortController();
+  let order = initial, timer, clock, failures = 0, focus = '';
+  const signature = o => JSON.stringify([o.status, o.received_usd, (o.transfers || []).map(t => [t.id, t.status, t.value_usd, t.note])]);
+  const final = () => ['paid', 'failed', 'cancelled'].includes(order.status) || (order.status === 'expired' && !(order.transfers || []).length);
+  const tick = () => {
+    const el = box.querySelector('[data-countdown]');
+    if (!el) return;
+    const left = Number(el.dataset.countdown) - nowSeconds();
+    el.textContent = countdown(left);
+    if (left <= 0 && !el.dataset.expired) {
+      el.dataset.expired = '1';
+      clearTimeout(timer);
+      poll();
+    }
+  };
   const draw = () => {
-    box.innerHTML = cryptoView(order);
+    box.innerHTML = cryptoView(order, sel);
     wireCopies(box);
     box.querySelector('[data-pay-done]')?.addEventListener('click', () => d.close());
     box.querySelector('[data-pay-again]')?.addEventListener('click', () => {
@@ -2308,31 +2835,81 @@ function runOrder(d, initial) {
       d.close();
       if (plan) checkout(plan, planCatalog.methods);
     });
+    const choose = (attr, apply) => box.querySelectorAll(`[${attr}]`).forEach(b => b.addEventListener('click', () => {
+      apply(b.getAttribute(attr));
+      focus = `[${attr}="${CSS.escape(b.getAttribute(attr))}"]`;
+      draw();
+    }));
+    choose('data-pick-chain', chain => Object.assign(sel, { chain, asset: '' }));
+    choose('data-pick-asset', asset => { sel.asset = asset; });
+    choose('data-qr', mode => { sel.qr = mode; });
+    if (focus) box.querySelector(focus)?.focus();
+    focus = '';
+    tick();
   };
-  const poll = async () => {
+  const schedule = () => {
+    clearTimeout(timer);
+    if (d.open && !final()) timer = setTimeout(poll, Math.min(60_000, 5_000 * 2 ** failures));
+  };
+  async function poll() {
     if (!d.open) return;
     try {
-      const next = await api(`/v1/account/payments/${encodeURIComponent(order.id)}`);
-      const changed = next.status !== order.status || next.received_usd !== order.received_usd || (next.transfers || []).length !== (order.transfers || []).length
-        || (next.transfers || []).map(t => t.status).join() !== (order.transfers || []).map(t => t.status).join();
+      const next = await api(`/v1/account/payments/${encodeURIComponent(order.id)}`, 'GET', undefined, { signal: control.signal });
+      failures = 0;
+      const changed = signature(next) !== signature(order);
+      const wasPaid = order.status === 'paid';
       order = next;
       if (changed) draw();
-      if (order.status === 'paid') {
+      if (order.status === 'paid' && !wasPaid) {
         notice('Payment confirmed, credit added');
         if (tab === 'billing') load();
-        return;
       }
-    } catch {
-      // Transient errors: keep polling.
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      failures = Math.min(failures + 1, 4);
     }
-    if (order.status === 'pending') timer = setTimeout(poll, 8_000);
-  };
+    schedule();
+  }
   draw();
-  if (order.status === 'pending') timer = setTimeout(poll, 8_000);
-  d.addEventListener('close', () => clearTimeout(timer));
+  clock = setInterval(tick, 1000);
+  schedule();
+  d.addEventListener('close', () => {
+    control.abort();
+    clearTimeout(timer);
+    clearInterval(clock);
+  });
 }
 function cryptoOrder(initial) {
   modal('Pay with crypto', '<div data-pay></div>', d => runOrder(d, initial), 'wide');
+}
+// A customer's view of one of their payments, card or crypto.
+async function receiptModal(id) {
+  const o = await api(`/v1/account/payments/${encodeURIComponent(id)}`);
+  const plan = planOfOrder(o);
+  const payable = o.method === 'crypto' && o.status === 'pending';
+  modal(`Payment ${shortId(o.id)}`, `
+    <div class="tiles">
+      ${metric('Price', usd(o.price_usd), `${esc(plan.name)}, ${esc(methodLabel(o.method))}`)}
+      ${metric('Received', usd(o.received_usd), o.status === 'paid' ? `Credit of ${esc(usd(o.credit_usd))} granted` : 'Counted so far')}
+      ${metric('Status', pill(o.status), o.paid_at ? `Paid ${esc(date(o.paid_at))}` : o.expires_at && o.status !== 'paid' ? `Quote ${o.status === 'expired' ? 'expired' : 'expires'} ${esc(date(o.expires_at))}` : `Created ${esc(date(o.created_at))}`, { html: true })}
+    </div>
+    <section class="detail-section"><h4>Receipt</h4>${facts([
+      ['Payment ID', copyable(o.id, 'Payment ID')],
+      ['Plan', esc(plan.name)],
+      ['Method', esc(methodLabel(o.method))],
+      ['Created', esc(date(o.created_at))],
+      o.paid_at && ['Paid', esc(date(o.paid_at))],
+      ['Credit', `${esc(usd(o.credit_usd))} for ${esc(plural(o.duration_days, 'day'))}`],
+      o.paid_at && ['Credit valid until', esc(date(o.paid_at + o.duration_days * DAY))],
+    ])}</section>
+    ${transfersTable(o)}
+    ${payable ? '<div class="actions"><button type="button" class="primary" data-continue>Continue payment</button></div>' : ''}`, d => {
+    wireCopies(d);
+    d.querySelector('[data-continue]')?.addEventListener('click', () => {
+      d.close();
+      cryptoOrder(o);
+    });
+  }, 'wide');
 }
 async function paymentDetails(id) {
   const o = await api(endpoint(`payments/${encodeURIComponent(id)}`));
@@ -2355,7 +2932,7 @@ async function paymentDetails(id) {
       ['Rate', q => esc(usd(q.rate_usd))],
       ['Address', q => copyable(q.address, 'Address', shortHash(q.address))],
     ], o.quotes)}</section>` : ''}
-    ${transfersTable(o.transfers)}
+    ${transfersTable(o)}
     ${payable ? `<div class="callout warn"><p>Use after verifying a late, underpaid, or otherwise flagged payment by hand. Credit is granted once.</p><div class="actions"><button type="button" class="primary" data-complete>Mark as paid and grant credit</button></div></div>` : ''}`, d => {
     wireCopies(d);
     d.querySelector('[data-complete]')?.addEventListener('click', async e => {
@@ -2685,6 +3262,13 @@ function wire(root) {
   wireShares(root);
   wireDocs(root);
   wireCopies(root);
+  wireTopUp(root);
+  root.querySelectorAll('[data-scroll]').forEach(b => b.onclick = () => {
+    const target = document.getElementById(b.dataset.scroll);
+    if (!target) return;
+    target.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+    target.focus({ preventScroll: true });
+  });
   root.querySelectorAll('[data-list-form]').forEach(form => {
     form.addEventListener('submit', e => {
       e.preventDefault();
@@ -2769,6 +3353,7 @@ function wire(root) {
   });
   action('[data-order]', async b => cryptoOrder(await api(`/v1/account/payments/${encodeURIComponent(b.dataset.order)}`)));
   action('[data-payment]', async b => paymentDetails(b.dataset.payment));
+  action('[data-receipt]', async b => receiptModal(b.dataset.receipt));
   action('[data-payroof]', async () => payroofSetup());
   action('[data-revoke-app]', async b => {
     if (!(await confirmModal('Disconnect app?', `${b.dataset.appName} will lose access to your account right away. You can connect it again later.`, 'Disconnect', true))) return;

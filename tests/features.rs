@@ -1090,6 +1090,52 @@ async fn models_list_follows_the_catalog_and_hides_upstream_names() {
 }
 
 #[tokio::test]
+async fn models_list_derives_capability_and_modalities_from_the_routes() {
+    let t = Test::new().await;
+    {
+        let mut c = t.app.config_mut().await;
+        c.llm.model = "chat-up".into();
+        c.tts.model = "voice-up".into();
+        c.tts.fallbacks = vec!["voice-fallback".into()];
+        c.stt.model = "ears-up".into();
+        c.image.model = "paint-up".into();
+    }
+    let k = t.key().await;
+    let key = k["key"].as_str().unwrap();
+    let (s, v) = t.call("GET", "/v1/models", Some(key), json!({})).await;
+    assert_eq!(s, 200, "{v}");
+    let arch = |id: &str| {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("{id} in {v}"))["architecture"]
+            .clone()
+    };
+    assert_eq!(arch("chat-up")["modality"], "text->text");
+    assert_eq!(arch("chat-up")["capability"], "chat");
+    assert_eq!(arch("voice-up")["modality"], "text->audio");
+    assert_eq!(arch("voice-fallback")["capability"], "speech");
+    assert_eq!(arch("ears-up")["modality"], "audio->text");
+    assert_eq!(arch("ears-up")["capability"], "transcription");
+    assert_eq!(arch("paint-up")["modality"], "text->image");
+    assert_eq!(arch("paint-up")["capability"], "image");
+    // An explicit catalog entry wins over derivation.
+    t.app.config_mut().await.models = vec![reseller::config::Model {
+        id: "vision".into(),
+        upstream: "chat-up".into(),
+        input_modalities: vec!["text".into(), "image".into()],
+        ..Default::default()
+    }];
+    let (_, v) = t
+        .call("GET", "/v1/models/vision", Some(key), json!({}))
+        .await;
+    assert_eq!(v["architecture"]["modality"], "text+image->text");
+    assert_eq!(v["architecture"]["capability"], "chat");
+}
+
+#[tokio::test]
 async fn models_list_requires_a_valid_key_and_a_balance() {
     let t = Test::new().await;
     let (s, v) = t.call("GET", "/v1/models", None, json!({})).await;
@@ -1320,6 +1366,57 @@ async fn account_top_up_lists_deposit_addresses_without_secrets() {
         symbols.contains(&"USDC") && !symbols.contains(&"ETH"),
         "{symbols:?}"
     );
+    let net = &top_up["networks"][0];
+    assert_eq!(net["chain_id"], 1);
+    assert_eq!(net["address"], top_up["addresses"][0]["address"]);
+    assert_eq!(
+        net["explorer"]["address"],
+        "https://etherscan.io/address/{address}"
+    );
+    let usdc = net["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["symbol"] == "USDC")
+        .expect("USDC listed");
+    assert_eq!(usdc["native"], false);
+    assert_eq!(usdc["contract"], "0xa0b8");
+    assert_eq!(usdc["credit"], "1 USDC = 1 USD of credit");
+    assert_eq!(top_up["recent"], json!([]));
+    let aid = k["account_id"].as_str().unwrap();
+    let reference = format!("acct-{aid}");
+    let usdc_id = "eip155:1/erc20:0xa0b8";
+    for (id, kind) in [("e1", "seen"), ("e2", "confirmed")] {
+        let ev = event(id, kind, "tr_r1", &reference, usdc_id, "2500000");
+        assert_eq!(deliver(&t, &ev).await.0, 200);
+    }
+    let ev = event(
+        "e3",
+        "confirmed",
+        "tr_r2",
+        &reference,
+        "eip155:1/slip44:60",
+        "1000",
+    );
+    assert_eq!(deliver(&t, &ev).await.0, 200);
+    let (_, v) = t
+        .call("GET", "/v1/account", k["key"].as_str(), json!({}))
+        .await;
+    let recent = v["top_up"]["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    let paid = recent.iter().find(|r| r["id"] == "tr_r1").unwrap();
+    assert_eq!(
+        (
+            paid["state"].as_str(),
+            paid["amount"].as_str(),
+            paid["symbol"].as_str()
+        ),
+        (Some("credited"), Some("2.5"), Some("USDC"))
+    );
+    assert_eq!(paid["credited_usd"], "2.5");
+    let native = recent.iter().find(|r| r["id"] == "tr_r2").unwrap();
+    assert_eq!(native["state"], "not_credited");
+    assert_eq!(native["note"], "unsupported_asset");
     let text = top_up.to_string();
     for secret in ["prf_test_token", "shop", "acct-", &base] {
         assert!(!text.contains(secret), "{secret} leaked in {text}");

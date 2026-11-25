@@ -18,7 +18,7 @@ mod signup;
 pub use branding::{Branding, Link};
 pub use keys::KeyPolicy;
 pub use mcp::Mcp;
-pub use models::Model;
+pub use models::{Capability, Model, Resolved};
 pub use payments::{Payroof, RateSource, Stripe};
 pub use rate_limits::RateLimits;
 pub use signup::Signup;

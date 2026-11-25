@@ -10,6 +10,7 @@
 //!   EVM chains), completed by signed `confirmed` transfer webhooks.
 //! - [`deposits`]: standing per-account Payroof addresses. Confirmed
 //!   stablecoin transfers to them credit the account directly.
+pub mod chains;
 pub mod deposits;
 pub mod payroof;
 pub mod stripe;
@@ -202,7 +203,7 @@ pub async fn order(app: &App, order_id: &str, account: Option<&str>) -> Result<V
         .fetch_optional(&app.db)
         .await?
         .ok_or_else(|| Error::not_found("payment_not_found", "Payment not found"))?;
-    let quotes: Vec<Value> =
+    let mut quotes: Vec<Value> =
         sqlx::query("SELECT * FROM payment_quotes WHERE payment_id=? ORDER BY chain_name,symbol")
             .bind(order_id)
             .fetch_all(&app.db)
@@ -219,6 +220,26 @@ pub async fn order(app: &App, order_id: &str, account: Option<&str>) -> Result<V
             .map(payroof::transfer_json)
             .collect();
     let mut out = summary(&row);
+    if row.get::<String, _>("provider") == "payroof" {
+        // Confirmations come from the cached catalog, so a Payroof outage
+        // only drops this hint.
+        let config = app.config().await;
+        let catalog = match config.payroof.enabled() {
+            true => payroof::catalog(app, &config.payroof).await.ok(),
+            false => None,
+        };
+        for quote in &mut quotes {
+            let confirmations = catalog.as_ref().and_then(|chains| {
+                chains
+                    .iter()
+                    .find(|c| quote["chain"] == c.id.as_str())
+                    .map(|c| c.confirmations)
+            });
+            quote["confirmations"] = confirmations.into();
+        }
+        out["underpayment_tolerance_pct"] =
+            config.payroof.underpayment_tolerance_pct.clone().into();
+    }
     out["quotes"] = quotes.into();
     out["transfers"] = transfers.into();
     Ok(out)
