@@ -12,15 +12,19 @@
 //!   score, and the least recently picked one on a tie.
 //! - Picking consumes the request budgets and takes an in-flight [`Permit`].
 //!   Token budgets are charged when the request has settled.
-//! - 429 cools the route down (until the upstream's hint, else
-//!   `routing.cooldown_seconds`). 401, 402, 403 and an exhausted account
-//!   cool the whole provider down. 404 (the model is not found at that
-//!   provider) cools the route down for `routing.cooldown_seconds` without
-//!   counting as a circuit failure, so a broken route of an `ordered` model is
-//!   not retried first on every request. 400 and the other client errors
-//!   say nothing about health on their own. A route that refused a request
-//!   with 400 while a later route served the same request is cooled down
-//!   like a 404 (some providers answer an unknown model with 400). 5xx, timeouts and connection errors count
+//! - Each answer is classified from its status and error body together
+//!   ([`Outcome::of`]). A rate limit (429, or a rate-limit body under another
+//!   status) cools the route down until the upstream's hint, else
+//!   `routing.cooldown_seconds`. Authentication, credit and region failures
+//!   cool the whole provider down. A missing or retired model (404) cools the
+//!   route down for `routing.cooldown_seconds` without counting as a circuit
+//!   failure, so a broken route of an `ordered` model is not retried first
+//!   on every request. A request too large for the route (a token window
+//!   below the request, a context window), a moderation refusal, and the
+//!   other client errors say nothing about health on their own. A route that
+//!   refused a request with 400 or 422 while a later route served the same
+//!   request is cooled down like a 404 (some providers answer an unknown
+//!   model with 400). 5xx, timeouts and connection errors count
 //!   toward the route's circuit breaker. The circuit opens after
 //!   `routing.failure_threshold` consecutive failures, stays open for a
 //!   doubling, jittered cooldown, then lets one probe request through.
@@ -32,6 +36,7 @@
 //! keeps the state of every route that survives it.
 pub mod free;
 pub mod hints;
+pub mod outcome;
 
 use crate::{
     config::{Budget, Config, Model, Provider, Route, Routing, Strategy},
@@ -39,6 +44,7 @@ use crate::{
     security::limiter::{Limiter, seconds},
 };
 use hints::Hints;
+pub use outcome::Outcome;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -159,39 +165,21 @@ fn jitter(d: Duration) -> Duration {
     d.mul_f64(0.8 + 0.4 * unit)
 }
 
+/// The retry hint for `soonest`: `routing.cooldown_seconds` when nothing is
+/// known, never below [`BUSY_RETRY`] or above `routing.max_cooldown_seconds`.
+fn clamp_wait(config: &Config, soonest: Option<Duration>) -> Duration {
+    let cap = Duration::from_secs(config.routing.max_cooldown_seconds);
+    let fallback = Duration::from_secs(config.routing.cooldown_seconds);
+    soonest
+        .unwrap_or(fallback)
+        .clamp(BUSY_RETRY, cap.max(BUSY_RETRY))
+}
+
 /// A route chosen for one attempt.
 pub struct Picked {
     /// Index into the model's `routes`.
     pub index: usize,
     pub permit: Permit,
-}
-
-/// How the upstream answered an attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Verdict {
-    Success,
-    RateLimited,
-    /// The provider's account is unusable (auth failure or no credit).
-    ProviderDown,
-    /// The upstream does not know the model: a permanent-looking route
-    /// problem, but not a failure of the service.
-    NotFound,
-    Failure,
-    /// A client error or an answer that says nothing about health.
-    Neutral,
-}
-
-fn classify(status: Option<u16>, out_of_credit: bool) -> Verdict {
-    match status {
-        None => Verdict::Failure,
-        Some(200..=299) => Verdict::Success,
-        Some(_) if out_of_credit => Verdict::ProviderDown,
-        Some(429) => Verdict::RateLimited,
-        Some(401..=403) => Verdict::ProviderDown,
-        Some(404) => Verdict::NotFound,
-        Some(500..=599) => Verdict::Failure,
-        Some(_) => Verdict::Neutral,
-    }
 }
 
 /// An attempt in flight on one route. Dropping it releases the in-flight
@@ -209,18 +197,15 @@ pub struct Permit {
 }
 
 impl Permit {
-    /// Reports how the upstream answered: its status (`None` for a timeout
-    /// or connection error), its hints, and whether the body says the
-    /// account is out of credit.
-    pub fn finish(&mut self, status: Option<u16>, hints: &Hints, out_of_credit: bool) {
-        self.finish_at(status, hints, out_of_credit, Instant::now());
+    /// Reports how the upstream answered (see [`Outcome::of`]) and its hints.
+    pub fn finish(&mut self, outcome: Outcome, hints: &Hints) {
+        self.finish_at(outcome, hints, Instant::now());
     }
 
-    fn finish_at(&mut self, status: Option<u16>, hints: &Hints, out_of_credit: bool, now: Instant) {
+    fn finish_at(&mut self, outcome: Outcome, hints: &Hints, now: Instant) {
         if std::mem::replace(&mut self.finished, true) {
             return;
         }
-        let verdict = classify(status, out_of_credit);
         let latency = now.saturating_duration_since(self.started);
         let mut st = self.router.lock();
         let route = st
@@ -229,12 +214,12 @@ impl Permit {
             .or_default();
         route.learn(hints, now);
         let mut provider_until = None;
-        match verdict {
-            Verdict::Success => {
+        match outcome {
+            Outcome::Success => {
                 route.record(true, Some(latency));
                 route.close();
             }
-            Verdict::RateLimited => {
+            Outcome::RateLimited => {
                 route.record(false, Some(latency));
                 // The upstream answered, so the route is alive.
                 route.close();
@@ -244,21 +229,26 @@ impl Permit {
                     .min(Duration::from_secs(self.routing.max_cooldown_seconds));
                 route.cool_until(now + wait);
             }
-            Verdict::NotFound => {
+            Outcome::NotFound => {
                 // The upstream answered, so the circuit is left alone.
                 route.release_probe();
                 route.cool_until(now + Duration::from_secs(self.routing.cooldown_seconds));
             }
-            Verdict::ProviderDown => {
+            Outcome::ProviderDown => {
                 route.record(false, Some(latency));
                 route.release_probe();
                 provider_until = Some(now + Duration::from_secs(self.routing.max_cooldown_seconds));
             }
-            Verdict::Failure => {
+            Outcome::Failure => {
                 route.record(false, None);
                 route.fail(&self.routing, now);
             }
-            Verdict::Neutral => route.release_probe(),
+            // The route answered, about this request only.
+            Outcome::TooLarge
+            | Outcome::Refused
+            | Outcome::Rejected
+            | Outcome::Transient
+            | Outcome::Final => route.release_probe(),
         }
         if let Some(until) = provider_until {
             st.providers
@@ -546,11 +536,7 @@ impl Router {
             }
         }
         let Some((index, _, _)) = best else {
-            let cap = Duration::from_secs(config.routing.max_cooldown_seconds);
-            let fallback = Duration::from_secs(config.routing.cooldown_seconds);
-            return Err(soonest
-                .unwrap_or(fallback)
-                .clamp(BUSY_RETRY, cap.max(BUSY_RETRY)));
+            return Err(clamp_wait(config, soonest));
         };
         let route = &model.routes[index];
         let provider = config
@@ -602,6 +588,25 @@ impl Router {
                 finished: false,
             },
         })
+    }
+
+    /// How long until some route of `model` can take a request, without
+    /// taking it: the retry hint for a client whose attempts all failed.
+    pub fn soonest(&self, config: &Config, model: &Model) -> Duration {
+        let st = self.lock();
+        let now = Instant::now();
+        let mut soonest: Option<Duration> = None;
+        for route in &model.routes {
+            let Some(provider) = config.provider(&route.provider).filter(|p| p.enabled) else {
+                continue;
+            };
+            let wait = self
+                .evaluate(&st, provider, route, now)
+                .err()
+                .unwrap_or(BUSY_RETRY);
+            soonest = Some(soonest.map_or(wait, |s| s.min(wait)));
+        }
+        clamp_wait(config, soonest)
     }
 
     /// Cools down a route that refused a request (400) which a later route
@@ -938,7 +943,7 @@ mod tests {
         let t0 = Instant::now();
         let fail = |r: &Arc<Router>, t: Instant| {
             let mut p = r.pick_at(&c, &m, &[], false, t).ok().unwrap().permit;
-            p.finish_at(Some(503), &Hints::default(), false, t);
+            p.finish_at(Outcome::of(Some(503), None), &Hints::default(), t);
         };
         fail(&r, t0);
         // One failure is below the threshold of two.
@@ -961,7 +966,7 @@ mod tests {
         );
         // A failed probe reopens at once with a doubled cooldown.
         let mut permit = probe.permit;
-        permit.finish_at(Some(500), &Hints::default(), false, later);
+        permit.finish_at(Outcome::of(Some(500), None), &Hints::default(), later);
         drop(permit);
         let wait = r.pick_at(&c, &m, &[], false, later).err().unwrap();
         assert!(
@@ -975,7 +980,7 @@ mod tests {
             .ok()
             .unwrap()
             .permit;
-        probe.finish_at(Some(200), &Hints::default(), false, much_later);
+        probe.finish_at(Outcome::of(Some(200), None), &Hints::default(), much_later);
         drop(probe);
         for _ in 0..3 {
             assert!(r.pick_at(&c, &m, &[], false, much_later).is_ok());
@@ -993,7 +998,7 @@ mod tests {
         let t0 = Instant::now();
         for _ in 0..2 {
             let mut p = r.pick_at(&c, &m, &[], false, t0).ok().unwrap().permit;
-            p.finish_at(None, &Hints::default(), false, t0);
+            p.finish_at(Outcome::of(None, None), &Hints::default(), t0);
         }
         let later = t0 + Duration::from_secs(20);
         drop(r.pick_at(&c, &m, &[], false, later).ok().unwrap());
@@ -1014,7 +1019,7 @@ mod tests {
             retry_after: Some(Duration::from_secs(40)),
             ..Hints::default()
         };
-        p.finish_at(Some(429), &hints, false, t0);
+        p.finish_at(Outcome::of(Some(429), None), &hints, t0);
         drop(p);
         // Route a is parked, b takes the traffic, a returns after the hint.
         assert_eq!(r.pick_at(&c, &m, &[], false, t0).ok().unwrap().index, 1);
@@ -1034,7 +1039,7 @@ mod tests {
         );
         // Without a hint the default cooldown applies, capped by the maximum.
         let mut p = r.pick_at(&c, &m, &[0], false, t0).ok().unwrap().permit;
-        p.finish_at(Some(429), &Hints::default(), false, t0);
+        p.finish_at(Outcome::of(Some(429), None), &Hints::default(), t0);
         drop(p);
         let only_b = model(Strategy::Ordered, vec![route("b", "y")]);
         let wait = r.pick_at(&c, &only_b, &[], false, t0).err().unwrap();
@@ -1060,7 +1065,7 @@ mod tests {
             },
             None,
         );
-        p.finish_at(Some(200), &hints, false, t0);
+        p.finish_at(Outcome::of(Some(200), None), &hints, t0);
         drop(p);
         let wait = r.pick_at(&c, &m, &[], false, t0).err().unwrap();
         assert_eq!(wait, Duration::from_secs(45));
@@ -1078,7 +1083,7 @@ mod tests {
         let c = config(vec![m1.clone(), m2.clone()]);
         let t0 = Instant::now();
         let mut p = r.pick_at(&c, &m1, &[], false, t0).ok().unwrap().permit;
-        p.finish_at(Some(401), &Hints::default(), false, t0);
+        p.finish_at(Outcome::of(Some(401), None), &Hints::default(), t0);
         drop(p);
         // Provider a is out for the maximum cooldown, for every model.
         assert_eq!(r.pick_at(&c, &m1, &[], false, t0).ok().unwrap().index, 1);
@@ -1093,7 +1098,7 @@ mod tests {
         // An exhausted account (a 429 saying insufficient_quota) does the same.
         let t1 = t0 + Duration::from_secs(101);
         let mut p = r.pick_at(&c, &m1, &[0], false, t1).ok().unwrap().permit;
-        p.finish_at(Some(429), &Hints::default(), true, t1);
+        p.finish_at(Outcome::ProviderDown, &Hints::default(), t1);
         drop(p);
         assert_eq!(r.pick_at(&c, &m1, &[], false, t1).ok().unwrap().index, 0);
         let only_b = model(Strategy::Ordered, vec![route("b", "y")]);
@@ -1112,7 +1117,7 @@ mod tests {
         for status in [400, 408, 409] {
             for _ in 0..3 {
                 let mut p = r.pick_at(&c, &m, &[], false, t0).ok().unwrap().permit;
-                p.finish_at(Some(status), &Hints::default(), false, t0);
+                p.finish_at(Outcome::of(Some(status), None), &Hints::default(), t0);
             }
         }
         assert!(r.pick_at(&c, &m, &[], false, t0).is_ok());
@@ -1125,7 +1130,7 @@ mod tests {
         let c = config(vec![m.clone()]);
         let t0 = Instant::now();
         let mut p = r.pick_at(&c, &m, &[], false, t0).ok().unwrap().permit;
-        p.finish_at(Some(404), &Hints::default(), false, t0);
+        p.finish_at(Outcome::of(Some(404), None), &Hints::default(), t0);
         drop(p);
         // The route is skipped for the cooldown, then tried first again.
         assert_eq!(r.pick_at(&c, &m, &[], false, t0).ok().unwrap().index, 1);
@@ -1148,7 +1153,7 @@ mod tests {
         for _ in 0..5 {
             t += Duration::from_secs(11);
             let mut p = r.pick_at(&c, &m, &[], false, t).ok().unwrap().permit;
-            p.finish_at(Some(404), &Hints::default(), false, t);
+            p.finish_at(Outcome::of(Some(404), None), &Hints::default(), t);
         }
         let st = r.lock();
         let route = &st.routes[&("a".to_owned(), "x".to_owned())];
@@ -1164,7 +1169,7 @@ mod tests {
         let t0 = Instant::now();
         // A bare 400 says nothing: the route stays first.
         let mut p = r.pick_at(&c, &m, &[], false, t0).ok().unwrap().permit;
-        p.finish_at(Some(400), &Hints::default(), false, t0);
+        p.finish_at(Outcome::of(Some(400), None), &Hints::default(), t0);
         drop(p);
         assert_eq!(r.pick_at(&c, &m, &[], false, t0).ok().unwrap().index, 0);
         // Once another route served the same request, it is skipped for the

@@ -30,7 +30,8 @@ use crate::{
     router::{
         Permit,
         free::{self, Admission},
-        hints::{self, Hints},
+        hints::Hints,
+        outcome::{self, Outcome},
     },
 };
 use axum::{
@@ -166,6 +167,17 @@ const STRIPPED_RESPONSE: [&str; 4] = [
     "content-length",
 ];
 
+/// Whether an upstream response header describes the operator's upstream
+/// account: its rate limits and retry hints (the router reads them, the
+/// client gets its own) or its organization and project.
+fn upstream_private(name: &str) -> bool {
+    matches!(
+        name,
+        "retry-after" | "retry-after-ms" | "openai-organization" | "openai-project"
+    ) || name.starts_with("x-ratelimit-")
+        || name.starts_with("ratelimit")
+}
+
 /// Copies end-to-end headers in either direction.
 pub(crate) fn forward_headers(input: &HeaderMap, request: bool) -> HeaderMap {
     let listed_in_connection: Vec<String> = input
@@ -183,7 +195,7 @@ pub(crate) fn forward_headers(input: &HeaderMap, request: bool) -> HeaderMap {
             || if request {
                 STRIPPED_REQUEST.contains(&n) || n.starts_with("sec-websocket-")
             } else {
-                STRIPPED_RESPONSE.contains(&n)
+                STRIPPED_RESPONSE.contains(&n) || upstream_private(n)
             };
         if !drop {
             out.append(name.clone(), value.clone());
@@ -472,12 +484,30 @@ enum Failed {
     /// The upstream answered with an error status.
     Http {
         status: StatusCode,
+        outcome: Outcome,
         /// The body, when it was JSON and small enough to read.
         raw: Option<Bytes>,
         headers: HeaderMap,
     },
     /// No response head arrived.
     Transport { timeout: bool },
+}
+
+impl Failed {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Http { outcome, .. } => outcome.rank(),
+            Self::Transport { .. } => Outcome::Failure.rank(),
+        }
+    }
+
+    /// Keeps the failure that best explains the request to the client: the
+    /// higher [`Outcome::rank`], the later one on a tie.
+    fn keep(slot: &mut Option<Self>, new: Self) {
+        if slot.as_ref().is_none_or(|old| new.rank() >= old.rank()) {
+            *slot = Some(new);
+        }
+    }
 }
 
 /// How the attempts ended.
@@ -492,16 +522,6 @@ enum Finished {
 
 /// Chunks buffered between the upstream reader and the client.
 const RELAY_BUFFER: usize = 8;
-
-/// Statuses after which the next route is tried. Server errors are retried
-/// as well.
-fn retryable(status: StatusCode) -> bool {
-    status.is_server_error()
-        || matches!(
-            status.as_u16(),
-            400 | 401 | 402 | 403 | 404 | 408 | 409 | 429
-        )
-}
 
 impl Exchange {
     /// Picks routes and sends the request (trying the next route after a
@@ -634,7 +654,7 @@ impl Exchange {
             let latency = started.elapsed();
             // The upload may have aborted itself.
             if let Some(error) = counter.take_rejection() {
-                permit.finish(None, &Hints::default(), false);
+                permit.finish(Outcome::Failure, &Hints::default());
                 meter.attempt(&route.provider, &route.model, 0, latency);
                 meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
                 meter.fail(error.status, &error.to_string());
@@ -647,11 +667,7 @@ impl Exchange {
                     let status = response.status();
                     let errored = status.is_client_error() || status.is_server_error();
                     if !errored {
-                        permit.finish(
-                            Some(status.as_u16()),
-                            &Hints::parse(response.headers(), None),
-                            false,
-                        );
+                        permit.finish(Outcome::Success, &Hints::parse(response.headers(), None));
                         meter.attempt(&route.provider, &route.model, status.as_u16(), latency);
                         for index in refused.drain(..) {
                             let other = &model.routes[index];
@@ -675,35 +691,52 @@ impl Exchange {
                     };
                     let parsed: Option<Value> =
                         raw.as_deref().and_then(|b| serde_json::from_slice(b).ok());
+                    let outcome = Outcome::of(Some(status.as_u16()), parsed.as_ref());
                     let hints = Hints::parse(&response_headers, parsed.as_ref());
-                    let credit = parsed.as_ref().is_some_and(hints::is_out_of_credit);
-                    permit.finish(Some(status.as_u16()), &hints, credit);
+                    permit.finish(outcome, &hints);
                     meter.attempt(&route.provider, &route.model, status.as_u16(), latency);
+                    if outcome != Outcome::Success {
+                        tracing::info!(
+                            provider = %route.provider,
+                            model = %route.model,
+                            status = status.as_u16(),
+                            ?outcome,
+                            "upstream attempt failed"
+                        );
+                    }
                     let error = Failed::Http {
                         status,
+                        outcome,
                         raw,
                         headers: response_headers,
                     };
-                    if retryable(status) && can_retry {
-                        if status == StatusCode::BAD_REQUEST {
-                            refused.push(picked.index);
-                        }
-                        failed = Some(error);
+                    if outcome == Outcome::Final {
+                        // No route would answer it differently.
+                        break Finished::Failed(error);
+                    }
+                    if outcome == Outcome::Rejected {
+                        refused.push(picked.index);
+                    }
+                    Failed::keep(&mut failed, error);
+                    if outcome.retries() && can_retry {
                         continue;
                     }
-                    break Finished::Failed(error);
+                    break Finished::Failed(failed.take().expect("a failure was kept"));
                 }
                 Err(e) => {
-                    permit.finish(None, &Hints::default(), false);
+                    permit.finish(Outcome::Failure, &Hints::default());
                     meter.attempt(&route.provider, &route.model, 0, latency);
                     let error = Failed::Transport {
                         timeout: e.is_timeout(),
                     };
-                    if can_retry && !counter.too_large.load(Ordering::Relaxed) {
-                        failed = Some(error);
+                    if counter.too_large.load(Ordering::Relaxed) {
+                        break Finished::Failed(error);
+                    }
+                    Failed::keep(&mut failed, error);
+                    if can_retry {
                         continue;
                     }
-                    break Finished::Failed(error);
+                    break Finished::Failed(failed.take().expect("a failure was kept"));
                 }
             }
         };
@@ -745,11 +778,55 @@ impl Exchange {
                 )));
                 return;
             }
+            Finished::Failed(Failed::Http { outcome, .. }) if outcome.is_capacity() => {
+                // Rate limits, unusable provider accounts and missing models
+                // are the operator's capacity, not the caller's mistake: the
+                // client gets a retry hint, never the upstream's text (which
+                // may name the operator's account, plan, or upstream model).
+                meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+                meter.fail(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "upstream capacity exhausted",
+                );
+                settle(meter).await;
+                let wait = app.router.soonest(&config, model);
+                let _ = head.send(Err(rate_headers(unavailable(wait), free.as_ref())));
+                return;
+            }
+            Finished::Failed(Failed::Http {
+                outcome: Outcome::TooLarge,
+                ..
+            }) => {
+                meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+                meter.fail(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request too large for every route",
+                );
+                settle(meter).await;
+                let _ = head.send(Err(rate_headers(
+                    Error::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_too_large",
+                        "The request is larger than this model accepts right now. \
+                         Shorten the messages or lower max_tokens and try again",
+                    ),
+                    free.as_ref(),
+                )));
+                return;
+            }
             Finished::Failed(Failed::Http {
                 status,
+                outcome,
                 raw,
                 headers,
             }) => {
+                // A moderation refusal is about the content, even when the
+                // upstream sent it as 403.
+                let status = if outcome == Outcome::Refused && status.as_u16() != 400 {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    status
+                };
                 // Upstream errors are rebuilt in the API's shape: an error
                 // page that is not JSON (for example an HTML 502 from a
                 // gateway) gets a generic message, and a JSON error keeps only
@@ -757,15 +834,10 @@ impl Exchange {
                 // never reach the customer.
                 meter.status = status.as_u16();
                 meter.success = false;
-                let (out_status, body) = upstream_error(status, raw.as_deref());
+                let body = upstream_error(status, raw.as_deref());
                 let mut out_headers =
                     response_head(&headers, &meter, identity.as_ref(), balance, free.as_ref());
                 if let Ok(h) = &mut out_headers {
-                    if out_status != status {
-                        // A rewritten status (for example 429 to 502) must
-                        // not keep the upstream's retry hint.
-                        h.remove(header::RETRY_AFTER);
-                    }
                     h.remove(header::CONTENT_ENCODING);
                     h.remove(header::CONTENT_LENGTH);
                     h.insert(
@@ -779,7 +851,7 @@ impl Exchange {
                 match out_headers {
                     Ok(h) => {
                         let mut out = Response::new(Body::from(body));
-                        *out.status_mut() = out_status;
+                        *out.status_mut() = status;
                         *out.headers_mut() = h;
                         settle(meter).await;
                         let _ = head.send(Ok(out));
@@ -953,25 +1025,17 @@ async fn read_capped(
 
 /// Rebuilds an upstream error as `{"error":{"message","type","param","code"}}`.
 ///
-/// Upstream 401, 402 and 403 concern the operator's upstream account, not
-/// the caller's key, so they become 502 with a generic message.
-fn upstream_error(status: StatusCode, raw: Option<&[u8]>) -> (StatusCode, Value) {
+/// Only errors about the request reach here: capacity, account and catalog
+/// failures are answered by the proxy itself (see [`Outcome::is_capacity`]).
+fn upstream_error(status: StatusCode, raw: Option<&[u8]>) -> Value {
     let generic = || {
         format!(
             "The upstream provider returned an error (HTTP {})",
             status.as_u16()
         )
     };
-    if matches!(status.as_u16(), 401..=403) {
-        let error = Error::new(
-            StatusCode::BAD_GATEWAY,
-            "upstream_error",
-            "The upstream provider rejected the request. Please try again later",
-        );
-        return (StatusCode::BAD_GATEWAY, error.body());
-    }
     let parsed: Option<Value> = raw.and_then(|b| serde_json::from_slice(b).ok());
-    let error = parsed.as_ref().map(|v| v.get("error").unwrap_or(v));
+    let error = parsed.as_ref().map(outcome::error_object);
     let text = |key: &str| {
         error
             .and_then(|e| e.get(key))
@@ -980,19 +1044,6 @@ fn upstream_error(status: StatusCode, raw: Option<&[u8]>) -> (StatusCode, Value)
             .filter(|s| !s.is_empty())
             .map(|s| s.chars().take(1000).collect::<String>())
     };
-    // An upstream `insufficient_quota` (OpenAI sends it as a 429) means the
-    // operator's upstream account is out of credit, not the caller's: it
-    // must not look like the caller's quota or rate limit.
-    if text("code").as_deref() == Some("insufficient_quota")
-        || text("type").as_deref() == Some("insufficient_quota")
-    {
-        let error = Error::new(
-            StatusCode::BAD_GATEWAY,
-            "upstream_error",
-            "The upstream provider is temporarily unavailable. Please try again later",
-        );
-        return (StatusCode::BAD_GATEWAY, error.body());
-    }
     let message = text("message")
         .or_else(|| error.and_then(Value::as_str).map(str::to_owned))
         .unwrap_or_else(generic);
@@ -1011,10 +1062,9 @@ fn upstream_error(status: StatusCode, raw: Option<&[u8]>) -> (StatusCode, Value)
         _ => Value::String("upstream_error".into()),
     };
     let param = text("param").map_or(Value::Null, Value::String);
-    let body = serde_json::json!({
+    serde_json::json!({
         "error": {"message": message, "type": kind, "param": param, "code": code}
-    });
-    (status, body)
+    })
 }
 
 /// Response headers returned to the client: the upstream's end-to-end
@@ -1385,8 +1435,7 @@ mod tests {
     #[test]
     fn upstream_errors_keep_only_the_openai_fields() {
         let raw = br#"{"error":{"message":"x is not a valid model ID","code":400,"metadata":{"provider_name":"P"}},"user_id":"user_123"}"#;
-        let (status, body) = upstream_error(StatusCode::BAD_REQUEST, Some(raw));
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body = upstream_error(StatusCode::BAD_REQUEST, Some(raw));
         assert_eq!(
             body,
             serde_json::json!({"error": {
@@ -1402,44 +1451,39 @@ mod tests {
     #[test]
     fn upstream_openai_errors_pass_their_fields() {
         let raw = br#"{"error":{"message":"bad","type":"invalid_request_error","param":"messages","code":"invalid_value"}}"#;
-        let (_, body) = upstream_error(StatusCode::BAD_REQUEST, Some(raw));
+        let body = upstream_error(StatusCode::BAD_REQUEST, Some(raw));
         assert_eq!(body["error"]["param"], "messages");
         assert_eq!(body["error"]["code"], "invalid_value");
-    }
-
-    #[test]
-    fn upstream_account_failures_become_bad_gateway() {
-        for code in [401, 402, 403] {
-            let status = StatusCode::from_u16(code).unwrap();
-            let (out, body) = upstream_error(
-                status,
-                Some(br#"{"error":{"message":"No auth credentials found"}}"#),
-            );
-            assert_eq!(out, StatusCode::BAD_GATEWAY);
-            assert_eq!(body["error"]["code"], "upstream_error");
-            assert!(!body.to_string().contains("credentials"));
-        }
-    }
-
-    #[test]
-    fn upstream_insufficient_quota_is_the_operators_problem() {
-        let raw = br#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#;
-        let (out, body) = upstream_error(StatusCode::TOO_MANY_REQUESTS, Some(raw));
-        assert_eq!(out, StatusCode::BAD_GATEWAY);
-        assert_eq!(body["error"]["code"], "upstream_error");
-        assert!(!body.to_string().contains("quota"));
-        let limited = br#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#;
-        let (out, body) = upstream_error(StatusCode::TOO_MANY_REQUESTS, Some(limited));
-        assert_eq!(out, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+        // Google wraps its errors in an array.
+        let raw = br#"[{"error":{"code":400,"message":"Invalid value at 'temperature'","status":"INVALID_ARGUMENT"}}]"#;
+        let body = upstream_error(StatusCode::BAD_REQUEST, Some(raw));
+        assert_eq!(body["error"]["message"], "Invalid value at 'temperature'");
     }
 
     #[test]
     fn non_json_upstream_errors_get_a_generic_message() {
-        let (out, body) = upstream_error(StatusCode::SERVICE_UNAVAILABLE, None);
-        assert_eq!(out, StatusCode::SERVICE_UNAVAILABLE);
+        let body = upstream_error(StatusCode::SERVICE_UNAVAILABLE, None);
         assert_eq!(body["error"]["type"], "server_error");
         assert!(body["error"]["message"].as_str().unwrap().contains("503"));
+    }
+
+    #[test]
+    fn upstream_account_headers_are_not_returned() {
+        let mut upstream = HeaderMap::new();
+        for name in [
+            "retry-after",
+            "retry-after-ms",
+            "x-ratelimit-remaining-tokens",
+            "ratelimit-policy",
+            "openai-organization",
+            "x-request-id",
+            "content-type",
+        ] {
+            upstream.insert(HeaderName::from_static(name), HeaderValue::from_static("1"));
+        }
+        let out = forward_headers(&upstream, false);
+        let names: Vec<&str> = out.keys().map(HeaderName::as_str).collect();
+        assert_eq!(names, ["x-request-id", "content-type"]);
     }
 
     #[test]
@@ -1472,12 +1516,16 @@ mod tests {
 
     #[test]
     fn failures_fall_through_to_the_next_route() {
-        for code in [400, 401, 402, 403, 404, 408, 409, 429, 500, 502, 503, 504] {
-            assert!(retryable(StatusCode::from_u16(code).unwrap()), "{code}");
+        let retries = |code: u16| Outcome::of(Some(code), None).retries();
+        for code in [
+            400, 401, 402, 403, 404, 408, 409, 413, 422, 425, 429, 500, 502, 503, 504,
+        ] {
+            assert!(retries(code), "{code}");
         }
-        for code in [200, 301, 413, 422] {
-            assert!(!retryable(StatusCode::from_u16(code).unwrap()), "{code}");
+        for code in [200, 301, 405, 415] {
+            assert!(!retries(code), "{code}");
         }
+        assert!(Outcome::of(None, None).retries());
     }
 
     #[test]

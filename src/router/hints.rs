@@ -149,15 +149,6 @@ fn body_delay(body: &Value) -> Option<Duration> {
     })
 }
 
-/// Whether an error body reports an exhausted account (`insufficient_quota`)
-/// rather than a momentary rate limit.
-pub fn is_out_of_credit(body: &Value) -> bool {
-    let error = body.get("error").unwrap_or(body);
-    ["code", "type"]
-        .into_iter()
-        .any(|key| error.get(key).and_then(Value::as_str) == Some("insufficient_quota"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,19 +250,5 @@ mod tests {
             Hints::parse(&HeaderMap::new(), Some(&json!({"error": "x"}))).retry_after,
             None
         );
-    }
-
-    #[test]
-    fn out_of_credit_is_not_a_rate_limit() {
-        assert!(is_out_of_credit(
-            &json!({"error": {"code": "insufficient_quota"}})
-        ));
-        assert!(is_out_of_credit(
-            &json!({"error": {"type": "insufficient_quota"}})
-        ));
-        assert!(!is_out_of_credit(
-            &json!({"error": {"code": "rate_limit_exceeded"}})
-        ));
-        assert!(!is_out_of_credit(&json!("nope")));
     }
 }

@@ -10,6 +10,7 @@ This guide explains how reseller picks an upstream for each request, how the key
 - [Why over-limit requests fail fast](#why-over-limit-requests-fail-fast)
 - [Route selection](#route-selection)
 - [Circuit breaker and cooldowns](#circuit-breaker-and-cooldowns)
+- [Failure classification](#failure-classification)
 - [Response rewriting](#response-rewriting)
 - [Upstream hints](#upstream-hints)
 - [Failover rules](#failover-rules)
@@ -142,19 +143,28 @@ Each route has a circuit breaker.
 | `open` | Out of rotation until the cooldown ends. |
 | `half_open` | The cooldown ended. One probe request is let through. A success closes the circuit and resets the failure count. A failure reopens it with a doubled cooldown. |
 
-What counts, per attempt:
-
-| Upstream answer | Effect |
-|---|---|
-| `2xx` | Success. Closes a half-open circuit and resets the failure count. |
-| `5xx`, timeout, connection error | A breaker failure. After `routing.failure_threshold` in a row the circuit opens. |
-| `429` | The route cools down until the upstream's hint, else `routing.cooldown_seconds`. It is not a breaker failure. |
-| `401`, `402`, `403`, or an `insufficient_quota` body | A problem with the operator's account. The whole provider cools down for `routing.max_cooldown_seconds`. |
-| `404` | The upstream does not know the model. The route cools down for `routing.cooldown_seconds` and the next route is tried. It is not a breaker failure, so a permanently broken route of an `ordered` model is not tried first on every request. |
-| `400` | Says nothing about health on its own. When a later route then serves the same request, the refusal was about the route (OpenRouter, for example, answers an unknown model with `400`), so that route cools down for `routing.cooldown_seconds` like a `404`. |
-| `408`, `409` | The next route is tried, but the route's health is not affected. |
+Each attempt's answer is classified (see [Failure classification](#failure-classification)) and the outcome decides the effect.
 
 Cooldown lengths start at `routing.cooldown_seconds`, double on each reopen, get 20% random jitter in either direction so retries do not synchronize, and never exceed `routing.max_cooldown_seconds`. Cooldowns from upstream hints are capped the same way.
+
+## Failure classification
+
+Providers report the same condition under different statuses, so an answer is classified from its status and its error body together: the structured fields first (`error.code`, `error.type`, Google's `error.status`, with errors wrapped in an array as Google does), the message when they are missing, and the status last. Examples seen in production: Groq answers a request above its per-minute token window with `413` and `code: rate_limit_exceeded` ("Limit 7000, Requested 8012"), Gemini answers from an unsupported region with `400 FAILED_PRECONDITION` ("User location is not supported"), OpenAI sends an empty account as `429 insufficient_quota`, and OpenRouter sends a moderation refusal as `403`.
+
+| Outcome | Recognized by | Route health | Next route | Caller gets, when it is the reported failure |
+|---|---|---|---|---|
+| Success | `2xx` | Closes a half-open circuit, resets the failure count | No | The response |
+| Rate limited | `429`, or a rate-limit code or message under any status, when the request fits the window | Route cools down until the upstream's hint, else `routing.cooldown_seconds`. Not a breaker failure. | Yes | `503 capacity_exhausted` with `Retry-After` |
+| Too large | `413`, `context_length_exceeded` and similar, or a rate-limit message whose `Requested` exceeds its `Limit` | Untouched: smaller requests still fit, so the upstream's `Retry-After` is ignored | Yes | `413 request_too_large` |
+| Provider down | `401`, `402`, `403`, `insufficient_quota`, credit messages, unsupported region or country | The whole provider cools down for `routing.max_cooldown_seconds` | Yes | `503 capacity_exhausted` with `Retry-After` |
+| Not found | `404`, `model_not_found`, `model_decommissioned` | Route cools down for `routing.cooldown_seconds`. Not a breaker failure. | Yes | `503 capacity_exhausted` with `Retry-After` |
+| Failure | `5xx`, timeout, connection error | A breaker failure. After `routing.failure_threshold` in a row the circuit opens. | Yes | The rebuilt upstream error, `502`, or `504` |
+| Refused | Moderation codes or messages (`content_filter`, "flagged"), under any status | Untouched, so one caller cannot disable a provider | Yes | `400` with the upstream message |
+| Rejected | Other `400` and `422` | Untouched. When a later route serves the request, the route cools down for `routing.cooldown_seconds` (OpenRouter, for example, answers an unknown model with `400`). | Yes | The rebuilt upstream error |
+| Transient | `408`, `409`, `425` | Untouched | Yes | The rebuilt upstream error |
+| Final | Other `4xx` | Untouched | No | The rebuilt upstream error |
+
+When every attempt failed, the reported failure is the most actionable one: a capacity problem (the caller can retry later) beats a server error, which beats a request too large for every route, which beats a client error. On a tie the later attempt wins. Capacity failures never show the upstream's text, which can name the operator's account, organization, plan, or upstream model. Every failed attempt is logged at `info` with its provider, upstream model, status, and outcome.
 
 ## Response rewriting
 
@@ -181,7 +191,7 @@ How the hints are used:
 - The reported limits and remaining counts are learned as windows and enter the `headroom` of the score even when you configured no limit. A window without a reset time is believed for one minute.
 - No hint is ever believed for more than 24 hours, so a broken upstream cannot park a route for longer.
 
-Hints from the upstream are never forwarded to the client. The client gets its own `Retry-After`.
+Hints from the upstream are never forwarded to the client: `retry-after`, `retry-after-ms`, `x-ratelimit-*`, and `ratelimit*` headers are removed, as are `openai-organization` and `openai-project`. The client gets its own `Retry-After`.
 
 ## Failover rules
 

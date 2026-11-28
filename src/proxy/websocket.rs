@@ -10,7 +10,7 @@ use crate::{
     error::{Error, Result},
     identity::Caller,
     meter::{Meter, RequestMeta, Usage},
-    router::{Permit, free::Admission, hints::Hints},
+    router::{Outcome, Permit, free::Admission, hints::Hints},
 };
 use axum::{
     body::Body,
@@ -151,12 +151,12 @@ pub(super) async fn relay(
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)).await;
     let (up, response) = match connected {
         Ok(Ok(pair)) => {
-            permit.finish(Some(200), &Hints::default(), false);
+            permit.finish(Outcome::Success, &Hints::default());
             meter.attempt(&route.provider, &route.model, 101, started.elapsed());
             pair
         }
         Ok(Err(_)) => {
-            permit.finish(None, &Hints::default(), false);
+            permit.finish(Outcome::Failure, &Hints::default());
             meter.attempt(&route.provider, &route.model, 0, started.elapsed());
             return Err(settle_failure(
                 meter,
@@ -173,7 +173,7 @@ pub(super) async fn relay(
             .await);
         }
         Err(_) => {
-            permit.finish(None, &Hints::default(), false);
+            permit.finish(Outcome::Failure, &Hints::default());
             meter.attempt(&route.provider, &route.model, 0, started.elapsed());
             return Err(settle_failure(
                 meter,

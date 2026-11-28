@@ -377,7 +377,8 @@ api_key = "${OPENROUTER2_API_KEY:-}"
 # tier with per-project, per-model limits (requests per minute, tokens per
 # minute, requests per day, reset at midnight Pacific). Copy the numbers from
 # Google's rate-limit page into the route limits. Free-tier prompts are used
-# to improve Google's products.
+# to improve Google's products. From an unsupported region Google answers 400
+# "User location is not supported", which cools the provider down.
 [[providers]]
 id = "gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -535,12 +536,13 @@ model = "openai/gpt-6-luna"
 # failure_threshold = 3
 
 # First circuit-open cooldown in seconds. It doubles on every reopen, with
-# +/-20% jitter. Also the cooldown after a 429 without a retry hint.
+# +/-20% jitter. Also the cooldown after a rate limit without a retry hint.
 # Default: 30.
 # cooldown_seconds = 30
 
-# Cap of every cooldown, also used for provider-wide auth and credit failures
-# (401, 402, 403). Default: 600.
+# Cap of every cooldown, also used for provider-wide auth, credit, and region
+# failures (401, 402, 403, insufficient_quota, unsupported location).
+# Default: 600.
 # max_cooldown_seconds = 600
 
 # =============================================================================

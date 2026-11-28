@@ -1124,8 +1124,15 @@ async fn generate_text_validates_arguments_and_reports_failures() {
     assert!(seen.lock().unwrap().is_empty());
     // Provider failures surface as tool errors, not protocol errors.
     let r = t.tool(key, "generate_text", json!({"prompt":"x"})).await;
-    assert_eq!(error_code(&r), "upstream_error");
-    assert!(text_of(&r).contains("429") && text_of(&r).contains("slow down"));
+    // A rate limit is the operator's capacity: the upstream's text stays
+    // private and the caller is told to retry.
+    assert_eq!(error_code(&r), "capacity_exhausted");
+    assert!(
+        text_of(&r).contains("No upstream capacity"),
+        "{}",
+        text_of(&r)
+    );
+    assert!(!text_of(&r).contains("slow down"));
     // The rate-limited route now cools down: nothing else can serve.
     // Conversation form.
     let r = t

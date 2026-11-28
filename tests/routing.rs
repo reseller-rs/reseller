@@ -212,6 +212,8 @@ struct Up {
     gate: Option<Arc<Semaphore>>,
     cost: Arc<Mutex<Option<f64>>>,
     tokens: Arc<AtomicUsize>,
+    /// The error body, when not the default one.
+    error: Arc<Mutex<Option<Value>>>,
     /// Answers like an upstream that names itself: its own model and a
     /// `provider` key, as JSON or (for `stream: true`) as an event stream.
     leaky: bool,
@@ -226,6 +228,7 @@ impl Up {
             gate: None,
             cost: Arc::default(),
             tokens: Arc::new(AtomicUsize::new(30)),
+            error: Arc::default(),
             leaky: false,
         }
     }
@@ -240,6 +243,11 @@ impl Up {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
+        self
+    }
+
+    fn with_error(self, body: Value) -> Self {
+        *self.error.lock().unwrap() = Some(body);
         self
     }
 
@@ -284,7 +292,9 @@ impl Up {
                     }
                     json!({"id": "mock", "choices": [], "usage": usage})
                 } else {
-                    json!({"error": {"message": "upstream says no", "type": "x", "code": "upstream_code"}})
+                    up.error.lock().unwrap().clone().unwrap_or_else(|| {
+                        json!({"error": {"message": "upstream says no", "type": "x", "code": "upstream_code"}})
+                    })
                 };
                 let mut response: Response = (status, Json(body)).into_response();
                 for (name, value) in up.headers.lock().unwrap().iter() {
@@ -536,6 +546,167 @@ async fn when_every_route_fails_the_last_upstream_error_is_returned() {
     assert_eq!(rows[0].get::<i64, _>("billed_micro"), 0);
 }
 
+/// Groq's answer to a request above its per-minute token window.
+fn groq_too_large() -> Value {
+    json!({"error": {
+        "message": "Request too large for model `qwen/qwen3.8-27b` in organization `org_01secret` service tier `on_demand` on input tokens per minute (ITPM): Limit 7000, Requested 7503, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing",
+        "type": "tokens", "code": "rate_limit_exceeded"}})
+}
+
+#[tokio::test]
+async fn a_request_too_large_for_a_route_moves_on_without_parking_it() {
+    let mut t = Test::new(|_| {}).await;
+    let small = Up::new(413)
+        .with_headers(&[
+            ("retry-after", "9"),
+            ("x-ratelimit-remaining-tokens", "8000"),
+        ])
+        .with_error(groq_too_large());
+    let big = Up::new(200);
+    t.upstream("small", &small).await;
+    t.upstream("big", &big).await;
+    t.model(
+        "m",
+        Tier::Free,
+        Strategy::Ordered,
+        &[("small", "x"), ("big", "y")],
+    )
+    .await;
+    let r = t.chat(IP, None, Some("m")).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!((small.hits(), big.hits()), (1, 1));
+    // Smaller requests still fit the route, so it is asked first again.
+    small.status.store(200, Ordering::SeqCst);
+    assert_eq!(t.chat(IP, None, Some("m")).await.status, 200);
+    assert_eq!((small.hits(), big.hits()), (2, 1));
+
+    // When no route can take it, the client is told to shorten the request,
+    // and the upstream's account details stay private.
+    let mut t = Test::new(|_| {}).await;
+    let only = Up::new(413).with_error(groq_too_large());
+    t.upstream("only", &only).await;
+    t.model("m", Tier::Free, Strategy::Ordered, &[("only", "x")])
+        .await;
+    let r = t.chat(IP, None, Some("m")).await;
+    assert_eq!(
+        (r.status, r.code()),
+        (413, "request_too_large"),
+        "{}",
+        r.body
+    );
+    assert!(!r.text.contains("org_"), "{}", r.text);
+    assert!(!r.text.contains("groq"), "{}", r.text);
+    assert!(!r.headers.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn a_provider_blocked_in_this_region_is_parked_as_a_whole() {
+    let mut t = Test::new(|_| {}).await;
+    let blocked = Up::new(400).with_error(json!([{"error": {
+        "code": 400,
+        "message": "User location is not supported for the API use.",
+        "status": "FAILED_PRECONDITION"}}]));
+    let good = Up::new(200);
+    t.upstream("blocked", &blocked).await;
+    t.upstream("good", &good).await;
+    t.model(
+        "m",
+        Tier::Free,
+        Strategy::Ordered,
+        &[("blocked", "x"), ("good", "y")],
+    )
+    .await;
+    t.model("n", Tier::Free, Strategy::Ordered, &[("blocked", "z")])
+        .await;
+    assert_eq!(t.chat(IP, None, Some("m")).await.status, 200);
+    assert_eq!(t.chat(IP, None, Some("m")).await.status, 200);
+    assert_eq!((blocked.hits(), good.hits()), (1, 2));
+    // Every route of the provider is parked, and the free caller gets a
+    // limit with a retry hint, not the provider's error.
+    let r = t.chat(IP, None, Some("n")).await;
+    assert_eq!(
+        (r.status, r.code()),
+        (503, "capacity_exhausted"),
+        "{}",
+        r.body
+    );
+    assert!(r.headers.contains_key("retry-after"));
+    assert_eq!(blocked.hits(), 1);
+}
+
+#[tokio::test]
+async fn free_callers_get_a_limit_not_the_providers_rate_limit_text() {
+    let mut t = Test::new(|_| {}).await;
+    let (a, b) = (
+        Up::new(429).with_headers(&[("retry-after", "20")]).with_error(json!({"error": {
+            "message": "Rate limit reached in organization org_01secret on requests per minute (RPM): Limit 30, Used 30, Requested 1.",
+            "type": "requests", "code": "rate_limit_exceeded"}})),
+        Up::new(503).with_error(json!({"error": {"message": "Too many requests, slow down"}})),
+    );
+    t.upstream("a", &a).await;
+    t.upstream("b", &b).await;
+    t.model(
+        "m",
+        Tier::Free,
+        Strategy::Ordered,
+        &[("a", "x"), ("b", "y")],
+    )
+    .await;
+    let r = t.chat(IP, None, Some("m")).await;
+    assert_eq!(
+        (r.status, r.code()),
+        (503, "capacity_exhausted"),
+        "{}",
+        r.body
+    );
+    assert!(
+        !r.text.contains("org_") && !r.text.contains("slow down"),
+        "{}",
+        r.text
+    );
+    let wait: u64 = r.header("retry-after").parse().unwrap();
+    assert!((1..=20).contains(&wait), "{wait}");
+    assert_eq!((a.hits(), b.hits()), (1, 1));
+    // Both routes are parked: the next request is refused without asking.
+    let r = t.chat(IP, None, Some("m")).await;
+    assert_eq!(r.status, 503);
+    assert_eq!((a.hits(), b.hits()), (1, 1));
+}
+
+#[tokio::test]
+async fn a_moderation_refusal_does_not_park_the_provider() {
+    let mut t = Test::new(|_| {}).await;
+    let strict = Up::new(403).with_error(json!({"error": {
+        "code": 403,
+        "message": "gpt-x requires moderation on OpenAI. Your input was flagged for \"harassment\"."}}));
+    let other = Up::new(200);
+    t.upstream("strict", &strict).await;
+    t.upstream("other", &other).await;
+    t.model(
+        "m",
+        Tier::Free,
+        Strategy::Ordered,
+        &[("strict", "x"), ("other", "y")],
+    )
+    .await;
+    assert_eq!(t.chat(IP, None, Some("m")).await.status, 200);
+    strict.status.store(200, Ordering::SeqCst);
+    assert_eq!(t.chat(IP, None, Some("m")).await.status, 200);
+    assert_eq!(
+        (strict.hits(), other.hits()),
+        (2, 1),
+        "strict is still first"
+    );
+    // Alone, the refusal is the client's: 400, not the operator's 502.
+    let mut t = Test::new(|_| {}).await;
+    let strict = Up::new(403).with_error(json!({"error": {"message": "Your input was flagged"}}));
+    t.upstream("strict", &strict).await;
+    t.model("m", Tier::Free, Strategy::Ordered, &[("strict", "x")])
+        .await;
+    let r = t.chat(IP, None, Some("m")).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
 #[tokio::test]
 async fn the_circuit_opens_after_repeated_failures_and_half_opens_for_a_probe() {
     let mut t = Test::new(|c| {
@@ -668,7 +839,9 @@ async fn an_auth_failure_cools_the_whole_provider_down() {
         .await;
     let k = t.account(true).await;
     let r = t.chat(IP, k["key"].as_str(), Some("m")).await;
-    assert_eq!((r.status, r.code()), (502, "upstream_error"));
+    // It is the operator's capacity: a retry hint, not the upstream's text.
+    assert_eq!((r.status, r.code()), (503, "capacity_exhausted"));
+    assert!(r.headers.contains_key("retry-after"));
     assert!(!r.body.to_string().contains("upstream says no"));
 }
 
@@ -701,7 +874,13 @@ async fn an_exhausted_upstream_account_cools_the_provider_down() {
     let k = t.account(true).await;
     let key = k["key"].as_str();
     let r = t.chat(IP, key, Some("m")).await;
-    assert_eq!((r.status, r.code()), (502, "upstream_error"), "{}", r.body);
+    assert_eq!(
+        (r.status, r.code()),
+        (503, "capacity_exhausted"),
+        "{}",
+        r.body
+    );
+    assert!(!r.body.to_string().contains("quota"));
     // Not a rate limit of the route: the whole provider is parked.
     let r = t.chat(IP, key, Some("n")).await;
     assert_eq!((r.status, r.code()), (503, "capacity_exhausted"));
