@@ -10,14 +10,15 @@
 //!   `default`.
 //! - A configured model without levels has no reasoning control: the
 //!   parameter is removed, so the upstream cannot reject it.
-//! - Free accounts are capped at `free_effort` (the highest supported level
+//! - Requests to free models are capped at `free_effort` (the highest supported level
 //!   at or below it), and configured reasoning models get that level even
 //!   when the request names none.
 //! - Models that are not configured get the client's value unchanged, apart
 //!   from the free cap.
 //!
-//! Each fallback model gets the policy again from the original request, with
-//! an unsupported level mapped to the nearest lower one instead of a 400.
+//! Each attempt gets the policy again for the upstream model of its route,
+//! from the original request, with an unsupported level mapped to the
+//! nearest lower one instead of a 400.
 use crate::{
     config::{Config, ReasoningModel, effort_rank},
     error::{Error, Result},
@@ -92,9 +93,9 @@ fn higher(level: &str, than: &str) -> bool {
     matches!((effort_rank(level), effort_rank(than)), (Some(a), Some(b)) if a > b)
 }
 
-/// Applies the policy for `model` to `body`. `free` caps the level, and
-/// `strict` turns an unsupported level into a 400 (the requested model)
-/// rather than mapping it down (fallback models).
+/// Applies the policy for `model` to `body`. `free` (a free model) caps the
+/// level, and `strict` turns an unsupported level into a 400 (the first
+/// route) rather than mapping it down (later attempts).
 pub fn apply(
     body: &mut Value,
     path: &str,

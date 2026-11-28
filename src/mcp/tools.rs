@@ -403,10 +403,8 @@ pub(super) fn definitions() -> Vec<Value> {
 pub(super) fn instructions(config: &Config) -> String {
     let base = config.public_base();
     let signup = if config.signup.enabled {
-        format!(
-            "New accounts receive ${} of trial credit valid for {} days.",
-            config.signup.free_credit_usd, config.signup.free_credit_expiry_days
-        )
+        "New accounts start without credit: free models need none, paid models need a plan or a top-up."
+            .to_owned()
     } else {
         "Self-service signup is disabled. Ask the operator for credentials.".to_owned()
     };
@@ -423,7 +421,7 @@ pub(super) fn instructions(config: &Config) -> String {
          - Any credential: account_overview, usage_summary, list_requests, list_keys, create_key, rotate_key, \
          block_key, list_plans, redeem_code, start_checkout.\n\
          \n\
-         Pricing: usage is billed in USD against the monthly subscription quota, then top-ups. Every generation result reports its \
+         Pricing: paid models are billed in USD against the monthly subscription quota, then top-ups. Free models cost nothing and are rate limited. Every generation result reports its \
          billed cost, tokens and the remaining balance. {signup} Use list_plans and start_checkout to add credit; \
          insufficient_quota errors mean the balance is exhausted or smaller than the request may cost (lower max_tokens). Rate limits return an error with a retry delay.",
         name = config.branding.name,

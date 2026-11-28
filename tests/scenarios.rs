@@ -14,13 +14,15 @@ use axum::{
 };
 use reseller::{
     App, billing,
-    config::{Config, Policy},
+    config::{Capability, Config},
     db, identity, keys,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::net::SocketAddr;
 use tower::ServiceExt;
+
+mod common;
 
 const ADMIN: &str = "admin-test-secret-123456789";
 
@@ -37,11 +39,8 @@ impl Test {
             key_pepper: "pepper-test-secret-12345678".into(),
             signup: reseller::config::Signup {
                 cooldown_seconds: 0,
-                ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
-                // Halving is on by default, but these tests expect full trial credit.
-                free_credit_halving: false,
                 ..Default::default()
             },
             keys: reseller::config::KeyPolicy {
@@ -61,15 +60,18 @@ impl Test {
             _dir: dir,
         }
     }
+    /// A new account with 0.10 USD of credit.
     async fn key(&self) -> Value {
-        keys::create(
+        let key = keys::create(
             &self.app,
             keys::Requester::Signup { altcha: None },
             "127.0.0.1",
             &json!({"name":"test"}),
         )
         .await
-        .unwrap()
+        .unwrap();
+        common::fund(&self.app, key["account_id"].as_str().unwrap(), common::DIME).await;
+        key
     }
     async fn call(
         &self,
@@ -149,9 +151,8 @@ async fn mock_llm(t: &Test, cost: &'static str, tokens: i64) -> tokio::task::Joi
     )))
     .await;
     let mut c = t.app.config_mut().await;
-    c.llm.base_url = format!("{base}/v1");
-    c.llm.api_key = "upstream-secret".into();
-    c.llm.model = "configured".into();
+    common::llm(&mut c, "configured");
+    common::point(&mut c, "llm", &format!("{base}/v1"), "upstream-secret");
     task
 }
 async fn balance(t: &Test, aid: &str) -> String {
@@ -272,11 +273,11 @@ async fn redeem_credit_code_settles_existing_debt_first() {
     assert_eq!(remaining, 8_000_000);
 }
 
-/// Signup trial credit that has expired cannot be spent, blocks proxying at
+/// Credit that has expired cannot be spent, blocks paid proxying at
 /// admission, and an admin top-up restores service without resurrecting the
 /// expired lot.
 #[tokio::test]
-async fn expired_free_credit_blocks_proxy_until_admin_topup() {
+async fn expired_credit_blocks_proxy_until_admin_topup() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap().to_owned();
@@ -3105,89 +3106,94 @@ async fn redeem_codes_can_be_issued_in_bulk_atomically() {
     assert_eq!(final_count, after + 1);
 }
 
-/// Model policy semantics: "default" fills only a missing model, "force"
-/// always overrides the client, and "passthrough" forwards whatever the client
-/// sent, even a placeholder, without substitution.
+/// Model resolution: a missing model gets the capability's default, ids and
+/// aliases resolve (case-insensitively) to the route's upstream model, and
+/// anything else is not found. A speech model's voice fills a missing voice.
 #[tokio::test]
-async fn model_policy_default_force_and_passthrough() {
+async fn model_resolution_uses_defaults_aliases_and_the_models_voice() {
     let t = Test::new().await;
     let (base, task) = upstream(Router::new().fallback(any(|req: Request<Body>| async move {
         let v: Value =
             serde_json::from_slice(&to_bytes(req.into_body(), 1_000_000).await.unwrap()).unwrap();
-        axum::Json(json!({"model": v.get("model").cloned().unwrap_or(Value::Null)}))
+        axum::Json(json!({"model": v.get("model").cloned().unwrap_or(Value::Null), "seen": v.get("model").cloned().unwrap_or(Value::Null), "voice": v.get("voice").cloned().unwrap_or(Value::Null)}))
     })))
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.llm.base_url = format!("{base}/v1");
-        c.llm.api_key = "upstream".into();
-        c.llm.model = "configured".into();
-        c.model_policy = Policy::Default;
+        common::llm(&mut c, "configured");
+        common::model(
+            &mut c,
+            "assistant",
+            Capability::Chat,
+            reseller::config::Tier::Paid,
+            "llm",
+            "vendor/assistant-1",
+        )
+        .aliases = vec!["Smart".into()];
+        common::serve(&mut c, "tts", Capability::Speech, "voice-up");
+        c.models
+            .iter_mut()
+            .find(|m| m.id == "voice-up")
+            .unwrap()
+            .voice = "alloy".into();
+        common::point(&mut c, "llm", &format!("{base}/v1"), "upstream");
+        common::point(&mut c, "tts", &format!("{base}/v1"), "upstream");
     }
     let k = t.key().await;
     let key = k["key"].as_str().unwrap();
+    let chat = |body: Value| {
+        let t = &t;
+        async move {
+            t.call("POST", "/v1/chat/completions", Some(key), body)
+                .await
+        }
+    };
 
-    // default + missing model -> the configured model is injected.
-    let (s, v) = t
-        .call(
-            "POST",
-            "/v1/chat/completions",
-            Some(key),
-            json!({"messages":[]}),
-        )
-        .await;
+    // A missing model gets the default.
+    let (s, v) = chat(json!({"messages":[]})).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["model"], "configured");
+    assert_eq!(v["seen"], "configured");
+    // A null model counts as missing.
+    let (s, v) = chat(json!({"model":null,"messages":[]})).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["seen"], "configured");
+    // A public id or alias reaches its route's upstream model, and the
+    // response names the public model instead.
+    for name in ["assistant", "ASSISTANT", "smart"] {
+        let (s, v) = chat(json!({"model":name,"messages":[]})).await;
+        assert_eq!(s, 200, "{name}: {v}");
+        assert_eq!(v["seen"], "vendor/assistant-1");
+        assert_eq!(v["model"], "assistant");
+    }
+    // Unknown names, upstream names and other capabilities are refused.
+    for (name, status, code) in [
+        ("your-model", 404, "model_not_found"),
+        ("vendor/assistant-1", 404, "model_not_found"),
+        ("voice-up", 400, "unsupported_model"),
+    ] {
+        let (s, v) = chat(json!({"model":name,"messages":[]})).await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (status, Some(code)),
+            "{name}"
+        );
+    }
+    let (s, v) = chat(json!({"model":5,"messages":[]})).await;
+    assert_eq!(s, 400, "{v}");
 
-    // default + explicit unknown model -> the client's value is forwarded.
-    let (s, v) = t
-        .call(
-            "POST",
-            "/v1/chat/completions",
-            Some(key),
-            json!({"model":"your-model","messages":[]}),
-        )
-        .await;
+    // Speech: the model's voice fills a missing one and never overrides.
+    let speech = |body: Value| {
+        let t = &t;
+        async move { t.call("POST", "/v1/audio/speech", Some(key), body).await }
+    };
+    let (s, v) = speech(json!({"input":"hi"})).await;
     assert_eq!(s, 200, "{v}");
-    assert_eq!(v["model"], "your-model");
-
-    // passthrough + explicit model -> untouched.
-    t.app.config_mut().await.model_policy = Policy::Passthrough;
-    let (s, v) = t
-        .call(
-            "POST",
-            "/v1/chat/completions",
-            Some(key),
-            json!({"model":"your-model","messages":[]}),
-        )
-        .await;
-    assert_eq!(s, 200, "{v}");
-    assert_eq!(v["model"], "your-model");
-
-    // passthrough + missing model -> still missing upstream.
-    let (s, v) = t
-        .call(
-            "POST",
-            "/v1/chat/completions",
-            Some(key),
-            json!({"messages":[]}),
-        )
-        .await;
-    assert_eq!(s, 200, "{v}");
-    assert!(v["model"].is_null(), "{v}");
-
-    // force + explicit model -> always the configured model.
-    t.app.config_mut().await.model_policy = Policy::Force;
-    let (s, v) = t
-        .call(
-            "POST",
-            "/v1/chat/completions",
-            Some(key),
-            json!({"model":"your-model","messages":[]}),
-        )
-        .await;
-    assert_eq!(s, 200, "{v}");
-    assert_eq!(v["model"], "configured");
+    assert_eq!(
+        (v["model"].as_str(), v["voice"].as_str()),
+        (Some("voice-up"), Some("alloy"))
+    );
+    let (_, v) = speech(json!({"input":"hi","voice":"nova"})).await;
+    assert_eq!(v["voice"], "nova");
     task.abort();
 }
 
@@ -3226,7 +3232,7 @@ async fn request_history_totals_filters_and_scoping() {
     for (i, (id, account, key, status, kind, model, finished, billed, error)) in
         rows.into_iter().enumerate()
     {
-        sqlx::query("INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip,status,duration_ms,bytes_in,bytes_out,tokens,upstream_micro,billed_micro,error,finished) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,public_model,tier,ip,status,duration_ms,bytes_in,bytes_out,tokens,upstream_micro,billed_micro,error,finished) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(id)
             .bind(account)
             .bind(key)
@@ -3235,6 +3241,8 @@ async fn request_history_totals_filters_and_scoping() {
             .bind("/v1/chat/completions")
             .bind(kind)
             .bind(model)
+            .bind(model)
+            .bind("paid")
             .bind("127.0.0.1")
             .bind(status)
             .bind(12)
@@ -3607,7 +3615,7 @@ async fn signup_terms_acceptance_plans_and_legal_pages() {
         .collect();
     assert_eq!(codes, ["monthly", "halfyear", "year"]);
     assert_eq!(plans["request_estimate_usd"], "0.001");
-    assert_eq!(plans["trial_credit_usd"], "0.10");
+    assert!(plans.get("trial_credit_usd").is_none(), "{plans}");
 
     let consent = |accept: Value| {
         let t = &t;

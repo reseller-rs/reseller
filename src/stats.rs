@@ -109,7 +109,7 @@ pub async fn usage(
 ///
 /// Deletes finished request logs beyond the retention window or the entry
 /// cap. Logs from the last minute are always kept. Also deletes usage buckets
-/// older than [`BUCKET_RETENTION_DAYS`].
+/// and route usage older than [`BUCKET_RETENTION_DAYS`].
 pub async fn prune(app: &App) -> Result<()> {
     let config = app.config().await;
     // Keep at least the last minute: the RPM limiter counts those rows.
@@ -122,9 +122,14 @@ pub async fn prune(app: &App) -> Result<()> {
     .bind(i64::from(config.max_log_entries))
     .execute(&app.db)
     .await?;
-    sqlx::query("DELETE FROM usage_buckets WHERE hour<?")
+    for table in ["usage_buckets", "route_usage"] {
+        // Table names come from this fixed list.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE hour<?"
+        )))
         .bind(now() - BUCKET_RETENTION_DAYS * DAY)
         .execute(&app.db)
         .await?;
+    }
     Ok(())
 }

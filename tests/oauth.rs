@@ -3,12 +3,18 @@
 
 use axum::{Json, Router, extract::Request, response::IntoResponse, routing::any};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use reseller::{App, config::Config, db, keys};
+use reseller::{
+    App,
+    config::{Capability, Config},
+    db, keys,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::net::SocketAddr;
 use url::Url;
+
+mod common;
 
 const ADMIN: &str = "admin-test-secret-123456789";
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -51,14 +57,13 @@ impl Test {
             public_url: format!("http://{addr}"),
             signup: reseller::config::Signup {
                 cooldown_seconds: 0,
-                ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
                 ..Default::default()
             },
             ..Config::default()
         };
-        config.llm.model = "m".into();
+        common::serve(&mut config, "llm", Capability::Chat, "m");
         tweak(&mut config);
         let config = db::settings(&pool, config).await.unwrap();
         let app = App::new(pool, config).unwrap();
@@ -70,6 +75,7 @@ impl Test {
         )
         .await
         .unwrap();
+        common::fund(&app, key["account_id"].as_str().unwrap(), common::DIME).await;
         let router = reseller::web::router(app.clone()).await;
         let server = tokio::spawn(async move {
             axum::serve(
@@ -104,8 +110,7 @@ impl Test {
             axum::serve(listener, router).await.unwrap();
         }));
         let mut config = self.app.config_mut().await;
-        config.llm.base_url = format!("{url}/v1");
-        config.llm.api_key = "upstream".into();
+        common::point(&mut config, "llm", &format!("{url}/v1"), "upstream");
     }
 
     fn url(&self, path: &str) -> String {
@@ -759,9 +764,20 @@ async fn code_flow_with_pkce_issues_tokens_for_mcp_only() {
         .unwrap();
     assert!(billed > 0, "the OAuth identity is billed like its key");
 
-    // ... and nowhere else.
+    // ... and nowhere else. On the proxy the token is no credential of ours:
+    // it is an anonymous placeholder, which lists no paid model and cannot
+    // use one.
+    let r = t
+        .http
+        .get(t.url("/v1/models"))
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let models: Value = r.json().await.unwrap();
+    assert_eq!(models["data"], json!([]));
     for (method, path) in [
-        ("GET", "/v1/models"),
         ("POST", "/v1/chat/completions"),
         ("GET", "/v1/account"),
         ("GET", "/v1/keys"),
@@ -1023,7 +1039,7 @@ async fn connected_apps_are_listed_and_revocable_by_the_customer() {
 
 #[tokio::test]
 async fn admin_token_is_an_operator_credential_on_v1() {
-    let mut t = Test::with(|c| c.require_key = true).await;
+    let mut t = Test::with(|c| c.free.enabled = false).await;
     t.mock_llm().await;
     let get = |token: Option<&str>, path: &str| {
         let mut r = t.http.get(t.url(path));
@@ -1032,7 +1048,8 @@ async fn admin_token_is_an_operator_credential_on_v1() {
         }
         async move { r.send().await.unwrap() }
     };
-    // Without a credential require_key still refuses.
+    // With the free tier off, a request without a key (or with a token that is
+    // not one of ours) has no credential.
     assert_eq!(get(None, "/v1/models").await.status(), 401);
     assert_eq!(get(Some("not-the-token"), "/v1/models").await.status(), 401);
     let r = get(Some(ADMIN), "/v1/models").await;
@@ -1111,7 +1128,7 @@ async fn admin_token_on_customer_routes_is_a_clear_uncounted_error() {
 
 #[tokio::test]
 async fn admin_token_may_generate_over_mcp_but_has_no_account_tools() {
-    let mut t = Test::with(|c| c.require_key = true).await;
+    let mut t = Test::with(|c| c.free.enabled = false).await;
     t.mock_llm().await;
     assert_eq!(
         t.mcp(Some(ADMIN), "tools/list", json!({})).await.status(),

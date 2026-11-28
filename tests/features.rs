@@ -10,7 +10,12 @@ use axum::{
     routing::{any, get, put},
 };
 use hmac::{Hmac, KeyInit, Mac};
-use reseller::{App, config::Config, db, keys, payments::payroof};
+use reseller::{
+    App,
+    config::{Capability, Config, Tier},
+    db, keys,
+    payments::payroof,
+};
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::{
@@ -18,6 +23,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tower::ServiceExt;
+
+mod common;
 
 const ADMIN: &str = "admin-test-secret-123456789";
 const WHSEC: &str = "whsec_aXM6kkfVj6PFUBgwA3JVX9I18Rgp-ziMIuRMtjfwEhA";
@@ -36,7 +43,6 @@ impl Test {
             key_pepper: "pepper-test-secret-12345678".into(),
             signup: reseller::config::Signup {
                 cooldown_seconds: 0,
-                ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
                 ..Default::default()
@@ -54,7 +60,15 @@ impl Test {
         }
     }
 
+    /// A new account with 0.10 USD of credit.
     async fn key(&self) -> Value {
+        let key = self.unfunded_key().await;
+        common::fund(&self.app, key["account_id"].as_str().unwrap(), common::DIME).await;
+        key
+    }
+
+    /// A new account, as signup leaves it: without credit.
+    async fn unfunded_key(&self) -> Value {
         keys::create(
             &self.app,
             keys::Requester::Signup { altcha: None },
@@ -169,10 +183,11 @@ async fn image_generation_routes_to_image_upstream_and_bills_trailing_usage() {
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.image.base_url = format!("{base}/api/v1");
-        c.image.api_key = "img-secret".into();
-        c.image.model = "meta/muse-image".into();
-        c.image.headers.insert("X-Title".into(), "Reseller".into());
+        common::serve(&mut c, "image", Capability::Image, "meta/muse-image");
+        common::point(&mut c, "image", &format!("{base}/api/v1"), "img-secret");
+        c.providers[0]
+            .headers
+            .insert("X-Title".into(), "Reseller".into());
         c.markup_pct = "0".into();
     }
     let k = t.key().await;
@@ -215,18 +230,20 @@ async fn image_generation_routes_to_image_upstream_and_bills_trailing_usage() {
     assert_eq!(row.get::<i64, _>("billed_micro"), 10_000);
     assert_eq!(row.get::<i64, _>("tokens"), 651);
 
-    // Without the image upstream key, image routes are unavailable even though
-    // the LLM upstream may be configured.
-    t.app.config_mut().await.image.api_key.clear();
+    // With the image provider disabled, its model has no enabled provider: it
+    // is hidden and refused like a disabled model, even though other
+    // providers may be configured.
+    t.app.config_mut().await.providers[0].enabled = false;
     let (s, v) = t
         .call(
             "POST",
             "/v1/images/generations",
             k["key"].as_str(),
-            json!({"prompt":"x"}),
+            json!({"model":"meta/muse-image","prompt":"x"}),
         )
         .await;
-    assert_eq!(s, 503, "{v}");
+    assert_eq!(s, 404, "{v}");
+    assert_eq!(v["error"]["code"], "model_not_found");
 }
 
 /// Without provider cost, images are priced per generated image.
@@ -239,8 +256,16 @@ async fn image_price_applies_per_generated_image() {
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.image.base_url = format!("{base}/v1");
-        c.image.api_key = "img-secret".into();
+        common::serve(&mut c, "image", Capability::Image, "meta/muse-image");
+        common::model(
+            &mut c,
+            "artist",
+            Capability::Image,
+            Tier::Paid,
+            "image",
+            "artist",
+        );
+        common::point(&mut c, "image", &format!("{base}/v1"), "img-secret");
         c.markup_pct = "50".into();
         c.prices.insert(
             "artist".into(),
@@ -929,33 +954,57 @@ async fn theme_favicon_gets_png_and_touch_icon_companions() {
 #[tokio::test]
 async fn nested_secrets_are_redacted_and_preserved_by_blank_patches() {
     let t = Test::new().await;
+    let provider = |key: &str, headers: Value| json!({"id": "up", "base_url": "https://up.example/v1", "api_key": key, "headers": headers});
     let (s, v) = t
         .admin(
             "PATCH",
             "settings",
             json!({"stripe": {"secret_key": "sk_live_x", "webhook_secret": "whsec_x"},
-                   "image": {"api_key": "img-key", "headers": {"X-Title": "A"}}}),
+                   "providers": [provider("up-key", json!({"X-Title": "A"}))]}),
         )
         .await;
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["settings"]["stripe"]["secret_key"], "");
-    assert_eq!(v["settings"]["image"]["api_key"], "");
+    assert_eq!(v["settings"]["providers"][0]["api_key"], "");
+    assert_eq!(v["settings"]["providers"][0]["id"], "up");
+    assert_eq!(t.app.config().await.providers[0].api_key, "up-key");
+    let (s, v) = t
+        .admin(
+            "PATCH",
+            "settings",
+            json!({"stripe": {"secret_key": ""},
+                   "providers": [provider("", json!({"X-Other": "B"}))]}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let c = t.app.config().await;
+    assert_eq!(c.stripe.secret_key, "sk_live_x");
+    assert_eq!(
+        c.providers[0].api_key, "up-key",
+        "blank keeps the stored key"
+    );
+    assert_eq!(
+        c.providers[0].headers.len(),
+        1,
+        "header maps are replaced wholesale"
+    );
+    drop(c);
+    // A new key replaces it, and a provider with a new id starts without one.
     let (s, _) = t
         .admin(
             "PATCH",
             "settings",
-            json!({"stripe": {"secret_key": ""}, "image": {"api_key": "", "headers": {"X-Other": "B"}}}),
+            json!({"providers": [provider("rotated", json!({})),
+                   {"id": "other", "base_url": "https://o.example/v1", "api_key": ""}]}),
         )
         .await;
     assert_eq!(s, 200);
     let c = t.app.config().await;
-    assert_eq!(c.stripe.secret_key, "sk_live_x");
-    assert_eq!(c.image.api_key, "img-key");
-    assert_eq!(
-        c.image.headers.len(),
-        1,
-        "header maps are replaced wholesale"
-    );
+    assert_eq!(c.providers[0].api_key, "rotated");
+    assert_eq!(c.providers[1].api_key, "");
+    drop(c);
+    let exported = t.app.config().await.to_toml(false).unwrap();
+    assert!(!exported.contains("rotated") && !exported.contains("sk_live_x"));
     let (_, plans) = t.call("GET", "/v1/plans", None, json!({})).await;
     assert_eq!(plans["payment_methods"], json!(["stripe"]));
 }
@@ -981,7 +1030,7 @@ async fn account_list_balance_subtracts_debt_and_search_is_literal() {
 }
 
 // ---------------------------------------------------------------------------
-// Model catalog, OpenAI errors, quota, deposits, and trial credit
+// Model catalog, OpenAI errors, quota, and deposits
 // ---------------------------------------------------------------------------
 
 const ERROR_KEYS: [&str; 4] = ["code", "message", "param", "type"];
@@ -1013,31 +1062,38 @@ async fn recording_llm(t: &Test) -> Arc<Mutex<Vec<Value>>> {
     })))
     .await;
     let mut c = t.app.config_mut().await;
-    c.llm.base_url = format!("{base}/v1");
-    c.llm.api_key = "upstream-secret".into();
-    c.llm.model = "configured".into();
+    common::llm(&mut c, "configured");
+    common::point(&mut c, "llm", &format!("{base}/v1"), "upstream-secret");
     seen
 }
 
 fn catalog() -> Vec<reseller::config::Model> {
+    let route = |model: &str| reseller::config::Route {
+        provider: "llm".into(),
+        model: model.into(),
+        ..Default::default()
+    };
+    let entry = |id: &str| reseller::config::Model {
+        id: id.into(),
+        capability: Some(Capability::Chat),
+        ..Default::default()
+    };
     vec![
         reseller::config::Model {
-            id: "assistant".into(),
-            upstream: "vendor/secret-upstream-name".into(),
             aliases: vec!["gpt-4o".into()],
             name: "Assistant".into(),
             context_length: Some(128_000),
-            ..Default::default()
+            routes: vec![route("vendor/secret-upstream-name")],
+            ..entry("assistant")
         },
         reseller::config::Model {
-            id: "other".into(),
-            upstream: "vendor/other".into(),
-            ..Default::default()
+            routes: vec![route("vendor/other")],
+            ..entry("other")
         },
         reseller::config::Model {
-            id: "retired".into(),
             enabled: false,
-            ..Default::default()
+            routes: vec![route("vendor/retired")],
+            ..entry("retired")
         },
     ]
 }
@@ -1052,7 +1108,13 @@ async fn empty_balance(t: &Test) {
 #[tokio::test]
 async fn models_list_follows_the_catalog_and_hides_upstream_names() {
     let t = Test::new().await;
-    t.app.config_mut().await.models = catalog();
+    {
+        let mut c = t.app.config_mut().await;
+        c.models = catalog();
+        if c.provider("llm").is_none() {
+            common::provider(&mut c, "llm", common::UNREACHABLE, "upstream-secret");
+        }
+    }
     let k = t.key().await;
     let key = k["key"].as_str().unwrap();
     let (s, v) = t.call("GET", "/v1/models", Some(key), json!({})).await;
@@ -1093,15 +1155,18 @@ async fn models_list_follows_the_catalog_and_hides_upstream_names() {
 }
 
 #[tokio::test]
-async fn models_list_derives_capability_and_modalities_from_the_routes() {
+async fn models_list_derives_capability_and_modalities_from_the_capability() {
     let t = Test::new().await;
     {
         let mut c = t.app.config_mut().await;
-        c.llm.model = "chat-up".into();
-        c.tts.model = "voice-up".into();
-        c.tts.fallbacks = vec!["voice-fallback".into()];
-        c.stt.model = "ears-up".into();
-        c.image.model = "paint-up".into();
+        for (id, capability) in [
+            ("chat-up", Capability::Chat),
+            ("voice-up", Capability::Speech),
+            ("ears-up", Capability::Transcription),
+            ("paint-up", Capability::Image),
+        ] {
+            common::model(&mut c, id, capability, Tier::Paid, "llm", id);
+        }
     }
     let k = t.key().await;
     let key = k["key"].as_str().unwrap();
@@ -1119,18 +1184,24 @@ async fn models_list_derives_capability_and_modalities_from_the_routes() {
     assert_eq!(arch("chat-up")["modality"], "text->text");
     assert_eq!(arch("chat-up")["capability"], "chat");
     assert_eq!(arch("voice-up")["modality"], "text->audio");
-    assert_eq!(arch("voice-fallback")["capability"], "speech");
+    assert_eq!(arch("voice-up")["capability"], "speech");
     assert_eq!(arch("ears-up")["modality"], "audio->text");
     assert_eq!(arch("ears-up")["capability"], "transcription");
     assert_eq!(arch("paint-up")["modality"], "text->image");
     assert_eq!(arch("paint-up")["capability"], "image");
-    // An explicit catalog entry wins over derivation.
-    t.app.config_mut().await.models = vec![reseller::config::Model {
-        id: "vision".into(),
-        upstream: "chat-up".into(),
-        input_modalities: vec!["text".into(), "image".into()],
-        ..Default::default()
-    }];
+    // Explicit modalities win over derivation.
+    {
+        let mut c = t.app.config_mut().await;
+        common::model(
+            &mut c,
+            "vision",
+            Capability::Chat,
+            Tier::Paid,
+            "llm",
+            "chat-up",
+        )
+        .input_modalities = vec!["text".into(), "image".into()];
+    }
     let (_, v) = t
         .call("GET", "/v1/models/vision", Some(key), json!({}))
         .await;
@@ -1139,8 +1210,58 @@ async fn models_list_derives_capability_and_modalities_from_the_routes() {
 }
 
 #[tokio::test]
-async fn models_list_requires_a_valid_key_and_a_balance() {
+async fn models_list_is_open_to_everyone_and_needs_no_balance() {
     let t = Test::new().await;
+    {
+        let mut c = t.app.config_mut().await;
+        common::model(
+            &mut c,
+            "gratis",
+            Capability::Chat,
+            Tier::Free,
+            "llm",
+            "gratis",
+        );
+        common::model(
+            &mut c,
+            "premium",
+            Capability::Chat,
+            Tier::Paid,
+            "llm",
+            "premium",
+        );
+    }
+    // No credential, and a placeholder token, see the free models only.
+    for token in [None, Some("free"), Some("not-a-key")] {
+        let (s, v) = t.call("GET", "/v1/models", token, json!({})).await;
+        assert_eq!(s, 200, "{v}");
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["gratis"], "{token:?}");
+        assert_eq!(v["data"][0]["tier"], "free");
+    }
+    // A key that looks like ours but is not valid is refused.
+    let (s, v) = t
+        .call("GET", "/v1/models", Some("sk-res-wrong"), json!({}))
+        .await;
+    assert_eq!(s, 401);
+    assert_eq!(error_keys(&v), ERROR_KEYS);
+    assert_eq!(v["error"]["code"], "invalid_api_key");
+    // A key lists free and paid models, even without a balance.
+    let k = t.unfunded_key().await;
+    let (s, v) = t
+        .call("GET", "/v1/models", k["key"].as_str(), json!({}))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"].as_array().unwrap().len(), 2);
+    assert_eq!(v["data"][1]["id"], "premium");
+    assert_eq!(v["data"][1]["tier"], "paid");
+    // With the free tier off, nothing is served without a key.
+    t.app.config_mut().await.free.enabled = false;
     let (s, v) = t.call("GET", "/v1/models", None, json!({})).await;
     assert_eq!(s, 401);
     assert_eq!(error_keys(&v), ERROR_KEYS);
@@ -1150,27 +1271,12 @@ async fn models_list_requires_a_valid_key_and_a_balance() {
         v["error"]["message"],
         "Missing bearer authentication in header"
     );
-    let (s, v) = t
-        .call("GET", "/v1/models", Some("sk-wrong"), json!({}))
-        .await;
+    let (s, _) = t.call("GET", "/v1/models", Some("free"), json!({})).await;
     assert_eq!(s, 401);
-    assert_eq!(error_keys(&v), ERROR_KEYS);
-    assert_eq!(v["error"]["code"], "invalid_api_key");
-    let k = t.key().await;
-    empty_balance(&t).await;
-    let (s, v) = t
+    let (s, _) = t
         .call("GET", "/v1/models", k["key"].as_str(), json!({}))
         .await;
-    assert_eq!(s, 402, "{v}");
-    assert_eq!(error_keys(&v), ERROR_KEYS);
-    assert_eq!(v["error"]["code"], "insufficient_quota");
-    assert_eq!(v["error"]["type"], "insufficient_quota");
-    let message = v["error"]["message"].as_str().unwrap();
-    assert!(
-        message.starts_with("You exceeded your current quota."),
-        "{message}"
-    );
-    assert!(message.contains("/workspace/"), "{message}");
+    assert_eq!(s, 200, "keys still work");
 }
 
 #[tokio::test]
@@ -1234,7 +1340,13 @@ async fn unknown_paths_and_wrong_methods_use_openai_errors() {
 async fn aliases_reach_the_upstream_by_its_name_and_hidden_models_are_not_found() {
     let t = Test::new().await;
     let seen = recording_llm(&t).await;
-    t.app.config_mut().await.models = catalog();
+    {
+        let mut c = t.app.config_mut().await;
+        c.models = catalog();
+        if c.provider("llm").is_none() {
+            common::provider(&mut c, "llm", common::UNREACHABLE, "upstream-secret");
+        }
+    }
     let k = t.key().await;
     let key = k["key"].as_str();
     let chat = |model: &'static str| json!({"model": model, "messages": []});
@@ -1452,54 +1564,21 @@ async fn account_top_up_degrades_when_payroof_is_down_or_deposits_are_off() {
     );
 }
 
+/// Signup carries no credit: the account starts empty and the response has no
+/// trial amount.
 #[tokio::test]
-async fn new_accounts_get_the_default_or_configured_trial_credit() {
+async fn new_accounts_start_without_credit() {
     let t = Test::new().await;
-    let k = t.key().await;
-    assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.1");
-    // Halving is on by default, but this test is about the configured amount only.
-    t.app.config_mut().await.signup.free_credit_halving = false;
-    t.app.config_mut().await.signup.free_credit_usd = "0.75".into();
-    let k = t.key().await;
-    assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0.75");
-}
-
-#[tokio::test]
-async fn halving_gives_each_further_signup_from_one_ip_half_the_trial() {
-    let t = Test::new().await;
-    {
-        let mut c = t.app.config_mut().await;
-        c.signup.free_credit_usd = "0.1".into();
-        c.signup.free_credit_halving = true;
-        c.signup.ip_limit_per_month = 4;
-    }
-    let signup = |ip: &'static str| {
-        let app = t.app.clone();
-        async move {
-            reseller::keys::create(
-                &app,
-                reseller::keys::Requester::Signup { altcha: None },
-                ip,
-                &json!({}),
-            )
-            .await
-        }
-    };
-    for expected in ["0.1", "0.05", "0.025", "0.0125"] {
-        let v = signup("203.0.113.9").await.unwrap();
-        assert_eq!(v["trial_credit_usd"], expected);
-        assert_eq!(t.balance(v["account_id"].as_str().unwrap()).await, expected);
-    }
-    // The fifth is over the monthly allowance. Another IP starts at full credit.
-    assert!(signup("203.0.113.9").await.is_err());
-    let other = signup("198.51.100.4").await.unwrap();
-    assert_eq!(other["trial_credit_usd"], "0.1");
-
-    // Without halving every signup gets the full amount.
-    t.app.config_mut().await.signup.free_credit_halving = false;
-    t.app.config_mut().await.signup.ip_limit_per_month = 0;
-    let v = signup("203.0.113.9").await.unwrap();
-    assert_eq!(v["trial_credit_usd"], "0.1");
+    let k = t.unfunded_key().await;
+    assert_eq!(t.balance(k["account_id"].as_str().unwrap()).await, "0");
+    assert!(k.get("trial_credit_usd").is_none(), "{k}");
+    let (_, plans) = t.call("GET", "/v1/plans", None, json!({})).await;
+    assert!(plans.get("trial_credit_usd").is_none(), "{plans}");
+    let credits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credits")
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(credits, 0);
 }
 
 /// The overview counts only credit active accounts can spend as outstanding.
@@ -1508,8 +1587,6 @@ async fn halving_gives_each_further_signup_from_one_ip_half_the_trial() {
 #[tokio::test]
 async fn overview_splits_credit_and_keys_by_account_status() {
     let t = Test::new().await;
-    // Halving is on by default, but both keys must get the full trial credit here.
-    t.app.config_mut().await.signup.free_credit_halving = false;
     let active = t.key().await;
     let suspended = t.key().await;
     let (s, v) = t
@@ -1580,8 +1657,9 @@ async fn dashboards_rank_spend_and_link_keys_accounts_and_requests() {
             .unwrap();
     }
     sqlx::query(
-        "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip,status,\
-         upstream_micro,billed_micro,finished) VALUES('r1',?,?,?,'POST','/v1/chat/completions','llm','m','127.0.0.1',200,1000,1300,1)",
+        "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,public_model,tier,\
+         ip,status,upstream_micro,billed_micro,finished) VALUES('r1',?,?,?,'POST','/v1/chat/completions','llm',\
+         'vendor/m','m','paid','127.0.0.1',200,1000,1300,1)",
     )
     .bind(aid)
     .bind(k2)
@@ -2565,6 +2643,15 @@ async fn apple_revoke_ends_the_subscription_without_blocking() {
 #[tokio::test]
 async fn apple_consumption_request_needs_consent_and_sends_the_v2_body() {
     let e = apple_env().await;
+    // The service offers a free tier, which Apple is told about as sample content.
+    common::model(
+        &mut *e.t.app.config_mut().await,
+        "gratis",
+        Capability::Chat,
+        Tier::Free,
+        "llm",
+        "gratis",
+    );
     let (key, aid, token) = store_account(&e.t).await;
     let now = db::now();
     let tx = apple_tx(
@@ -3285,6 +3372,14 @@ async fn google_voided_purchase_blocks_the_account() {
 #[tokio::test]
 async fn google_pending_refund_review_posts_the_review() {
     let e = google_env().await;
+    common::model(
+        &mut *e.t.app.config_mut().await,
+        "gratis",
+        Capability::Chat,
+        Tier::Free,
+        "llm",
+        "gratis",
+    );
     let (key, _, token) = store_account(&e.t).await;
     reply(
         &e.mock,

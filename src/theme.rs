@@ -76,7 +76,6 @@ pub fn public_json(config: &Config) -> serde_json::Value {
         "color_scheme": b.color_scheme,
         "theme_toggle": b.theme_toggle,
         "request_estimate_usd": config.billing.request_estimate_usd,
-        "trial_credit_usd": config.signup.free_credit_usd,
     })
 }
 

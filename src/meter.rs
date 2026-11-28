@@ -1,14 +1,15 @@
 //! Request admission, usage accounting, and settlement.
 //!
-//! [`Meter::begin`] admits a request (key status, balance, rate and usage
-//! limits) and logs it with its worst-case cost ([`Hold`]) in the same write
+//! [`Meter::begin`] admits a request (key status, balance for paid models,
+//! rate and usage limits) and logs it with its worst-case cost ([`Hold`]) in
+//! the same write
 //! transaction. Holds of requests in flight count against the balance and
 //! every limit, so concurrent requests cannot overshoot them. [`Meter::finish`] prices observed usage and
 //! settles it exactly once. A meter dropped mid-stream settles in the
 //! background with whatever usage was observed.
 use crate::{
     App,
-    config::{Config, Price},
+    config::{Config, Price, Tier},
     db::{self, HOUR, id, now},
     error::{Error, Result},
     identity::Identity,
@@ -19,7 +20,10 @@ use axum::http::StatusCode;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde_json::Value;
 use sqlx::{Row, SqliteConnection};
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 /// Billable quantities observed for one request.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -202,10 +206,27 @@ pub struct RequestMeta<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub kind: &'a str,
+    /// Public model id (empty when the request needs none).
     pub model: &'a str,
+    /// Free requests are never billed and need no balance.
+    pub tier: Tier,
+    /// Upstream model names of the model's routes. A paid request holds the
+    /// worst case over them.
+    pub routes: &'a [&'a str],
     pub ip: &'a str,
     /// Worst-case usage of the request, priced into its [`Hold`].
     pub estimate: &'a Usage,
+}
+
+/// One request sent to a route.
+#[derive(Clone, Debug)]
+pub struct Attempt {
+    pub provider: String,
+    /// Upstream model name.
+    pub model: String,
+    /// HTTP status, or 0 when no response head arrived.
+    pub status: u16,
+    pub latency_ms: i64,
 }
 
 /// An admitted request awaiting settlement.
@@ -214,7 +235,8 @@ pub struct Meter {
     pub id: String,
     identity: Option<Identity>,
     config: Arc<Config>,
-    pub model: String,
+    public_model: String,
+    tier: Tier,
     pub status: u16,
     /// The upstream answered successfully. It gates the flat request fee.
     /// Independent of `status`, which also records client-side outcomes
@@ -224,6 +246,7 @@ pub struct Meter {
     pub bytes_out: i64,
     pub usage: Usage,
     pub error: Option<String>,
+    attempts: Vec<Attempt>,
     start: Instant,
     settled: bool,
 }
@@ -235,7 +258,8 @@ struct Settlement {
     id: String,
     identity: Option<Identity>,
     config: Arc<Config>,
-    model: String,
+    public_model: String,
+    tier: Tier,
     status: u16,
     success: bool,
     duration_ms: i64,
@@ -243,43 +267,31 @@ struct Settlement {
     bytes_out: i64,
     usage: Usage,
     error: Option<String>,
+    attempts: Vec<Attempt>,
 }
 
 impl Meter {
-    /// Admits and logs a request. Anonymous requests (`identity = None`) are
-    /// logged but never billed.
+    /// Admits and logs a request. Callers without a key (anonymous and the
+    /// operator) are logged but never billed.
     pub async fn begin(
         app: &App,
         identity: Option<Identity>,
         meta: RequestMeta<'_>,
     ) -> Result<Self> {
-        Self::begin_with(app, identity, meta, true).await
-    }
-
-    /// Like [`Meter::begin`], but with `check_model = false` the key's model
-    /// allowlist is not applied at admission. The model is only learned while
-    /// the body streams. The caller must then enforce it.
-    pub async fn begin_with(
-        app: &App,
-        identity: Option<Identity>,
-        meta: RequestMeta<'_>,
-        check_model: bool,
-    ) -> Result<Self> {
         let config = app.config().await;
-        let hold = match &identity {
-            Some(identity) => Hold::of(&config, identity, meta.model, meta.estimate)?,
-            None => Hold::default(),
+        let hold = match (&identity, meta.tier) {
+            (Some(identity), Tier::Paid) => {
+                Hold::of(&config, identity, meta.routes, meta.estimate)?
+            }
+            (Some(_), Tier::Free) => Hold {
+                micro: 0,
+                tokens: meta.estimate.total.max(0),
+            },
+            (None, _) => Hold::default(),
         };
         let mut tx = db::write(&app.db).await?;
         if let Some(identity) = &identity
-            && let Err(e) = admit(
-                &mut tx,
-                &config,
-                identity,
-                check_model.then_some(meta.model),
-                hold,
-            )
-            .await
+            && let Err(e) = admit(&mut tx, &config, identity, meta.tier, hold).await
         {
             // Release the write lock before asking Payroof for deposit details.
             tx.rollback().await?;
@@ -287,8 +299,8 @@ impl Meter {
         }
         let request_id = id();
         sqlx::query(
-            "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip,\
-             hold_micro,hold_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,public_model,\
+             tier,ip,hold_micro,hold_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&request_id)
         .bind(identity.as_ref().map(|i| &i.account_id))
@@ -298,6 +310,8 @@ impl Meter {
         .bind(meta.path)
         .bind(meta.kind)
         .bind(meta.model)
+        .bind(meta.model)
+        .bind(meta.tier.as_str())
         .bind(meta.ip)
         .bind(hold.micro)
         .bind(hold.tokens)
@@ -309,13 +323,15 @@ impl Meter {
             id: request_id,
             identity,
             config,
-            model: meta.model.into(),
+            public_model: meta.model.into(),
+            tier: meta.tier,
             status: StatusCode::BAD_GATEWAY.as_u16(),
             success: false,
             bytes_in: 0,
             bytes_out: 0,
             usage: Usage::default(),
             error: None,
+            attempts: Vec::new(),
             start: Instant::now(),
             settled: false,
         })
@@ -325,6 +341,17 @@ impl Meter {
     pub fn fail(&mut self, status: StatusCode, error: &str) {
         self.status = status.as_u16();
         self.error = Some(error.into());
+    }
+
+    /// Records one attempt on a route. The last one is the route that
+    /// answered, and prices the request.
+    pub fn attempt(&mut self, provider: &str, model: &str, status: u16, latency: Duration) {
+        self.attempts.push(Attempt {
+            provider: provider.into(),
+            model: model.into(),
+            status,
+            latency_ms: i64::try_from(latency.as_millis()).unwrap_or(i64::MAX),
+        });
     }
 
     /// Settles the request: bills usage, updates aggregates, and closes the log.
@@ -347,7 +374,8 @@ impl Meter {
             id: self.id.clone(),
             identity: self.identity.clone(),
             config: self.config.clone(),
-            model: self.model.clone(),
+            public_model: self.public_model.clone(),
+            tier: self.tier,
             status: self.status,
             success: self.success,
             duration_ms: i64::try_from(self.start.elapsed().as_millis()).unwrap_or(i64::MAX),
@@ -355,6 +383,7 @@ impl Meter {
             bytes_out: self.bytes_out,
             usage: self.usage.clone(),
             error: self.error.clone(),
+            attempts: self.attempts.clone(),
         }
     }
 }
@@ -396,16 +425,27 @@ impl Settlement {
     }
 
     async fn persist(&self) -> Result<()> {
-        let upstream = self.usage.cost(&self.config, &self.model, self.success)?;
-        let billed = match &self.identity {
-            Some(identity) => money::markup(upstream, &identity.markup)?,
-            None => 0,
+        let answered = self.attempts.last();
+        let model = answered.map_or(self.public_model.as_str(), |a| a.model.as_str());
+        // Free requests are never billed. The cost is only recorded when the
+        // provider reported one.
+        let (upstream, billed) = match self.tier {
+            Tier::Free => (self.usage.cost.unwrap_or(0).max(0), 0),
+            Tier::Paid => {
+                let upstream = self.usage.cost(&self.config, model, self.success)?;
+                let billed = match &self.identity {
+                    Some(identity) => money::markup(upstream, &identity.markup)?,
+                    None => 0,
+                };
+                (upstream, billed)
+            }
         };
         let mut tx = db::write(&self.app.db).await?;
         let closed = sqlx::query(
             "UPDATE requests SET status=?,duration_ms=?,bytes_in=?,bytes_out=?,tokens=?,\
-             upstream_micro=?,billed_micro=?,error=?,model=?,estimated=?,input_tokens=?,output_tokens=?,\
-             cached_tokens=?,characters=?,audio_ms=?,images=?,finished=1 WHERE id=? AND finished=0",
+             upstream_micro=?,billed_micro=?,error=?,model=?,provider=?,attempts=?,estimated=?,\
+             input_tokens=?,output_tokens=?,cached_tokens=?,characters=?,audio_ms=?,images=?,\
+             finished=1 WHERE id=? AND finished=0",
         )
         .bind(i64::from(self.status))
         .bind(self.duration_ms)
@@ -415,7 +455,9 @@ impl Settlement {
         .bind(upstream)
         .bind(billed)
         .bind(&self.error)
-        .bind(&self.model)
+        .bind(model)
+        .bind(answered.map(|a| &a.provider))
+        .bind(i64::try_from(self.attempts.len()).unwrap_or(i64::MAX))
         .bind(self.usage.estimated)
         .bind(self.usage.input.max(0))
         .bind(self.usage.output.max(0))
@@ -441,7 +483,7 @@ impl Settlement {
             .bind(now() / HOUR * HOUR)
             .bind(&identity.key_id)
             .bind(&identity.account_id)
-            .bind(&self.model)
+            .bind(&self.public_model)
             .bind(self.usage.total)
             .bind(upstream)
             .bind(billed)
@@ -452,6 +494,29 @@ impl Settlement {
                 .bind(&identity.key_id)
                 .execute(&mut *tx)
                 .await?;
+        }
+        for (i, attempt) in self.attempts.iter().enumerate() {
+            let last = i + 1 == self.attempts.len();
+            let failed = matches!(attempt.status, 0 | 401..=403 | 408 | 500..);
+            sqlx::query(
+                "INSERT INTO route_usage(hour,provider,model,tier,requests,failures,rate_limited,\
+                 tokens,upstream_micro,latency_ms_sum) VALUES(?,?,?,?,1,?,?,?,?,?) \
+                 ON CONFLICT(hour,provider,model,tier) DO UPDATE SET requests=requests+1,\
+                 failures=failures+excluded.failures,rate_limited=rate_limited+excluded.rate_limited,\
+                 tokens=tokens+excluded.tokens,upstream_micro=upstream_micro+excluded.upstream_micro,\
+                 latency_ms_sum=latency_ms_sum+excluded.latency_ms_sum",
+            )
+            .bind(now() / HOUR * HOUR)
+            .bind(&attempt.provider)
+            .bind(&attempt.model)
+            .bind(self.tier.as_str())
+            .bind(i64::from(failed))
+            .bind(i64::from(attempt.status == 429))
+            .bind(if last { self.usage.total } else { 0 })
+            .bind(if last { upstream } else { 0 })
+            .bind(attempt.latency_ms)
+            .execute(&mut *tx)
+            .await?;
         }
         sqlx::query(
             "UPDATE totals SET requests=requests+1,tokens=tokens+?,\
@@ -466,7 +531,10 @@ impl Settlement {
         tracing::info!(
             request_id = %self.id,
             status = self.status,
-            model = %self.model,
+            model = %self.public_model,
+            tier = self.tier.as_str(),
+            provider = answered.map_or("", |a| a.provider.as_str()),
+            attempts = self.attempts.len(),
             tokens = self.usage.total,
             estimated = self.usage.estimated,
             billed_micro = billed,
@@ -487,10 +555,19 @@ pub struct Hold {
 }
 
 impl Hold {
-    /// Prices a worst-case usage estimate at the caller's markup. The money
-    /// part is at least `billing.min_hold_usd`.
-    pub fn of(config: &Config, identity: &Identity, model: &str, estimate: &Usage) -> Result<Self> {
-        let upstream = estimate.cost(config, model, true)?;
+    /// Prices a worst-case usage estimate at the caller's markup, taking the
+    /// dearest of the model's `routes` (upstream model names). The money part
+    /// is at least `billing.min_hold_usd`.
+    pub fn of(
+        config: &Config,
+        identity: &Identity,
+        routes: &[&str],
+        estimate: &Usage,
+    ) -> Result<Self> {
+        let mut upstream = estimate.cost(config, "", true)?;
+        for model in routes {
+            upstream = upstream.max(estimate.cost(config, model, true)?);
+        }
         let billed = money::markup(upstream, &identity.markup)?;
         Ok(Self {
             micro: billed.max(money::usd(&config.billing.min_hold_usd)?),
@@ -499,51 +576,33 @@ impl Hold {
     }
 }
 
-/// Checks the status and balance of an account without logging a request,
-/// for routes that are not metered.
+/// Checks the status of a key without logging a request, for routes that are
+/// not metered. A balance is not needed: free models cost nothing.
 pub async fn preflight(app: &App, identity: &Identity) -> Result<()> {
-    let config = app.config().await;
-    let checked = {
-        let mut conn = app.db.acquire().await?;
-        check_status(&mut conn, identity).await?;
-        if db::balance(&mut conn, &identity.account_id).await? <= 0 {
-            Err(deposits::quota_error(&config))
-        } else {
-            Ok(())
-        }
-    };
-    match checked {
-        Err(e) => Err(deposits::explain_quota(app, &config, &identity.account_id, e).await),
-        ok => ok,
-    }
-}
-
-/// Rejects an upstream model that is not on the key's allowlist. The
-/// allowlist names catalog ids, see [`Config::upstream_allowed`].
-pub fn check_model(config: &Config, identity: &Identity, model: &str) -> Result<()> {
-    if config.upstream_allowed(&identity.limits, model) {
-        Ok(())
-    } else {
-        Err(Error::model_not_found(model))
-    }
+    let mut conn = app.db.acquire().await?;
+    check_status(&mut conn, identity).await
 }
 
 /// Admission checks, run inside the logging transaction.
+///
+/// Free requests skip the balance and the new-account spending cap. Every
+/// other check applies to both tiers.
 async fn admit(
     conn: &mut SqliteConnection,
     config: &Config,
     identity: &Identity,
-    model: Option<&str>,
+    tier: Tier,
     hold: Hold,
 ) -> Result<()> {
     check_status(conn, identity).await?;
-    if let Some(model) = model {
-        check_model(config, identity, model)?;
+    if tier == Tier::Paid {
+        crate::billing::grant_due(conn, Some(&identity.account_id)).await?;
+        check_balance(conn, config, identity, hold).await?;
     }
-    crate::billing::grant_due(conn, Some(&identity.account_id)).await?;
-    check_balance(conn, config, identity, hold).await?;
     check_concurrency(conn, config, &identity.account_id).await?;
-    check_new_account(conn, config, identity, hold).await?;
+    if tier == Tier::Paid {
+        check_new_account(conn, config, identity, hold).await?;
+    }
     check_limits(conn, config, identity, hold).await
 }
 
@@ -613,7 +672,7 @@ async fn check_balance(
 /// `rate_limits.new_account_hours`: billed spend in the last 24 hours plus
 /// holds in flight may not exceed `new_account_daily_spend_pct` percent of
 /// the paid allowance (monthly quota of active subscriptions plus purchased
-/// top-ups). Accounts without paid credit are bounded by their trial credit.
+/// top-ups). Accounts without paid credit have no allowance and are not capped.
 async fn check_new_account(
     conn: &mut SqliteConnection,
     config: &Config,
@@ -826,12 +885,9 @@ impl Limit {
 /// leftovers of a crash (or exhausted settlement retries) and never count.
 fn in_flight_since(config: &Config) -> i64 {
     let timeout = config
-        .upstreams()
-        .into_iter()
-        .map(|(_, u)| match u.timeout_seconds {
-            0 => config.upstream_timeout_seconds,
-            t => t,
-        })
+        .providers
+        .iter()
+        .map(|p| p.timeout(config.upstream_timeout_seconds).as_secs())
         .max()
         .unwrap_or(config.upstream_timeout_seconds);
     now() - i64::try_from(timeout).unwrap_or(i64::MAX / 2)

@@ -32,18 +32,6 @@ pub fn months_between(from: i64, to: i64) -> u32 {
         .unwrap_or(1200)
 }
 
-/// Unix time at which the calendar month (UTC) after the one holding `t` starts.
-pub fn next_month_start(t: i64) -> i64 {
-    use chrono::Datelike;
-    let date = chrono::DateTime::from_timestamp(t, 0)
-        .unwrap_or_default()
-        .date_naive();
-    date.with_day(1)
-        .and_then(|d| d.checked_add_months(chrono::Months::new(1)))
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map_or(i64::MAX, |d| d.and_utc().timestamp())
-}
-
 /// Random UUIDv4 primary key.
 pub fn id() -> String {
     uuid::Uuid::new_v4().to_string()

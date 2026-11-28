@@ -1,7 +1,5 @@
 //! Anonymous self-service signup settings.
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Largest accepted `pow_max_number`, the highest proof-of-work difficulty.
 pub const MAX_POW_NUMBER: u32 = 10_000_000;
@@ -12,19 +10,6 @@ pub const MAX_POW_NUMBER: u32 = 10_000_000;
 pub struct Signup {
     /// Whether anonymous account creation is offered at all.
     pub enabled: bool,
-    /// USD trial credit granted to each new account, as a decimal string.
-    pub free_credit_usd: String,
-    /// When true, each further signup from the same IP in the same calendar
-    /// month gets half the trial credit of the previous one: the first gets
-    /// `free_credit_usd`, the second half of it, the third a quarter, and so
-    /// on. An amount that rounds below one micro-USD grants nothing.
-    pub free_credit_halving: bool,
-    /// Days the signup credit stays spendable. 0 means it never expires.
-    pub free_credit_expiry_days: u32,
-    /// New self-service accounts (signups) per source IP per calendar month.
-    /// Keys created on an existing account never count, and neither do accounts
-    /// that became paying or operator-trusted. 0 disables the guard.
-    pub ip_limit_per_month: u32,
     /// Minimum seconds between two signups from one IP. 0 disables the guard.
     pub cooldown_seconds: u32,
     /// Self-service key creations (signup, child keys, rotations) per hour
@@ -46,18 +31,12 @@ pub struct Signup {
     pub pow_max_number_ceiling: u32,
     /// Minutes after the last failure at which an IP's difficulty resets.
     pub adaptive_pow_reset_minutes: u32,
-    /// Per-IP replacements for `ip_limit_per_month`. 0 means unlimited.
-    pub ip_overrides: BTreeMap<String, u32>,
 }
 
 impl Default for Signup {
     fn default() -> Self {
         Self {
             enabled: true,
-            free_credit_usd: "0.10".into(),
-            free_credit_halving: true,
-            free_credit_expiry_days: 30,
-            ip_limit_per_month: 4,
             cooldown_seconds: 30,
             global_hourly_limit: 100,
             pow_max_number: 100_000,
@@ -65,7 +44,6 @@ impl Default for Signup {
             adaptive_pow: true,
             pow_max_number_ceiling: 1_000_000,
             adaptive_pow_reset_minutes: 30,
-            ip_overrides: BTreeMap::new(),
         }
     }
 }
@@ -81,13 +59,8 @@ impl Signup {
         }
     }
 
-    /// Checks the credit amount, expiry, proof-of-work difficulty, and challenge lifetime.
+    /// Checks the proof-of-work difficulty and challenge lifetime.
     pub(super) fn validate(&self) -> anyhow::Result<()> {
-        crate::money::usd(&self.free_credit_usd).context("signup.free_credit_usd")?;
-        anyhow::ensure!(
-            self.free_credit_expiry_days <= 3650,
-            "signup.free_credit_expiry_days must be at most 3650"
-        );
         anyhow::ensure!(
             self.pow_max_number <= MAX_POW_NUMBER,
             "signup.pow_max_number must be at most {MAX_POW_NUMBER}"

@@ -1,12 +1,13 @@
-//! The public model catalog: which models customers see and what each public
-//! name resolves to upstream.
-use super::Config;
-use crate::keys::Limits;
+//! The public model catalog: which models callers see, what each one does,
+//! and the routes that serve it.
+use super::{Budget, Config, Provider};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::HashSet};
+use std::collections::HashSet;
 
 /// Most catalog entries.
 const MAX_MODELS: usize = 200;
+/// Most routes of one entry.
+const MAX_ROUTES: usize = 20;
 /// Most aliases of one entry.
 const MAX_ALIASES: usize = 10;
 /// Longest public model name, in characters.
@@ -17,14 +18,84 @@ const MAX_MODALITY_CHARS: usize = 32;
 /// Largest accepted `context_length`.
 const MAX_CONTEXT_LENGTH: u64 = 1_000_000_000;
 
+/// Which callers a model serves and whether it is billed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// Keyless, rate limited per client, never billed.
+    Free,
+    /// Needs an API key and a balance.
+    #[default]
+    Paid,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Paid => "paid",
+        }
+    }
+}
+
+/// How a model with several routes picks one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Strategy {
+    /// Score-based spread over the routes that have headroom.
+    #[default]
+    Balanced,
+    /// The first available route in list order.
+    Ordered,
+}
+
+/// One upstream a model can be served from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Route {
+    /// Id of a configured provider.
+    pub provider: String,
+    /// Model name sent to the provider.
+    pub model: String,
+    /// Share in the `balanced` strategy (1-100).
+    pub weight: u32,
+    /// Budget of this (provider, model) pair.
+    pub limits: Budget,
+    /// A last resort: tried, in listed order, only once no other route of
+    /// the model can take the request (each is unavailable or has failed
+    /// it). Fallback attempts do not count against `routing.max_attempts`.
+    /// For example a cheap paid model behind free routes.
+    pub fallback: bool,
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            model: String::new(),
+            weight: 1,
+            limits: Budget::default(),
+            fallback: false,
+        }
+    }
+}
+
 /// One public model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Model {
     /// Public model id, unique case-insensitively across ids and aliases.
     pub id: String,
-    /// Model name sent upstream. Empty means `id`.
-    pub upstream: String,
+    pub tier: Tier,
+    /// What the model does. Required. Chat also covers embeddings,
+    /// moderations, completions, responses and realtime.
+    pub capability: Option<Capability>,
+    /// Served when a request names no model. At most one enabled entry per
+    /// capability and tier.
+    pub default: bool,
+    pub strategy: Strategy,
+    /// Speech only: the voice sent when the client names none.
+    pub voice: String,
     /// Extra public names that resolve to this entry. They are not listed.
     pub aliases: Vec<String>,
     /// Disabled entries are hidden and refused.
@@ -39,20 +110,25 @@ pub struct Model {
     /// Context window in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u64>,
-    /// Input modalities. Empty derives them from the upstream the entry
-    /// serves, see [`Model::resolved`].
+    /// Input modalities. Empty derives them from the capability.
     pub input_modalities: Vec<String>,
     /// Output modalities. Empty derives them like `input_modalities`.
     pub output_modalities: Vec<String>,
-    /// List the price, with the caller's markup applied.
+    /// List the price, with the caller's markup applied (paid models only).
     pub show_pricing: bool,
+    /// The upstreams that serve this model (1-20).
+    pub routes: Vec<Route>,
 }
 
 impl Default for Model {
     fn default() -> Self {
         Self {
             id: String::new(),
-            upstream: String::new(),
+            tier: Tier::Paid,
+            capability: None,
+            default: false,
+            strategy: Strategy::Balanced,
+            voice: String::new(),
             aliases: Vec::new(),
             enabled: true,
             name: String::new(),
@@ -63,18 +139,16 @@ impl Default for Model {
             input_modalities: Vec::new(),
             output_modalities: Vec::new(),
             show_pricing: false,
+            routes: Vec::new(),
         }
     }
 }
 
 impl Model {
-    /// The model name sent upstream.
-    pub fn upstream_name(&self) -> &str {
-        if self.upstream.is_empty() {
-            &self.id
-        } else {
-            &self.upstream
-        }
+    /// The capability. Validation requires one, chat is the fallback for an
+    /// unvalidated entry.
+    pub fn capability(&self) -> Capability {
+        self.capability.unwrap_or(Capability::Chat)
     }
 
     /// Whether `name` is this entry's id or one of its aliases.
@@ -83,45 +157,31 @@ impl Model {
             || self.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
     }
 
-    /// A minimal enabled entry for a configured route model. Its modalities
-    /// are derived from the upstream it serves.
-    fn route(id: &str) -> Self {
-        Self {
-            id: id.to_owned(),
-            ..Self::default()
-        }
-    }
-
     /// The capability, input and output modalities of this entry. Explicit
-    /// modalities win. Empty ones come from the upstream route that serves
-    /// the entry's upstream model, and stay empty when no route does.
-    pub fn resolved(&self, config: &Config) -> Resolved {
-        // A route decides first. Without one, explicit catalog modalities
-        // still name the capability (never guessed from nothing).
-        let capability = config.capability_of(self.upstream_name()).or_else(|| {
-            Capability::from_modalities(&self.input_modalities, &self.output_modalities)
-        });
-        let pick = |explicit: &[String], derived: Option<&[&str]>| -> Vec<String> {
-            if !explicit.is_empty() {
-                explicit.to_vec()
+    /// modalities win, empty ones come from the capability.
+    pub fn resolved(&self) -> Resolved {
+        let capability = self.capability();
+        let pick = |explicit: &[String], derived: &[&str]| -> Vec<String> {
+            if explicit.is_empty() {
+                derived.iter().map(|m| (*m).to_owned()).collect()
             } else {
-                derived
-                    .map(|d| d.iter().map(|m| (*m).to_owned()).collect())
-                    .unwrap_or_default()
+                explicit.to_vec()
             }
         };
         Resolved {
             capability,
-            input: pick(&self.input_modalities, capability.map(|c| c.input())),
-            output: pick(&self.output_modalities, capability.map(|c| c.output())),
+            input: pick(&self.input_modalities, capability.input()),
+            output: pick(&self.output_modalities, capability.output()),
         }
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    fn validate(&self, providers: &[Provider]) -> anyhow::Result<()> {
         public_name("id", &self.id)?;
-        if !self.upstream.is_empty() {
-            public_name("upstream", &self.upstream)?;
-        }
+        anyhow::ensure!(
+            self.capability.is_some(),
+            "models.{}: capability is required (chat, speech, transcription or image)",
+            self.id
+        );
         anyhow::ensure!(
             self.aliases.len() <= MAX_ALIASES,
             "models.{}: at most {MAX_ALIASES} aliases",
@@ -134,6 +194,7 @@ impl Model {
             ("name", &self.name, MAX_NAME_CHARS),
             ("owned_by", &self.owned_by, MAX_NAME_CHARS),
             ("description", &self.description, MAX_DESCRIPTION_CHARS),
+            ("voice", &self.voice, MAX_NAME_CHARS),
         ] {
             anyhow::ensure!(
                 value.chars().count() <= limit && !value.chars().any(char::is_control),
@@ -141,6 +202,16 @@ impl Model {
                 self.id
             );
         }
+        anyhow::ensure!(
+            self.voice.is_empty() || self.capability() == Capability::Speech,
+            "models.{}: voice applies to speech models only",
+            self.id
+        );
+        anyhow::ensure!(
+            !(self.show_pricing && self.tier == Tier::Free),
+            "models.{}: show_pricing applies to paid models only",
+            self.id
+        );
         anyhow::ensure!(
             self.context_length
                 .is_none_or(|n| (1..=MAX_CONTEXT_LENGTH).contains(&n)),
@@ -162,12 +233,50 @@ impl Model {
                 self.id
             );
         }
+        anyhow::ensure!(
+            (1..=MAX_ROUTES).contains(&self.routes.len()),
+            "models.{}: needs 1-{MAX_ROUTES} routes",
+            self.id
+        );
+        anyhow::ensure!(
+            self.routes.iter().any(|r| !r.fallback),
+            "models.{}: needs at least one route that is not a fallback",
+            self.id
+        );
+        for (i, route) in self.routes.iter().enumerate() {
+            anyhow::ensure!(
+                providers.iter().any(|p| p.id == route.provider),
+                "models.{}: route {} names unknown provider {:?}",
+                self.id,
+                i + 1,
+                route.provider
+            );
+            public_name("route model", &route.model)?;
+            anyhow::ensure!(
+                (1..=100).contains(&route.weight),
+                "models.{}: route weight must be between 1 and 100",
+                self.id
+            );
+            route
+                .limits
+                .validate(&format!("models.{}.routes", self.id))?;
+            anyhow::ensure!(
+                !self.routes[..i]
+                    .iter()
+                    .any(|r| r.provider == route.provider && r.model == route.model),
+                "models.{}: route {}/{} is listed twice",
+                self.id,
+                route.provider,
+                route.model
+            );
+        }
         Ok(())
     }
 }
 
-/// What a model does, decided by the upstream route it is configured on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a model does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Capability {
     Chat,
     Speech,
@@ -182,24 +291,6 @@ impl Capability {
             Self::Speech => "speech",
             Self::Transcription => "transcription",
             Self::Image => "image",
-        }
-    }
-
-    /// The capability named by explicit modalities, if they name one.
-    fn from_modalities(input: &[String], output: &[String]) -> Option<Self> {
-        let has = |list: &[String], m: &str| list.iter().any(|x| x.eq_ignore_ascii_case(m));
-        if output.is_empty() {
-            None
-        } else if has(output, "image") {
-            Some(Self::Image)
-        } else if has(output, "audio") {
-            Some(Self::Speech)
-        } else if has(output, "text") && has(input, "audio") {
-            Some(Self::Transcription)
-        } else if has(output, "text") {
-            Some(Self::Chat)
-        } else {
-            None
         }
     }
 
@@ -222,7 +313,7 @@ impl Capability {
 /// A model's capability and modalities after derivation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
-    pub capability: Option<Capability>,
+    pub capability: Capability,
     pub input: Vec<String>,
     pub output: Vec<String>,
 }
@@ -237,75 +328,97 @@ fn public_name(field: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Checks the catalog: sizes, fields, and unique names.
-pub(super) fn validate(models: &[Model]) -> anyhow::Result<()> {
+/// Whether `model` is enabled and has a route on an enabled provider.
+fn servable(model: &Model, providers: &[Provider]) -> bool {
+    model.enabled
+        && model
+            .routes
+            .iter()
+            .any(|r| providers.iter().any(|p| p.id == r.provider && p.enabled))
+}
+
+/// Checks the catalog: sizes, fields, routes, unique names, and at most one
+/// servable default per capability and tier.
+pub(super) fn validate(models: &[Model], providers: &[Provider]) -> anyhow::Result<()> {
     anyhow::ensure!(
         models.len() <= MAX_MODELS,
         "at most {MAX_MODELS} models are allowed"
     );
     let mut names = HashSet::new();
+    let mut defaults = HashSet::new();
     for model in models {
-        model.validate()?;
+        model.validate(providers)?;
         for name in std::iter::once(&model.id).chain(&model.aliases) {
             anyhow::ensure!(
                 names.insert(name.to_lowercase()),
                 "model name {name:?} is used twice, ids and aliases must be unique"
             );
         }
+        // Entries without an enabled provider (for example a provider whose
+        // key variable is unset) are hidden, so they never compete.
+        anyhow::ensure!(
+            !(model.default && servable(model, providers))
+                || defaults.insert((model.capability(), model.tier)),
+            "models.{}: only one servable default per capability and tier is allowed",
+            model.id
+        );
     }
     Ok(())
 }
 
 impl Config {
-    /// The catalog served to customers. Without configured entries, it holds
-    /// one minimal entry per configured route model.
-    pub fn catalog(&self) -> Cow<'_, [Model]> {
-        if !self.models.is_empty() {
-            return Cow::Borrowed(&self.models);
-        }
-        let mut routes: Vec<&str> = Vec::new();
-        let configured = [&self.llm, &self.tts, &self.stt, &self.image]
-            .into_iter()
-            .flat_map(|u| std::iter::once(&u.model).chain(&u.fallbacks));
-        for name in configured.filter(|m| !m.is_empty()) {
-            if !routes.iter().any(|r| r.eq_ignore_ascii_case(name)) {
-                routes.push(name);
+    /// The provider with `id`.
+    pub fn provider(&self, id: &str) -> Option<&Provider> {
+        self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// Whether `model` can be served: it is enabled and at least one of its
+    /// routes is on an enabled provider. Other entries are hidden and refused
+    /// like disabled ones.
+    pub fn serves(&self, model: &Model) -> bool {
+        servable(model, &self.providers)
+    }
+
+    /// The servable catalog entry a client name (id or alias) refers to.
+    pub fn find_model(&self, name: &str) -> Option<&Model> {
+        self.models
+            .iter()
+            .find(|m| m.answers_to(name) && self.serves(m))
+    }
+
+    /// The servable default entry of a capability and tier.
+    pub fn default_model(&self, capability: Capability, tier: Tier) -> Option<&Model> {
+        self.models
+            .iter()
+            .find(|m| m.default && m.capability() == capability && m.tier == tier && self.serves(m))
+    }
+
+    /// Whether anyone can try the service for free: keyless access is on and
+    /// at least one servable model is free.
+    pub fn offers_free_tier(&self) -> bool {
+        self.free.enabled
+            && self
+                .models
+                .iter()
+                .any(|m| m.tier == Tier::Free && self.serves(m))
+    }
+
+    /// Every distinct (provider, upstream model) pair of the enabled
+    /// catalog, with the public models that use it.
+    pub fn route_pairs(&self) -> Vec<(&str, &str, Vec<&str>)> {
+        let mut out: Vec<(&str, &str, Vec<&str>)> = Vec::new();
+        for model in &self.models {
+            for route in &model.routes {
+                match out
+                    .iter_mut()
+                    .find(|(p, m, _)| *p == route.provider && *m == route.model)
+                {
+                    Some((_, _, users)) => users.push(&model.id),
+                    None => out.push((&route.provider, &route.model, vec![&model.id])),
+                }
             }
         }
-        Cow::Owned(routes.into_iter().map(Model::route).collect())
-    }
-
-    /// The capability of the upstream model `upstream`: the first route
-    /// (chat, speech, transcription, image) that lists it as its model or a
-    /// fallback.
-    pub fn capability_of(&self, upstream: &str) -> Option<Capability> {
-        let routes = [
-            (Capability::Chat, &self.llm),
-            (Capability::Speech, &self.tts),
-            (Capability::Transcription, &self.stt),
-            (Capability::Image, &self.image),
-        ];
-        routes
-            .into_iter()
-            .find(|(_, u)| {
-                std::iter::once(&u.model)
-                    .chain(&u.fallbacks)
-                    .any(|m| !m.is_empty() && m.eq_ignore_ascii_case(upstream))
-            })
-            .map(|(c, _)| c)
-    }
-
-    /// Whether a key with `limits` may use the upstream model `upstream`.
-    ///
-    /// With a catalog, the allowlist is checked against the id of the first
-    /// entry that sends this upstream model. Otherwise the raw name is checked.
-    pub fn upstream_allowed(&self, limits: &Limits, upstream: &str) -> bool {
-        let id = self
-            .models
-            .iter()
-            .find(|m| m.upstream_name().eq_ignore_ascii_case(upstream))
-            .map_or(upstream, |m| m.id.as_str());
-        limits.allows(id)
+        out
     }
 }
 
@@ -313,28 +426,50 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn providers() -> Vec<Provider> {
+        vec![Provider {
+            id: "p".into(),
+            base_url: "https://p.example/v1".into(),
+            ..Provider::default()
+        }]
+    }
+
+    fn route(model: &str) -> Route {
+        Route {
+            provider: "p".into(),
+            model: model.into(),
+            ..Route::default()
+        }
+    }
+
     fn model(id: &str) -> Model {
         Model {
             id: id.into(),
+            capability: Some(Capability::Chat),
+            routes: vec![route(id)],
             ..Model::default()
         }
     }
 
+    fn check(models: &[Model]) -> anyhow::Result<()> {
+        validate(models, &providers())
+    }
+
     #[test]
     fn names_are_unique_case_insensitively_across_ids_and_aliases() {
-        assert!(validate(&[model("a"), model("b")]).is_ok());
-        assert!(validate(&[model("a"), model("A")]).is_err());
+        assert!(check(&[model("a"), model("b")]).is_ok());
+        assert!(check(&[model("a"), model("A")]).is_err());
         let aliased = Model {
             aliases: vec!["Fast".into()],
             ..model("a")
         };
-        assert!(validate(&[aliased.clone(), model("fast")]).is_err());
+        assert!(check(&[aliased.clone(), model("fast")]).is_err());
         let twice = Model {
             aliases: vec!["x".into(), "X".into()],
             ..model("a")
         };
-        assert!(validate(&[twice]).is_err());
-        assert!(validate(&[aliased]).is_ok());
+        assert!(check(&[twice]).is_err());
+        assert!(check(&[aliased]).is_ok());
     }
 
     #[test]
@@ -343,10 +478,6 @@ mod tests {
             model(""),
             model(&"x".repeat(129)),
             model("a\nb"),
-            Model {
-                upstream: "bad\u{7}".into(),
-                ..model("a")
-            },
             Model {
                 aliases: (0..11).map(|i| format!("alias{i}")).collect(),
                 ..model("a")
@@ -364,131 +495,181 @@ mod tests {
                 ..model("a")
             },
         ] {
-            assert!(validate(std::slice::from_ref(&bad)).is_err(), "{bad:?}");
+            assert!(check(std::slice::from_ref(&bad)).is_err(), "{bad:?}");
         }
         let many: Vec<Model> = (0..=MAX_MODELS).map(|i| model(&format!("m{i}"))).collect();
-        assert!(validate(&many).is_err());
-        assert!(validate(&many[..MAX_MODELS]).is_ok());
+        assert!(check(&many).is_err());
+        assert!(check(&many[..MAX_MODELS]).is_ok());
     }
 
     #[test]
-    fn upstream_defaults_to_the_id_and_names_match_aliases() {
-        let plain = model("gpt");
-        assert_eq!(plain.upstream_name(), "gpt");
-        let routed = Model {
-            upstream: "vendor/gpt-1".into(),
-            aliases: vec!["Fast".into()],
-            ..plain
+    fn capability_routes_and_tier_rules_are_enforced() {
+        let missing = Model {
+            capability: None,
+            ..model("a")
         };
-        assert_eq!(routed.upstream_name(), "vendor/gpt-1");
-        assert!(routed.answers_to("GPT") && routed.answers_to("fast"));
-        assert!(!routed.answers_to("vendor/gpt-1"));
+        assert!(check(&[missing]).is_err(), "capability is required");
+        let no_routes = Model {
+            routes: vec![],
+            ..model("a")
+        };
+        assert!(check(&[no_routes]).is_err());
+        let too_many = Model {
+            routes: (0..21).map(|i| route(&format!("m{i}"))).collect(),
+            ..model("a")
+        };
+        assert!(check(&[too_many]).is_err());
+        let unknown_provider = Model {
+            routes: vec![Route {
+                provider: "nope".into(),
+                ..route("x")
+            }],
+            ..model("a")
+        };
+        assert!(check(&[unknown_provider]).is_err());
+        for weight in [0, 101] {
+            let bad = Model {
+                routes: vec![Route {
+                    weight,
+                    ..route("x")
+                }],
+                ..model("a")
+            };
+            assert!(check(&[bad]).is_err(), "weight {weight}");
+        }
+        let duplicate = Model {
+            routes: vec![route("x"), route("x")],
+            ..model("a")
+        };
+        assert!(check(&[duplicate]).is_err());
+        let priced_free = Model {
+            tier: Tier::Free,
+            show_pricing: true,
+            ..model("a")
+        };
+        assert!(check(&[priced_free]).is_err());
+        let voiced_chat = Model {
+            voice: "alloy".into(),
+            ..model("a")
+        };
+        assert!(check(&[voiced_chat]).is_err());
+        let voiced_speech = Model {
+            capability: Some(Capability::Speech),
+            voice: "alloy".into(),
+            ..model("a")
+        };
+        assert!(check(&[voiced_speech]).is_ok());
     }
 
     #[test]
-    fn empty_catalog_lists_route_models_once() {
-        let mut config = Config::default();
-        assert!(config.catalog().is_empty());
-        config.llm.model = "m".into();
-        config.llm.fallbacks = vec!["backup".into(), "M".into()];
-        config.stt.model = "whisper-1".into();
-        config.image.model = "backup".into();
-        config.tts.fallbacks = vec!["voice-b".into()];
-        let ids: Vec<_> = config.catalog().iter().map(|m| m.id.clone()).collect();
-        assert_eq!(ids, ["m", "backup", "voice-b", "whisper-1"]);
-        config.models = vec![model("only")];
-        assert_eq!(config.catalog().len(), 1);
+    fn one_default_per_capability_and_tier() {
+        let default = |id: &str, tier, capability| Model {
+            default: true,
+            tier,
+            capability: Some(capability),
+            ..model(id)
+        };
+        assert!(
+            check(&[
+                default("a", Tier::Paid, Capability::Chat),
+                default("b", Tier::Free, Capability::Chat),
+                default("c", Tier::Paid, Capability::Speech),
+            ])
+            .is_ok()
+        );
+        assert!(
+            check(&[
+                default("a", Tier::Paid, Capability::Chat),
+                default("b", Tier::Paid, Capability::Chat),
+            ])
+            .is_err()
+        );
+        let retired = Model {
+            enabled: false,
+            ..default("b", Tier::Paid, Capability::Chat)
+        };
+        assert!(check(&[default("a", Tier::Paid, Capability::Chat), retired]).is_ok());
     }
 
     #[test]
-    fn modalities_derive_from_the_serving_route() {
-        let mut config = Config::default();
-        config.llm.model = "chat-1".into();
-        config.llm.fallbacks = vec!["chat-2".into()];
-        config.tts.model = "voice-1".into();
-        config.tts.fallbacks = vec!["voice-2".into()];
-        config.stt.model = "ears-1".into();
-        config.image.model = "paint-1".into();
+    fn modalities_derive_from_the_capability_and_explicit_ones_win() {
         let strs = |v: &[String]| v.iter().map(String::as_str).collect::<Vec<_>>().join("+");
-        for (id, kind, input, output) in [
-            ("chat-1", Capability::Chat, "text", "text"),
-            ("CHAT-2", Capability::Chat, "text", "text"),
-            ("voice-1", Capability::Speech, "text", "audio"),
-            ("voice-2", Capability::Speech, "text", "audio"),
-            ("ears-1", Capability::Transcription, "audio", "text"),
-            ("paint-1", Capability::Image, "text", "image"),
+        for (capability, input, output) in [
+            (Capability::Chat, "text", "text"),
+            (Capability::Speech, "text", "audio"),
+            (Capability::Transcription, "audio", "text"),
+            (Capability::Image, "text", "image"),
         ] {
-            let r = model(id).resolved(&config);
-            assert_eq!(r.capability, Some(kind), "{id}");
+            let r = Model {
+                capability: Some(capability),
+                ..model("m")
+            }
+            .resolved();
+            assert_eq!(r.capability, capability);
             assert_eq!(
                 (strs(&r.input).as_str(), strs(&r.output).as_str()),
                 (input, output)
             );
         }
-        // An alias entry derives from its upstream, not its id.
-        let aliased = Model {
-            upstream: "voice-1".into(),
-            ..model("speaker")
-        };
-        assert_eq!(
-            aliased.resolved(&config).capability,
-            Some(Capability::Speech)
-        );
-        // Explicit modalities win, per side.
         let explicit = Model {
             input_modalities: vec!["text".into(), "image".into()],
-            ..model("chat-1")
+            ..model("m")
         };
-        let r = explicit.resolved(&config);
+        let r = explicit.resolved();
         assert_eq!(
             (strs(&r.input), strs(&r.output)),
             ("text+image".into(), "text".into())
         );
-        // No route, but explicit modalities name the capability.
-        for (input, output, kind) in [
-            (vec!["text"], vec!["text"], Capability::Chat),
-            (vec!["text"], vec!["audio"], Capability::Speech),
-            (vec!["audio"], vec!["text"], Capability::Transcription),
-            (vec!["text", "image"], vec!["image"], Capability::Image),
-        ] {
-            let catalog_only = Model {
-                input_modalities: input.iter().map(|m| (*m).to_owned()).collect(),
-                output_modalities: output.iter().map(|m| (*m).to_owned()).collect(),
-                ..model("catalog-only")
-            };
-            assert_eq!(catalog_only.resolved(&config).capability, Some(kind));
-        }
-        // No route, no guess.
-        let r = model("unknown").resolved(&config);
-        assert_eq!(
-            r,
-            Resolved {
-                capability: None,
-                input: vec![],
-                output: vec![]
-            }
-        );
     }
 
     #[test]
-    fn allowlist_checks_the_entry_id_of_an_upstream_model() {
+    fn lookups_follow_aliases_and_enabled_flags() {
         let config = Config {
+            providers: providers(),
             models: vec![
                 Model {
-                    upstream: "vendor/fast-1".into(),
-                    ..model("fast")
+                    aliases: vec!["Fast".into()],
+                    default: true,
+                    ..model("a")
                 },
-                model("slow"),
+                Model {
+                    enabled: false,
+                    ..model("off")
+                },
+                Model {
+                    tier: Tier::Free,
+                    default: true,
+                    ..model("free")
+                },
             ],
             ..Config::default()
         };
-        let only = |id: &str| Limits {
-            allowed_models: vec![id.into()],
-            ..Limits::default()
-        };
-        assert!(config.upstream_allowed(&only("FAST"), "vendor/fast-1"));
-        assert!(!config.upstream_allowed(&only("vendor/fast-1"), "vendor/fast-1"));
-        assert!(config.upstream_allowed(&only("other"), "other"), "raw name");
-        assert!(config.upstream_allowed(&Limits::default(), "anything"));
+        assert_eq!(config.find_model("FAST").unwrap().id, "a");
+        assert!(config.find_model("off").is_none());
+        assert_eq!(
+            config
+                .default_model(Capability::Chat, Tier::Paid)
+                .unwrap()
+                .id,
+            "a"
+        );
+        assert_eq!(
+            config
+                .default_model(Capability::Chat, Tier::Free)
+                .unwrap()
+                .id,
+            "free"
+        );
+        assert!(
+            config
+                .default_model(Capability::Image, Tier::Free)
+                .is_none()
+        );
+        let pairs = config.route_pairs();
+        assert!(
+            pairs
+                .iter()
+                .any(|(p, m, users)| *p == "p" && *m == "a" && users == &["a"])
+        );
     }
 }

@@ -12,7 +12,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reseller::{
     App, billing,
-    config::{Config, Price},
+    config::{Capability, Config, Price},
     db, keys,
     mcp::bridge::{Bridge, Credentials, Options, Store},
     security::pow,
@@ -25,6 +25,8 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+mod common;
 
 const ADMIN: &str = "admin-test-secret-123456789";
 const MODERN: &str = "2026-07-28";
@@ -88,19 +90,16 @@ impl Test {
             markup_pct: "0".into(),
             signup: reseller::config::Signup {
                 cooldown_seconds: 0,
-                ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
-                // Halving is on by default, but these tests expect full trial credit.
-                free_credit_halving: false,
                 ..Default::default()
             },
             ..Config::default()
         };
-        config.llm.model = "m".into();
-        config.tts.model = "tts-1".into();
-        config.stt.model = "whisper-1".into();
-        config.image.model = "img-1".into();
+        common::serve(&mut config, "llm", Capability::Chat, "m");
+        common::serve(&mut config, "tts", Capability::Speech, "tts-1");
+        common::serve(&mut config, "stt", Capability::Transcription, "whisper-1");
+        common::serve(&mut config, "image", Capability::Image, "img-1");
         config.prices.clear();
         config.prices.insert("m".into(), price("2", "4"));
         config.prices.insert(
@@ -137,6 +136,7 @@ impl Test {
         )
         .await
         .unwrap();
+        common::fund(&app, key["account_id"].as_str().unwrap(), common::DIME).await;
         app.config_mut().await.signup.pow_max_number = pow_max_number;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -158,16 +158,16 @@ impl Test {
         }
     }
 
-    async fn mock(
-        &mut self,
-        select: fn(&mut Config) -> &mut reseller::config::Upstream,
-        router: Router,
-    ) {
+    /// Points the provider `provider` at `router`.
+    async fn mock(&mut self, provider: &str, router: Router) {
         let (base, task) = serve(router).await;
         let mut config = self.app.config_mut().await;
-        let upstream = select(&mut config);
-        upstream.base_url = format!("{base}/v1");
-        upstream.api_key = "upstream-secret".into();
+        common::point(
+            &mut config,
+            provider,
+            &format!("{base}/v1"),
+            "upstream-secret",
+        );
         self.tasks.push(task);
     }
 
@@ -294,19 +294,6 @@ impl Rpc {
     }
 }
 
-fn llm(c: &mut Config) -> &mut reseller::config::Upstream {
-    &mut c.llm
-}
-fn tts(c: &mut Config) -> &mut reseller::config::Upstream {
-    &mut c.tts
-}
-fn stt(c: &mut Config) -> &mut reseller::config::Upstream {
-    &mut c.stt
-}
-fn image(c: &mut Config) -> &mut reseller::config::Upstream {
-    &mut c.image
-}
-
 /// Upstream requests seen by a mock: (Authorization header, body).
 type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -383,7 +370,12 @@ async fn discover_advertises_versions_capabilities_and_identity() {
     assert!(result["ttlMs"].as_u64().unwrap() > 0);
     assert_server_info(result);
     let instructions = result["instructions"].as_str().unwrap();
-    for needle in ["Bearer", "OAuth", "generate_text", "$0.10"] {
+    for needle in [
+        "Bearer",
+        "OAuth",
+        "generate_text",
+        "Free models cost nothing",
+    ] {
         assert!(instructions.contains(needle), "{needle}: {instructions}");
     }
     // Discovery and the tool list are identical for every caller.
@@ -976,7 +968,8 @@ async fn tools_list_is_complete_and_well_formed() {
 async fn tools_need_the_right_credential() {
     let mut t = Test::new().await;
     let seen = Arc::default();
-    t.mock(llm, recording(Arc::clone(&seen), chat_reply)).await;
+    t.mock("llm", recording(Arc::clone(&seen), chat_reply))
+        .await;
 
     // There is no anonymous mode: a request without a credential is a 401.
     let call = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
@@ -1018,7 +1011,8 @@ async fn tools_need_the_right_credential() {
 async fn generate_text_is_billed_like_the_http_api() {
     let mut t = Test::new().await;
     let seen = Arc::default();
-    t.mock(llm, recording(Arc::clone(&seen), chat_reply)).await;
+    t.mock("llm", recording(Arc::clone(&seen), chat_reply))
+        .await;
 
     let result = t
         .tool(
@@ -1102,7 +1096,7 @@ async fn generate_text_validates_arguments_and_reports_failures() {
     let mut t = Test::new().await;
     let seen = Arc::default();
     t.mock(
-        llm,
+        "llm",
         recording(Arc::clone(&seen), || {
             (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1132,6 +1126,7 @@ async fn generate_text_validates_arguments_and_reports_failures() {
     let r = t.tool(key, "generate_text", json!({"prompt":"x"})).await;
     assert_eq!(error_code(&r), "upstream_error");
     assert!(text_of(&r).contains("429") && text_of(&r).contains("slow down"));
+    // The rate-limited route now cools down: nothing else can serve.
     // Conversation form.
     let r = t
         .tool(
@@ -1140,14 +1135,20 @@ async fn generate_text_validates_arguments_and_reports_failures() {
             json!({"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"}]}),
         )
         .await;
-    assert_eq!(error_code(&r), "upstream_error");
+    assert_eq!(error_code(&r), "capacity_exhausted");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the cooling route is skipped"
+    );
 }
 
 #[tokio::test]
 async fn insufficient_quota_is_a_tool_error_with_the_code() {
     let mut t = Test::new().await;
     let seen = Arc::default();
-    t.mock(llm, recording(Arc::clone(&seen), chat_reply)).await;
+    t.mock("llm", recording(Arc::clone(&seen), chat_reply))
+        .await;
     sqlx::query("UPDATE credits SET remaining_micro=0 WHERE account_id=?")
         .bind(t.account())
         .execute(&t.app.db)
@@ -1168,7 +1169,7 @@ async fn generate_speech_returns_audio_and_is_billed_by_characters() {
     let audio = vec![0xFF, 0xFB, 0x90, 0x00, 7, 7];
     let reply = audio.clone();
     t.mock(
-        tts,
+        "tts",
         recording(Arc::clone(&seen), move || {
             let mut response = Response::new(Body::from(reply.clone()));
             response
@@ -1237,7 +1238,7 @@ async fn generate_speech_returns_audio_and_is_billed_by_characters() {
 async fn generate_speech_wraps_pcm_using_the_declared_layout() {
     let mut t = Test::new().await;
     t.mock(
-        tts,
+        "tts",
         Router::new().fallback(any(|body: axum::body::Bytes| async move {
             let format: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(format["response_format"], "pcm");
@@ -1276,7 +1277,7 @@ async fn generate_speech_wraps_pcm_using_the_declared_layout() {
 async fn media_limits_apply_to_outputs_and_inputs() {
     let mut t = Test::with(|c| c.mcp.max_media_bytes = 100).await;
     t.mock(
-        tts,
+        "tts",
         Router::new().fallback(any(|| async {
             let mut response = Response::new(Body::from(vec![1u8; 200]));
             response
@@ -1287,7 +1288,7 @@ async fn media_limits_apply_to_outputs_and_inputs() {
     )
     .await;
     t.mock(
-        image,
+        "image",
         Router::new().fallback(any(|| async {
             Json(json!({"data":[{"b64_json": STANDARD.encode(vec![9u8; 80])},{"b64_json": STANDARD.encode(vec![9u8; 80])}]}))
         })),
@@ -1325,7 +1326,7 @@ async fn transcribe_audio_uploads_multipart_and_bills_duration() {
     let mut t = Test::new().await;
     let seen = Arc::default();
     t.mock(
-        stt,
+        "stt",
         recording(Arc::clone(&seen), || {
             Json(json!({"text":"hello world","language":"en","usage":{"type":"duration","seconds":30}}))
                 .into_response()
@@ -1399,7 +1400,7 @@ async fn generate_image_returns_inline_images_and_never_fetches_urls() {
     let link = format!("{victim}/secret.png");
     let b64 = STANDARD.encode(PNG);
     t.mock(
-        image,
+        "image",
         recording(Arc::clone(&seen), move || {
             Json(json!({"data":[
                 {"b64_json": b64, "revised_prompt":"a red cat"},
@@ -1463,17 +1464,19 @@ async fn generate_image_returns_inline_images_and_never_fetches_urls() {
 #[tokio::test]
 async fn list_models_lists_the_catalog() {
     let t = Test::new().await;
-    t.app.config_mut().await.models = vec![
-        reseller::config::Model {
-            id: "m".into(),
-            ..Default::default()
-        },
-        reseller::config::Model {
-            id: "other".into(),
-            upstream: "vendor/other".into(),
-            ..Default::default()
-        },
-    ];
+    {
+        let mut config = t.app.config_mut().await;
+        config.models.retain(|m| m.id == "m");
+        config.models.truncate(1);
+        common::model(
+            &mut config,
+            "other",
+            Capability::Chat,
+            reseller::config::Tier::Free,
+            "llm",
+            "vendor/other",
+        );
+    }
     let r = t.tool(Some(t.api_key()), "list_models", json!({})).await;
     assert_eq!(r["structuredContent"]["models"], json!(["m", "other"]));
 }
@@ -1484,7 +1487,7 @@ async fn list_models_lists_the_catalog() {
 #[tokio::test]
 async fn account_tools_reuse_the_http_handlers() {
     let mut t = Test::new().await;
-    t.mock(llm, recording(Arc::default(), chat_reply)).await;
+    t.mock("llm", recording(Arc::default(), chat_reply)).await;
     let key = Some(t.api_key());
     let dash = Some(t.dashboard());
     t.tool(key, "generate_text", json!({"prompt":"x"})).await;
@@ -1667,7 +1670,7 @@ async fn solve_challenge(challenge: &Value) -> String {
 #[tokio::test]
 async fn account_creation_is_over_http_and_not_a_tool() {
     let mut t = Test::with(|c| c.signup.pow_max_number = 300).await;
-    t.mock(llm, recording(Arc::default(), chat_reply)).await;
+    t.mock("llm", recording(Arc::default(), chat_reply)).await;
     for gone in ["signup_challenge", "create_account"] {
         let r = t
             .rpc(
@@ -1700,10 +1703,14 @@ async fn account_creation_is_over_http_and_not_a_tool() {
         .unwrap();
     let key = created["key"].as_str().unwrap().to_owned();
     let overview = t.tool(Some(&key), "account_overview", json!({})).await;
-    assert_eq!(
-        overview["structuredContent"]["account"]["balance_usd"],
-        "0.1"
-    );
+    // A new account starts without credit.
+    assert_eq!(overview["structuredContent"]["account"]["balance_usd"], "0");
+    common::fund(
+        &t.app,
+        created["account_id"].as_str().unwrap(),
+        common::DIME,
+    )
+    .await;
     let text = t
         .tool(Some(&key), "generate_text", json!({"prompt":"hi"}))
         .await;
@@ -1921,9 +1928,9 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
         c.keys.rotate_cooldown_seconds = 0;
     })
     .await;
-    t.mock(llm, recording(Arc::default(), chat_reply)).await;
+    t.mock("llm", recording(Arc::default(), chat_reply)).await;
     t.mock(
-        tts,
+        "tts",
         Router::new().fallback(any(|| async {
             let mut response = Response::new(Body::from(vec![1u8, 2, 3]));
             response
@@ -1963,9 +1970,16 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
     let who = b.tool("whoami", json!({})).await;
     let who = &who["structuredContent"];
     assert_eq!(who["signed_in"], true);
-    assert_eq!(who["balance_usd"], "0.1");
+    assert_eq!(who["balance_usd"], "0");
     assert_eq!(who["key_prefix"], api_key[..15]);
     assert!(!who.to_string().contains(&api_key));
+    let account: String =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE id<>? ORDER BY created_at DESC LIMIT 1")
+            .bind(t.account())
+            .fetch_one(&t.app.db)
+            .await
+            .unwrap();
+    common::fund(&t.app, &account, common::DIME).await;
 
     // Generation uses the API key and is billed.
     let text = b.tool("generate_text", json!({"prompt":"hi"})).await;
@@ -2054,7 +2068,7 @@ async fn bridge_signup_generate_and_credential_lifecycle() {
 #[tokio::test]
 async fn bridge_login_verifies_credentials() {
     let mut t = Test::new().await;
-    t.mock(llm, recording(Arc::default(), chat_reply)).await;
+    t.mock("llm", recording(Arc::default(), chat_reply)).await;
     let b = local(&t, None);
     let bad = format!("sk-res-{}", "a".repeat(64));
     let r = b.tool("login", json!({"api_key":bad})).await;
@@ -2124,7 +2138,7 @@ async fn bridge_login_verifies_credentials() {
 #[tokio::test]
 async fn bridge_token_option_is_used_without_storing_it() {
     let mut t = Test::new().await;
-    t.mock(llm, recording(Arc::default(), chat_reply)).await;
+    t.mock("llm", recording(Arc::default(), chat_reply)).await;
     let b = local(&t, Some(t.api_key()));
     let who = b.tool("whoami", json!({})).await;
     assert_eq!(who["structuredContent"]["signed_in"], true);

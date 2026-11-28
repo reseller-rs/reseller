@@ -101,7 +101,7 @@ async fn billing(ctx: &Ctx, request_id: Option<&str>) -> Result<Value, ToolError
     if let Some(id) = request_id {
         out["request_id"] = id.into();
         let row = sqlx::query(
-            "SELECT model,tokens,billed_micro,estimated FROM requests WHERE id=? AND account_id=?",
+            "SELECT public_model AS model,tokens,billed_micro,estimated FROM requests WHERE id=? AND account_id=?",
         )
         .bind(id)
         .bind(account)

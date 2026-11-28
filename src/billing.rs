@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
 
 /// Allowed values of `credits.source`.
-pub const CREDIT_SOURCES: [&str; 5] = ["free", "purchase", "admin", "refund", "subscription"];
+pub const CREDIT_SOURCES: [&str; 4] = ["purchase", "admin", "refund", "subscription"];
 
 /// Plan kind with a monthly quota over a paid period.
 pub const SUBSCRIPTION: &str = "subscription";
@@ -612,20 +612,23 @@ pub async fn block_after_refund(
     Ok(())
 }
 
-/// Whether an account is on the free tier: no active subscription and no
-/// spendable credit other than signup trial credit. The operator's free-tier
-/// rules (for example the reasoning effort cap) apply to it.
-pub async fn is_free(conn: &mut SqliteConnection, account: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT NOT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=?1 AND status='active' \
-           AND expires_at>?2) \
-         AND NOT EXISTS(SELECT 1 FROM credits WHERE account_id=?1 AND source<>'free' \
-           AND remaining_micro>0 AND (expires_at IS NULL OR expires_at>?2))",
+/// Whether an account counts as a customer for the free tier: it ever paid
+/// for an order, has an active subscription or spendable credit, or the
+/// operator trusts it (`can_create_keys`). Such accounts get their own free
+/// request budget. Every other key shares the budget of its client address, so
+/// opening more accounts buys nothing.
+pub async fn is_paying(conn: &mut SqliteConnection, account: &str) -> Result<bool> {
+    let flagged: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=?1 AND can_create_keys=1) \
+         OR EXISTS(SELECT 1 FROM payments WHERE account_id=?1 AND status='paid') \
+         OR EXISTS(SELECT 1 FROM subscriptions WHERE account_id=?1 AND status='active' \
+           AND expires_at>?2)",
     )
     .bind(account)
     .bind(now())
-    .fetch_one(conn)
-    .await?)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(flagged || db::balance(conn, account).await? > 0)
 }
 
 /// Whether `value` of `kind` is blocked after an earlier refund.

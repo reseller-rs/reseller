@@ -13,13 +13,15 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use reseller::{
     App, billing,
-    config::{Config, Price},
+    config::{Capability, Config, Price},
     db, keys,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Notify;
+
+mod common;
 
 struct Test {
     app: App,
@@ -59,14 +61,13 @@ impl Test {
             markup_pct: "0".into(),
             signup: reseller::config::Signup {
                 cooldown_seconds: 0,
-                ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
                 ..Default::default()
             },
             ..Config::default()
         };
-        config.llm.model = "m".into();
+        common::llm(&mut config, "m");
         config.prices.clear();
         for (model, price) in prices {
             config.prices.insert((*model).into(), price.clone());
@@ -81,6 +82,7 @@ impl Test {
         )
         .await
         .unwrap();
+        common::fund(&app, key["account_id"].as_str().unwrap(), common::DIME).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = reseller::web::router(app.clone()).await;
@@ -101,17 +103,16 @@ impl Test {
         }
     }
 
-    /// Points the upstream chosen by `select` at `router`.
-    async fn mock(
-        &mut self,
-        select: fn(&mut Config) -> &mut reseller::config::Upstream,
-        router: Router,
-    ) {
+    /// Points the provider `provider` at `router`.
+    async fn mock(&mut self, provider: &str, router: Router) {
         let (base, task) = serve(router).await;
         let mut config = self.app.config_mut().await;
-        let upstream = select(&mut config);
-        upstream.base_url = format!("{base}/v1");
-        upstream.api_key = "upstream-secret".into();
+        common::point(
+            &mut config,
+            provider,
+            &format!("{base}/v1"),
+            "upstream-secret",
+        );
         self.tasks.push(task);
     }
 
@@ -170,15 +171,9 @@ fn price(input: &str, output: &str) -> Price {
     }
 }
 
-fn llm_upstream(c: &mut Config) -> &mut reseller::config::Upstream {
-    &mut c.llm
-}
-fn tts_upstream(c: &mut Config) -> &mut reseller::config::Upstream {
-    &mut c.tts
-}
-fn stt_upstream(c: &mut Config) -> &mut reseller::config::Upstream {
-    &mut c.stt
-}
+const LLM: &str = "llm";
+const TTS: &str = "tts";
+const STT: &str = "stt";
 
 /// An upstream that answers every request with `handler`.
 fn fixed<F, Fut>(handler: F) -> Router
@@ -211,7 +206,7 @@ async fn client_disconnect_mid_stream_still_bills_final_usage() {
     let release = Arc::new(Notify::new());
     let gate = release.clone();
     t.mock(
-        llm_upstream,
+        LLM,
         Router::new().fallback(any(move || {
             let gate = gate.clone();
             async move {
@@ -266,8 +261,19 @@ async fn client_disconnect_mid_stream_still_bills_final_usage() {
 #[tokio::test]
 async fn missing_usage_is_estimated_and_flagged() {
     let mut t = Test::new(&[("m", price("2", "4"))]).await;
+    {
+        let mut c = t.app.config_mut().await;
+        common::model(
+            &mut c,
+            "reported",
+            Capability::Chat,
+            reseller::config::Tier::Paid,
+            "llm",
+            "reported",
+        );
+    }
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|body| async move {
             if body["model"] == "reported" {
                 return json_response(
@@ -336,7 +342,7 @@ async fn missing_usage_is_estimated_and_flagged() {
 async fn streamed_response_without_usage_is_estimated() {
     let mut t = Test::new(&[("m", price("2", "4"))]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         Router::new().fallback(any(|| async {
             Response::builder()
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -372,9 +378,14 @@ async fn tts_mp3_is_billed_by_characters_and_only_on_success() {
         ..price("0", "0")
     };
     let mut t = Test::new(&[("m", price("0", "0")), ("tts-1", speech)]).await;
-    t.app.config_mut().await.tts.model = "tts-1".into();
+    common::serve(
+        &mut *t.app.config_mut().await,
+        "tts",
+        Capability::Speech,
+        "tts-1",
+    );
     t.mock(
-        tts_upstream,
+        TTS,
         fixed(|body| async move {
             if body["input"] == "fail" {
                 return (StatusCode::BAD_REQUEST, "bad").into_response();
@@ -416,9 +427,14 @@ async fn tts_mp3_is_billed_by_characters_and_only_on_success() {
 #[tokio::test]
 async fn tts_sse_usage_is_billed_in_tokens() {
     let mut t = Test::new(&[("m", price("0", "0")), ("tts-1", price("1", "10"))]).await;
-    t.app.config_mut().await.tts.model = "tts-1".into();
+    common::serve(
+        &mut *t.app.config_mut().await,
+        "tts",
+        Capability::Speech,
+        "tts-1",
+    );
     t.mock(
-        tts_upstream,
+        TTS,
         Router::new().fallback(any(|| async {
             Response::builder()
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -454,9 +470,14 @@ async fn transcription_usage_shapes_and_flat_request_fee() {
         ..Price::default()
     };
     let mut t = Test::new(&[("m", price("0", "0")), ("whisper-1", stt)]).await;
-    t.app.config_mut().await.stt.model = "whisper-1".into();
+    common::serve(
+        &mut *t.app.config_mut().await,
+        "stt",
+        Capability::Transcription,
+        "whisper-1",
+    );
     t.mock(
-        stt_upstream,
+        STT,
         fixed(|body| async move {
             match body["response_format"].as_str() {
                 Some("duration") => {
@@ -503,7 +524,7 @@ async fn zero_provider_cost_plus_request_fee() {
     };
     let mut t = Test::new(&[("m", priced)]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|_| async {
             json_response(
                 json!({"usage":{"prompt_tokens":1000,"total_tokens":1000,"cost":"1.2e-5"}}),
@@ -531,7 +552,7 @@ async fn cached_tokens_and_aggregates_agree_to_the_micro_dollar() {
     let mut t = Test::new(&[("m", cached)]).await;
     t.app.config_mut().await.markup_pct = "30".into();
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|_| async {
             json_response(json!({"usage":{
                 "prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100,
@@ -610,7 +631,7 @@ async fn chat_completion_images_are_priced() {
     };
     let mut t = Test::new(&[("m", image)]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|body| async move {
             if body["stream"] == true {
                 let events = [
@@ -652,16 +673,18 @@ async fn chat_completion_images_are_priced() {
     );
 }
 
-/// A fallback model is priced by the model that actually served the request.
+/// A fallback route is priced by the upstream model that actually served the
+/// request, while usage is grouped under the public model.
 #[tokio::test]
 async fn fallback_attempt_is_priced_by_the_serving_model() {
     let mut t = Test::new(&[("m", price("1", "1")), ("fb", price("10", "10"))]).await;
     {
         let mut config = t.app.config_mut().await;
-        config.llm.fallbacks = vec!["fb".into()];
+        common::ordered(&mut config, "m");
+        common::add_route(&mut config, "m", "llm", "fb");
     }
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|body| async move {
             if body["model"] == "m" {
                 return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
@@ -675,16 +698,32 @@ async fn fallback_attempt_is_priced_by_the_serving_model() {
     let r = t
         .post("/v1/chat/completions", &json!({"model":"m","messages":[]}))
         .await;
-    assert_eq!(r.headers()["x-model-fallback"], "fb");
+    assert!(
+        r.headers().get("x-model-fallback").is_none(),
+        "no upstream names"
+    );
     let _ = r.bytes().await.unwrap();
     let rows = t.settled(1).await;
     assert_eq!(rows[0].get::<String, _>("model"), "fb");
+    assert_eq!(rows[0].get::<String, _>("public_model"), "m");
+    assert_eq!(rows[0].get::<String, _>("provider"), "llm");
+    assert_eq!(rows[0].get::<i64, _>("attempts"), 2);
     assert_eq!(rows[0].get::<i64, _>("upstream_micro"), 10_000);
     let bucket: String = sqlx::query_scalar("SELECT model FROM usage_buckets")
         .fetch_one(&t.app.db)
         .await
         .unwrap();
-    assert_eq!(bucket, "fb");
+    assert_eq!(bucket, "m", "usage is grouped under the public model");
+    // Each attempt is recorded on its route.
+    let usage: Vec<(String, i64, i64, i64)> =
+        sqlx::query_as("SELECT model,requests,rate_limited,tokens FROM route_usage ORDER BY model")
+            .fetch_all(&t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        usage,
+        [("fb".to_owned(), 1, 0, 1000), ("m".to_owned(), 1, 1, 0)]
+    );
 }
 
 /// An unfinished request row that outlived the upstream timeout (a crash
@@ -693,7 +732,7 @@ async fn fallback_attempt_is_priced_by_the_serving_model() {
 async fn stale_unfinished_rows_do_not_consume_request_limits() {
     let mut t = Test::new(&[("m", price("1", "1"))]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|_| async { json_response(json!({"usage":{"total_tokens":1}})) }),
     )
     .await;
@@ -707,8 +746,8 @@ async fn stale_unfinished_rows_do_not_consume_request_limits() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip,finished) \
-         VALUES('stale',?,?,?,'POST','/v1/chat/completions','llm','m','1.1.1.1',0)",
+        "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,tier,ip,finished) \
+         VALUES('stale',?,?,?,'POST','/v1/chat/completions','llm','m','paid','1.1.1.1',0)",
     )
     .bind(t.account())
     .bind(key_id)
@@ -728,7 +767,7 @@ async fn stale_unfinished_rows_do_not_consume_request_limits() {
 async fn realtime_client_close_waits_for_in_flight_response_done() {
     let mut t = Test::new(&[("m", price("2", "4"))]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         Router::new().fallback(any(|ws: WebSocketUpgrade| async move {
             ws.on_upgrade(|mut socket| async move {
                 use axum::extract::ws::Message;
@@ -824,7 +863,8 @@ impl Test {
 }
 
 /// An STT test fixture whose upstream records every completed request body.
-async fn stt_test(policy: reseller::config::Policy) -> (Test, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+/// `whisper-1` is the default model, and `cheap` another one.
+async fn stt_test() -> (Test, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
     let stt = Price {
         audio_second: "0.0001".into(),
         ..Price::default()
@@ -836,13 +876,20 @@ async fn stt_test(policy: reseller::config::Policy) -> (Test, Arc<std::sync::Mut
     let mut t = Test::new(&[("m", price("0", "0")), ("whisper-1", stt), ("cheap", cheap)]).await;
     {
         let mut c = t.app.config_mut().await;
-        c.model_policy = policy;
-        c.stt.model = "whisper-1".into();
+        common::serve(&mut c, "stt", Capability::Transcription, "whisper-1");
+        common::model(
+            &mut c,
+            "cheap",
+            Capability::Transcription,
+            reseller::config::Tier::Paid,
+            "stt",
+            "cheap",
+        );
     }
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
     t.mock(
-        stt_upstream,
+        STT,
         Router::new().fallback(any(move |request: Request| {
             let log = log.clone();
             async move {
@@ -858,85 +905,137 @@ async fn stt_test(policy: reseller::config::Policy) -> (Test, Arc<std::sync::Mut
     (t, seen)
 }
 
-/// The client's multipart model is priced and metered under default and
-/// passthrough policies. The body reaches the upstream unchanged.
+/// The client's multipart model is priced and metered. The body reaches the
+/// upstream with the model part rewritten to the route's model and every
+/// other byte unchanged.
 #[tokio::test]
-async fn multipart_model_is_priced_under_default_and_passthrough() {
-    use reseller::config::Policy;
-    for policy in [Policy::Default, Policy::Passthrough] {
-        let (t, seen) = stt_test(policy).await;
-        let body = multipart_body(Some("cheap"));
-        let r = t.upload(body.clone()).await;
-        assert_eq!(r.status(), 200);
-        let _ = r.bytes().await.unwrap();
-        let rows = t.settled(1).await;
-        assert_eq!(rows[0].get::<String, _>("model"), "cheap");
-        // 30 s * 0.00001 USD.
-        assert_eq!(rows[0].get::<i64, _>("upstream_micro"), 300, "{policy:?}");
-        assert_eq!(seen.lock().unwrap()[0], body);
-    }
-    // Missing model: injected under default (priced by it), empty and
-    // priced by the default entry under passthrough.
-    let (t, seen) = stt_test(Policy::Default).await;
+async fn multipart_model_is_priced_by_the_chosen_model() {
+    let (t, seen) = stt_test().await;
+    let body = multipart_body(Some("cheap"));
+    let r = t.upload(body.clone()).await;
+    assert_eq!(r.status(), 200);
+    let _ = r.bytes().await.unwrap();
+    let rows = t.settled(1).await;
+    assert_eq!(rows[0].get::<String, _>("model"), "cheap");
+    // 30 s * 0.00001 USD.
+    assert_eq!(rows[0].get::<i64, _>("upstream_micro"), 300);
+    assert_eq!(seen.lock().unwrap()[0], body);
+    // A missing model part gets the default model, injected for the upstream.
+    let (t, seen) = stt_test().await;
     let _ = t.upload(multipart_body(None)).await.bytes().await.unwrap();
     let rows = t.settled(1).await;
     assert_eq!(rows[0].get::<String, _>("model"), "whisper-1");
     assert_eq!(rows[0].get::<i64, _>("upstream_micro"), 3000);
     assert!(String::from_utf8_lossy(&seen.lock().unwrap()[0]).contains("whisper-1"));
-    let (t, _) = stt_test(Policy::Passthrough).await;
-    let _ = t.upload(multipart_body(None)).await.bytes().await.unwrap();
-    assert_eq!(t.settled(1).await[0].get::<String, _>("model"), "");
+}
+
+/// The public model of an upload is rewritten to the route's upstream model
+/// (aliases and catalog ids differ from upstream names), whatever its case.
+#[tokio::test]
+async fn multipart_public_model_is_replaced_by_the_route_model() {
+    let (t, seen) = stt_test().await;
+    {
+        let mut c = t.app.config_mut().await;
+        common::model(
+            &mut c,
+            "speech-to-text",
+            Capability::Transcription,
+            reseller::config::Tier::Paid,
+            "stt",
+            "vendor/stt-large",
+        )
+        .aliases = vec!["Ears".into()];
+    }
+    let r = t.upload(multipart_body(Some("EARS"))).await;
+    assert_eq!(r.status(), 200);
+    let _ = r.bytes().await.unwrap();
+    let sent = String::from_utf8_lossy(&seen.lock().unwrap()[0]).into_owned();
+    assert!(
+        sent.contains("name=\"model\"\r\n\r\nvendor/stt-large\r\n"),
+        "{sent}"
+    );
+    assert!(!sent.contains("EARS"));
+    assert!(sent.contains("\x00\x01AUDIO\u{fffd}") || sent.contains("AUDIO"));
+    let rows = t.settled(1).await;
+    assert_eq!(rows[0].get::<String, _>("public_model"), "speech-to-text");
+    assert_eq!(rows[0].get::<String, _>("model"), "vendor/stt-large");
 }
 
 /// The key's allowlist applies to the multipart model: allowed passes,
 /// disallowed or absent is a 404 and the upstream never gets a request.
 #[tokio::test]
 async fn multipart_model_allowlist_is_enforced() {
-    use reseller::config::Policy;
-    for policy in [Policy::Default, Policy::Passthrough] {
-        let (t, seen) = stt_test(policy).await;
-        t.restrict_models(&["cheap"]).await;
+    let (t, seen) = stt_test().await;
+    t.restrict_models(&["cheap"]).await;
 
-        let r = t.upload(multipart_body(Some("CHEAP"))).await;
-        assert_eq!(r.status(), 200, "{policy:?}");
-        let _ = r.bytes().await.unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 1);
+    let r = t.upload(multipart_body(Some("CHEAP"))).await;
+    assert_eq!(r.status(), 200);
+    let _ = r.bytes().await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1);
 
-        for body in [multipart_body(Some("whisper-1")), multipart_body(None)] {
-            let r = t.upload(body).await;
-            assert_eq!(r.status(), 404, "{policy:?}");
-            let v: Value = r.json().await.unwrap();
-            assert_eq!(v["error"]["code"], "model_not_found");
-        }
-        assert_eq!(
-            seen.lock().unwrap().len(),
-            1,
-            "upstream saw a rejected upload"
-        );
-        let rows = t.settled(3).await;
-        assert_eq!(rows[1].get::<i64, _>("status"), 404);
-        assert_eq!(rows[1].get::<String, _>("model"), "whisper-1");
-        assert!(
-            rows[1]
-                .get::<String, _>("error")
-                .contains("model_not_found")
-        );
-        assert_eq!(rows[2].get::<i64, _>("status"), 404);
-        // Only the allowed request was billed.
-        assert_eq!(rows[1].get::<i64, _>("billed_micro"), 0);
-        assert_eq!(rows[2].get::<i64, _>("billed_micro"), 0);
+    for body in [multipart_body(Some("whisper-1")), multipart_body(None)] {
+        let r = t.upload(body).await;
+        assert_eq!(r.status(), 404);
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["error"]["code"], "model_not_found");
     }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "upstream saw a rejected upload"
+    );
+    // Rejected uploads are refused before admission, so only the allowed
+    // request was logged and billed.
+    let rows = t.settled(1).await;
+    assert_eq!(rows[0].get::<i64, _>("status"), 200);
+}
+
+/// A later `model` part that names another model than the first is a 400,
+/// and one that names the same model (by an alias) is fine.
+#[tokio::test]
+async fn a_changed_multipart_model_is_rejected() {
+    let (t, seen) = stt_test().await;
+    {
+        let mut c = t.app.config_mut().await;
+        c.models
+            .iter_mut()
+            .find(|m| m.id == "cheap")
+            .unwrap()
+            .aliases = vec!["cheapest".into()];
+    }
+    // Pad the upload so that its first model part is read before the second.
+    let mut body = multipart_body(Some("cheap"));
+    let tail =
+        b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--b--\r\n";
+    let end = body.len() - b"--b--\r\n".len();
+    body.splice(end.., tail.iter().copied());
+    let r = t.upload(body).await;
+    assert_eq!(r.status(), 400);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "model_must_precede_file");
+    assert!(
+        seen.lock().unwrap().is_empty()
+            || !String::from_utf8_lossy(&seen.lock().unwrap()[0]).contains("whisper-1")
+    );
+    let mut body = multipart_body(Some("cheap"));
+    let tail =
+        b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nCheapest\r\n--b--\r\n";
+    let end = body.len() - b"--b--\r\n".len();
+    body.splice(end.., tail.iter().copied());
+    let r = t.upload(body).await;
+    assert_eq!(r.status(), 200);
 }
 
 /// A model value longer than the limit is a 400.
 #[tokio::test]
 async fn multipart_model_over_limit_is_rejected() {
-    let (t, seen) = stt_test(reseller::config::Policy::Default).await;
+    let (t, seen) = stt_test().await;
     let r = t.upload(multipart_body(Some(&"x".repeat(257)))).await;
     assert_eq!(r.status(), 400);
     assert!(seen.lock().unwrap().is_empty());
+    // At the limit it is just an unknown model.
     let r = t.upload(multipart_body(Some(&"x".repeat(256)))).await;
-    assert_eq!(r.status(), 200);
+    assert_eq!(r.status(), 404);
 }
 
 /// Requests left unfinished by a previous process are closed on startup
@@ -946,8 +1045,8 @@ async fn startup_sweep_closes_interrupted_requests() {
     let t = Test::new(&[("m", price("1", "1"))]).await;
     for (id, finished) in [("open", 0), ("done", 1)] {
         sqlx::query(
-            "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,ip,finished,status) \
-             VALUES(?,?,NULL,?,'POST','/v1/chat/completions','llm','m','1.1.1.1',?,200)",
+            "INSERT INTO requests(id,account_id,key_id,created_at,method,path,kind,model,tier,ip,finished,status) \
+             VALUES(?,?,NULL,?,'POST','/v1/chat/completions','llm','m','paid','1.1.1.1',?,200)",
         )
         .bind(id)
         .bind(t.account())
@@ -985,12 +1084,24 @@ async fn unauthorized_responses_carry_www_authenticate() {
     let t = Test::new(&[("m", price("1", "1"))]).await;
     let client = reqwest::Client::new();
     let url = format!("http://{}/v1/chat/completions", t.addr);
-    let r = client.post(&url).json(&json!({})).send().await.unwrap();
-    assert_eq!(r.status(), 401);
-    assert_eq!(r.headers()["www-authenticate"], "Bearer realm=\"reseller\"");
+    // No credential and a paid model: the request needs a key.
     let r = client
         .post(&url)
-        .bearer_auth("sk-wrong")
+        .json(&json!({"model":"m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    assert_eq!(r.headers()["www-authenticate"], "Bearer realm=\"reseller\"");
+    // With the free tier off, any request without a key lacks a credential.
+    t.app.config_mut().await.free.enabled = false;
+    let r = client.post(&url).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "missing_api_key");
+    let r = client
+        .post(&url)
+        .bearer_auth("sk-res-wrong")
         .json(&json!({}))
         .send()
         .await
@@ -1043,7 +1154,7 @@ fn gated(open: tokio::sync::watch::Receiver<bool>, output: i64) -> Router {
 async fn concurrent_requests_cannot_overdraw_the_balance() {
     let mut t = Test::new(&[("m", output_priced())]).await;
     let (open, gate) = tokio::sync::watch::channel(false);
-    t.mock(llm_upstream, gated(gate, 3000)).await;
+    t.mock(LLM, gated(gate, 3000)).await;
     let body = json!({"model":"m","max_tokens":3000,"messages":[{"role":"user","content":"hi"}]});
     let mut tasks = Vec::new();
     for _ in 0..6 {
@@ -1094,11 +1205,11 @@ async fn concurrent_requests_cannot_overdraw_the_balance() {
 async fn unaffordable_and_empty_balances_are_402_without_retry_after() {
     let mut t = Test::new(&[("m", output_priced())]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|_| async { json_response(json!({"usage":{"total_tokens":1}})) }),
     )
     .await;
-    // 20000 output tokens hold 0.20 USD, and the trial credit is 0.10.
+    // 20000 output tokens hold 0.20 USD, and the funded balance is 0.10.
     let r = t
         .post(
             "/v1/chat/completions",
@@ -1130,7 +1241,7 @@ async fn unaffordable_and_empty_balances_are_402_without_retry_after() {
 async fn limit_errors_carry_exact_retry_hints() {
     let mut t = Test::new(&[("m", output_priced())]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|_| async {
             json_response(json!({"usage":{"completion_tokens":3000,"total_tokens":3000}}))
         }),
@@ -1195,7 +1306,7 @@ async fn limit_errors_carry_exact_retry_hints() {
 async fn new_accounts_have_a_daily_spending_cap() {
     let mut t = Test::new(&[("m", output_priced())]).await;
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(|_| async {
             json_response(json!({"usage":{"completion_tokens":3000,"total_tokens":3000}}))
         }),
@@ -1243,7 +1354,7 @@ async fn reasoning_effort_is_validated_capped_and_mapped_per_model() {
     let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
     let record = seen.clone();
     t.mock(
-        llm_upstream,
+        LLM,
         fixed(move |body| {
             let record = record.clone();
             async move {
@@ -1258,7 +1369,9 @@ async fn reasoning_effort_is_validated_capped_and_mapped_per_model() {
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.llm.fallbacks = vec!["backup".into()];
+        common::ordered(&mut c, "m");
+        common::add_route(&mut c, "m", "llm", "backup");
+        c.models[0].tier = reseller::config::Tier::Free;
         c.reasoning.models.insert(
             "m".into(),
             reseller::config::ReasoningModel {
@@ -1284,7 +1397,7 @@ async fn reasoning_effort_is_validated_capped_and_mapped_per_model() {
         body
     };
 
-    // Trial credit only: a free account.
+    // A free model is capped at the free effort.
     let r = t
         .post(
             "/v1/chat/completions",
@@ -1309,12 +1422,8 @@ async fn reasoning_effort_is_validated_capped_and_mapped_per_model() {
     assert_eq!(error["error"]["param"], "reasoning_effort");
     assert_eq!(seen.lock().unwrap().len(), before, "never forwarded");
 
-    // Paid credit lifts the cap.
-    let mut tx = t.app.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
-    billing::credit(&mut tx, t.account(), 1_000_000, "purchase", None, "")
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    // A paid model has no cap.
+    t.app.config_mut().await.models[0].tier = reseller::config::Tier::Paid;
     t.post(
         "/v1/chat/completions",
         &chat(json!({"reasoning":{"effort":"high"}})),

@@ -206,7 +206,7 @@ async fn mint(conn: &mut SqliteConnection, config: &Config, key: NewKey<'_>) -> 
 /// Who is asking for a new key.
 #[derive(Clone, Copy, Debug)]
 pub enum Requester<'a> {
-    /// Anonymous self-service signup: opens an account with trial credit.
+    /// Anonymous self-service signup: opens an account without credit.
     /// `altcha` is the base64 proof-of-work solution (required unless
     /// `signup.pow_max_number` is 0).
     Signup { altcha: Option<&'a str> },
@@ -219,7 +219,8 @@ pub enum Requester<'a> {
 
 /// Creates a key for the requester.
 ///
-/// Anonymous signups also open a new account with trial credit.
+/// Anonymous signups also open a new account. It starts without credit: free
+/// models need none, and paid ones need a purchase.
 pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value) -> Result<Value> {
     let config = app.config().await;
     let proof = match requester {
@@ -304,12 +305,9 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     if let Some(proof) = &proof {
         spend_proof(&mut tx, proof).await?;
     }
-    let (account, trial) = match existing {
-        Some(account) => (account, None),
-        None => {
-            let (account, granted) = open_trial_account(&mut tx, &config, ip, body).await?;
-            (account, Some(granted))
-        }
+    let account = match existing {
+        Some(account) => account,
+        None => open_account(&mut tx, ip, body).await?,
     };
     let limits = match body.get("limits") {
         Some(v) if admin => {
@@ -337,10 +335,6 @@ pub async fn create(app: &App, requester: Requester<'_>, ip: &str, body: &Value)
     )
     .await?;
     tx.commit().await?;
-    let mut out = out;
-    if let Some(granted) = trial {
-        out["trial_credit_usd"] = json!(money::display(granted));
-    }
     Ok(out)
 }
 
@@ -391,12 +385,6 @@ async fn spend_proof(conn: &mut SqliteConnection, proof: &pow::Verified) -> Resu
 
 /// Returns the seconds until the oldest row leaves the window, or 60 when no
 /// row exists.
-/// Seconds until the next calendar month (UTC), when monthly allowances reset.
-fn until_next_month() -> u64 {
-    let now = now();
-    (db::next_month_start(now) - now).max(1).unsigned_abs()
-}
-
 fn window_retry(oldest: Option<i64>, window: i64) -> u64 {
     oldest.map_or(60, |t| (t + window - now()).max(1).unsigned_abs())
 }
@@ -454,13 +442,14 @@ async fn check_daily_budget(
 }
 
 /// Abuse guards for self-service creation: the global hourly cap and the
-/// child-key cap for every key, and for a signup (a new account) the per-IP
-/// monthly signup allowance and the cooldown between signups.
+/// child-key cap for every key, and for a signup (a new account) the cooldown
+/// between signups from one address.
 ///
 /// Keys on an existing account never count against the address: a family
 /// sharing one connection may each open an account, and one person may hold
 /// several keys on theirs (bounded by `keys.max_per_account` and
-/// `keys.max_new_per_day`).
+/// `keys.max_new_per_day`). Accounts carry no credit, so there is no monthly
+/// allowance of new accounts per address.
 async fn check_creation_guards(
     conn: &mut SqliteConnection,
     config: &Config,
@@ -491,43 +480,9 @@ async fn check_creation_guards(
     Ok(())
 }
 
-/// Per-IP signup guards: at most `ip_limit_per_month` new accounts per
-/// calendar month (or the address's `ip_overrides` entry), and at least
-/// `cooldown_seconds` between two signups.
-///
-/// Accounts that became paying customers (a paid order or an active
-/// subscription) or that the operator trusts (`can_create_keys`) do not
-/// count: the allowance limits free trials, not customers.
+/// The signup cooldown: at least `cooldown_seconds` between two signups from
+/// one address.
 async fn check_signup_guards(conn: &mut SqliteConnection, config: &Config, ip: &str) -> Result<()> {
-    let limit = config
-        .signup
-        .ip_overrides
-        .get(ip)
-        .copied()
-        .unwrap_or(config.signup.ip_limit_per_month);
-    if limit > 0 {
-        let month = chrono::Utc::now().format("%Y-%m-01 00:00:00").to_string();
-        let opened: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM accounts a WHERE a.created_ip=?1 AND a.created_at>=unixepoch(?2) \
-             AND a.can_create_keys=0 \
-             AND NOT EXISTS(SELECT 1 FROM payments p WHERE p.account_id=a.id AND p.status='paid') \
-             AND NOT EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id=a.id \
-               AND s.status='active' AND s.expires_at>?3)",
-        )
-        .bind(ip)
-        .bind(month)
-        .bind(now())
-        .fetch_one(&mut *conn)
-        .await?;
-        if opened >= i64::from(limit) {
-            return Err(Error::quota_window(
-                "ip_signup_limit",
-                "This network has reached its monthly limit of new accounts. \
-                 Sign in to an existing account to create more keys",
-                until_next_month(),
-            ));
-        }
-    }
     let cooldown = i64::from(config.signup.cooldown_seconds);
     if cooldown > 0 {
         let last: Option<i64> =
@@ -546,23 +501,8 @@ async fn check_signup_guards(conn: &mut SqliteConnection, config: &Config, ip: &
     Ok(())
 }
 
-/// The trial credit for the next signup from an IP that already opened
-/// `earlier` accounts this month: `base` halved once per earlier account.
-pub fn halved_trial(base: i64, earlier: i64) -> i64 {
-    u32::try_from(earlier)
-        .ok()
-        .and_then(|n| base.checked_shr(n))
-        .unwrap_or(0)
-}
-
-/// Opens a new account and grants the configured trial credit, if any.
-/// Returns the account id and the granted micro-USD.
-async fn open_trial_account(
-    conn: &mut SqliteConnection,
-    config: &Config,
-    ip: &str,
-    body: &Value,
-) -> Result<(String, i64)> {
+/// Opens a new account and returns its id.
+async fn open_account(conn: &mut SqliteConnection, ip: &str, body: &Value) -> Result<String> {
     if crate::billing::refund_blocked(conn, "ip", ip).await? {
         return Err(Error::forbidden(
             "signup_blocked",
@@ -581,18 +521,6 @@ async fn open_trial_account(
             return Err(Error::bad("accept_terms must be a boolean").with_param("accept_terms"));
         }
     };
-    let mut amount = money::usd(&config.signup.free_credit_usd)?;
-    if config.signup.free_credit_halving && amount > 0 {
-        let month = chrono::Utc::now().format("%Y-%m-01 00:00:00").to_string();
-        let earlier: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM accounts WHERE created_ip=? AND created_at>=unixepoch(?)",
-        )
-        .bind(ip)
-        .bind(month)
-        .fetch_one(&mut *conn)
-        .await?;
-        amount = halved_trial(amount, earlier);
-    }
     let account = id();
     sqlx::query(
         "INSERT INTO accounts(id,contact,consumption_consent,consent_at,created_at,created_ip) \
@@ -609,12 +537,7 @@ async fn open_trial_account(
     .bind(ip)
     .execute(&mut *conn)
     .await?;
-    if amount > 0 {
-        let expires = (config.signup.free_credit_expiry_days > 0)
-            .then(|| now() + i64::from(config.signup.free_credit_expiry_days) * DAY);
-        crate::billing::credit(conn, &account, amount, "free", expires, "").await?;
-    }
-    Ok((account, amount))
+    Ok(account)
 }
 
 /// Replaces an active key with a fresh one.
@@ -710,19 +633,4 @@ pub async fn rotate(app: &App, kid: &str, account: Option<&str>) -> Result<Value
     }
     tx.commit().await?;
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::halved_trial;
-
-    #[test]
-    fn trial_halves_per_earlier_signup_and_never_goes_negative() {
-        assert_eq!(halved_trial(100_000, 0), 100_000);
-        assert_eq!(halved_trial(100_000, 1), 50_000);
-        assert_eq!(halved_trial(100_000, 3), 12_500);
-        assert_eq!(halved_trial(100_000, 17), 0);
-        assert_eq!(halved_trial(100_000, 64), 0);
-        assert_eq!(halved_trial(100_000, -1), 0);
-    }
 }

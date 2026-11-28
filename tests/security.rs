@@ -8,7 +8,7 @@ use axum::{
 };
 use reseller::{
     App, billing,
-    config::{Config, KeyPolicy, RateLimits, Signup},
+    config::{Config, KeyPolicy, RateLimits, Signup, Tier},
     db, identity,
     meter::{Meter, RequestMeta, Usage},
     security::pow,
@@ -46,7 +46,6 @@ impl Test {
             key_pepper: PEPPER.into(),
             signup: Signup {
                 cooldown_seconds: 0,
-                ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
                 ..Signup::default()
@@ -572,6 +571,9 @@ fn meta() -> RequestMeta<'static> {
         path: "/v1/chat/completions",
         kind: "llm",
         model: "m",
+        // Free requests pass the same account checks without needing credit.
+        tier: Tier::Free,
+        routes: &[],
         ip: "127.0.0.1",
         estimate: &Usage::NONE,
     }
@@ -716,16 +718,11 @@ async fn strict_transport_security_only_with_https_public_url() {
 }
 
 /// Count caps are not rate limits: the per-account key cap is a 403 without
-/// a retry hint, while the monthly per-address allowance is a 429 whose
-/// `Retry-After` points at the start of next month and that SDKs must not
-/// retry right away.
+/// a retry hint. Accounts carry no credit, so there is no monthly allowance of
+/// new accounts per address.
 #[tokio::test]
-async fn key_caps_and_monthly_allowance_have_correct_retry_semantics() {
-    let t = Test::with(|c| {
-        c.signup.ip_limit_per_month = 1;
-        c.keys.max_per_account = 1;
-    })
-    .await;
+async fn key_caps_have_correct_retry_semantics_and_signups_have_no_monthly_cap() {
+    let t = Test::with(|c| c.keys.max_per_account = 1).await;
     let k = t.key().await;
     let token = k["key"].as_str().unwrap();
     let r = t.call("POST", "/v1/keys", Some(token), json!({})).await;
@@ -736,18 +733,12 @@ async fn key_caps_and_monthly_allowance_have_correct_retry_semantics() {
         r.body
     );
     assert!(r.headers.get("retry-after").is_none());
-
-    let r = t
-        .call("POST", "/v1/signup", None, json!({"name":"second"}))
-        .await;
-    assert_eq!((r.status, code(&r)), (429, "ip_signup_limit"), "{}", r.body);
-    assert_eq!(r.headers["x-should-retry"], "false");
-    let expected = db::next_month_start(db::now()) - db::now();
-    let wait = i64::try_from(retry_after(&r)).unwrap();
-    assert!(
-        (expected - 2..=expected + 2).contains(&wait),
-        "{wait} vs {expected}"
-    );
+    for name in ["second", "third", "fourth", "fifth"] {
+        let r = t
+            .call("POST", "/v1/signup", None, json!({"name": name}))
+            .await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
 }
 
 /// After a store refund blocks an account, its signup address cannot open
@@ -936,14 +927,12 @@ async fn adaptive_pow_can_be_disabled_and_ignores_rate_limits() {
     assert_eq!(challenge_from(&t, "10.2.2.2").await.maxnumber, 100);
 }
 
-/// The monthly per-address allowance counts new accounts, not keys: one
-/// person can hold several keys on their account, a household sharing one
-/// connection can still open its accounts, paying accounts stop counting,
-/// and the cooldown only spaces out signups.
+/// One person can hold several keys on their account, and a household
+/// sharing one connection can open as many accounts as it likes: nothing
+/// limits accounts per address except the cooldown.
 #[tokio::test]
-async fn per_address_allowance_counts_signups_not_keys() {
+async fn one_address_can_open_several_accounts_and_hold_several_keys() {
     let t = Test::with(|c| {
-        c.signup.ip_limit_per_month = 2;
         c.signup.cooldown_seconds = 0;
         c.keys.max_per_account = 10;
     })
@@ -966,28 +955,16 @@ async fn per_address_allowance_counts_signups_not_keys() {
             .await;
         assert_eq!(r.status, 200, "{}", r.body);
     }
-    // A second household member still gets an account.
-    let second = signup("child").await;
-    assert_eq!(second.status, 200, "{}", second.body);
-    // The third signup is over the allowance of two accounts.
-    let third = signup("guest").await;
-    assert_eq!((third.status, code(&third)), (429, "ip_signup_limit"));
-    // Keys on existing accounts keep working.
-    let r = t
-        .call_from(home, "POST", "/v1/keys", Some(&token), json!({}))
-        .await;
-    assert_eq!(r.status, 200, "{}", r.body);
-    // Once an account pays, it no longer uses up the free allowance.
-    sqlx::query(
-        "INSERT INTO payments(id,account_id,plan_code,provider,kind,price_micro,credit_micro,\
-         months,status,created_at) VALUES('paid1',?,'monthly','stripe','subscription',1,1,1,'paid',?)",
-    )
-    .bind(second.body["account_id"].as_str())
-    .bind(db::now())
-    .execute(&t.app.db)
-    .await
-    .unwrap();
-    assert_eq!(signup("guest").await.status, 200);
+    for name in ["child", "guest", "visitor", "neighbour"] {
+        let r = signup(name).await;
+        assert_eq!(r.status, 200, "{name}: {}", r.body);
+    }
+    let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE created_ip=?")
+        .bind(home)
+        .fetch_one(&t.app.db)
+        .await
+        .unwrap();
+    assert_eq!(accounts, 5);
 }
 
 /// The cooldown spaces out signups from one address, but keys on an

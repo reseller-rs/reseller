@@ -5,9 +5,9 @@
 //! here. Prices carry the caller's markup.
 use crate::{
     App,
-    config::{Config, Model},
+    config::{Capability, Config, Model, Tier},
     error::{Error, Result},
-    identity::Identity,
+    identity::{Caller, Identity},
     meter, money,
 };
 use axum::{Json, body::Body, http::Response, response::IntoResponse};
@@ -15,68 +15,117 @@ use percent_encoding::percent_decode_str;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
-/// Serves a models route for an authenticated (or anonymous) caller. The
-/// request is not metered or logged, but the key and balance are checked as
-/// at admission.
-pub(super) async fn serve(
-    app: &App,
-    identity: Option<&Identity>,
-    path: &str,
-) -> Result<Response<Body>> {
-    if let Some(identity) = identity {
+/// Serves a models route for a caller. The request is not metered or logged,
+/// but a key's status is checked as at admission.
+pub(super) async fn serve(app: &App, caller: &Caller, path: &str) -> Result<Response<Body>> {
+    if let Some(identity) = caller.identity() {
         meter::preflight(app, identity).await?;
     }
     let config = app.config().await;
     let body = match path.strip_prefix("/v1/models/") {
-        Some(id) => retrieve(
-            &config,
-            identity,
-            &percent_decode_str(id).decode_utf8_lossy(),
-        )?,
-        None => list(&config, identity),
+        Some(id) => retrieve(&config, caller, &percent_decode_str(id).decode_utf8_lossy())?,
+        None => list(&config, caller),
     };
     Ok(Json(body).into_response())
 }
 
-/// Resolves a model name sent by a client to its enabled catalog entry.
-/// Unknown, disabled and not allowed models are indistinguishable.
+/// 401 for an anonymous request to a paid model.
+fn api_key_required(model: &str) -> Error {
+    Error::unauthorized(
+        "api_key_required",
+        format!("Model {model} requires an API key"),
+    )
+}
+
+/// Resolves the model a request asked for (an id or alias, `None` for no
+/// model) to its enabled catalog entry, for a request of `capability`.
+///
+/// - A named model must be enabled, and a key's allowlist must name it.
+///   Unknown, disabled and not allowed models are indistinguishable.
+/// - Anonymous callers may name free models only (`api_key_required`).
+/// - Without a name the capability's default applies: the paid default for
+///   keys and the operator (else the free one), the free default for anonymous
+///   callers.
 pub(super) fn resolve<'a>(
     config: &'a Config,
-    identity: Option<&Identity>,
-    requested: &str,
+    caller: &Caller,
+    capability: Capability,
+    requested: Option<&str>,
 ) -> Result<&'a Model> {
-    config
-        .models
+    let allowed = |m: &Model| match caller {
+        Caller::Key(identity) => identity.limits.allows(&m.id),
+        _ => true,
+    };
+    if let Some(name) = requested.filter(|n| !n.is_empty()) {
+        let model = config
+            .find_model(name)
+            .filter(|m| allowed(m))
+            .ok_or_else(|| Error::model_not_found(name))?;
+        if matches!(caller, Caller::Anonymous) && model.tier == Tier::Paid {
+            return Err(api_key_required(name));
+        }
+        if model.capability() != capability {
+            return Err(Error::bad(format!(
+                "The model '{name}' cannot be used with this endpoint"
+            ))
+            .with_code("unsupported_model")
+            .with_param("model"));
+        }
+        return Ok(model);
+    }
+    let tiers: &[Tier] = match caller {
+        Caller::Anonymous => &[Tier::Free],
+        _ => &[Tier::Paid, Tier::Free],
+    };
+    let defaults: Vec<&Model> = tiers
         .iter()
-        .find(|m| m.enabled && m.answers_to(requested))
-        .filter(|m| identity.is_none_or(|i| i.limits.allows(&m.id)))
-        .ok_or_else(|| Error::model_not_found(requested))
+        .filter_map(|t| config.default_model(capability, *t))
+        .collect();
+    defaults
+        .iter()
+        .find(|m| allowed(m))
+        .copied()
+        .ok_or_else(|| {
+            if defaults.is_empty() {
+                Error::bad("This request needs a model: none is configured as the default")
+                    .with_code("model_required")
+                    .with_param("model")
+            } else {
+                Error::model_not_found("")
+            }
+        })
 }
 
 /// The `{"object":"list"}` response for the caller: enabled catalog entries
-/// the caller's key may use, priced with its markup when pricing is shown.
-pub fn list(config: &Config, identity: Option<&Identity>) -> Value {
+/// the caller may use, priced with its markup when pricing is shown.
+/// Anonymous callers see free models only.
+pub fn list(config: &Config, caller: &Caller) -> Value {
     let data: Vec<Value> = config
-        .catalog()
+        .models
         .iter()
-        .filter(|m| visible(m, identity))
-        .map(|m| entry(config, identity, m))
+        .filter(|m| visible(config, m, caller))
+        .map(|m| entry(config, caller.identity(), m))
         .collect();
     json!({"object": "list", "data": data})
 }
 
 /// One model by id or alias.
-fn retrieve(config: &Config, identity: Option<&Identity>, id: &str) -> Result<Value> {
+fn retrieve(config: &Config, caller: &Caller, id: &str) -> Result<Value> {
     config
-        .catalog()
+        .models
         .iter()
-        .find(|m| visible(m, identity) && m.answers_to(id))
-        .map(|m| entry(config, identity, m))
+        .find(|m| visible(config, m, caller) && m.answers_to(id))
+        .map(|m| entry(config, caller.identity(), m))
         .ok_or_else(|| Error::model_not_found(id))
 }
 
-fn visible(model: &Model, identity: Option<&Identity>) -> bool {
-    model.enabled && identity.is_none_or(|i| i.limits.allows(&model.id))
+fn visible(config: &Config, model: &Model, caller: &Caller) -> bool {
+    config.serves(model)
+        && match caller {
+            Caller::Anonymous => model.tier == Tier::Free,
+            Caller::Operator => true,
+            Caller::Key(identity) => identity.limits.allows(&model.id),
+        }
 }
 
 fn entry(config: &Config, identity: Option<&Identity>, model: &Model) -> Value {
@@ -90,6 +139,7 @@ fn entry(config: &Config, identity: Option<&Identity>, model: &Model) -> Value {
         "object": "model",
         "created": model.created,
         "owned_by": owner,
+        "tier": model.tier.as_str(),
     });
     if !model.name.is_empty() {
         out["name"] = model.name.clone().into();
@@ -100,7 +150,7 @@ fn entry(config: &Config, identity: Option<&Identity>, model: &Model) -> Value {
     if let Some(length) = model.context_length {
         out["context_length"] = length.into();
     }
-    let resolved = model.resolved(config);
+    let resolved = model.resolved();
     let mut architecture = serde_json::Map::new();
     if !resolved.input.is_empty() {
         architecture.insert("input_modalities".into(), json!(resolved.input));
@@ -119,14 +169,13 @@ fn entry(config: &Config, identity: Option<&Identity>, model: &Model) -> Value {
             .into(),
         );
     }
-    if let Some(capability) = resolved.capability {
-        architecture.insert("capability".into(), capability.as_str().into());
-    }
-    if !architecture.is_empty() {
-        out["architecture"] = architecture.into();
-    }
+    architecture.insert("capability".into(), resolved.capability.as_str().into());
+    out["architecture"] = architecture.into();
+    // The first route's price. Every route is billed at its own model's price.
     if model.show_pricing
-        && let Some(pricing) = pricing(config, identity, model.upstream_name())
+        && model.tier == Tier::Paid
+        && let Some(route) = model.routes.first()
+        && let Some(pricing) = pricing(config, identity, &route.model)
     {
         out["pricing"] = pricing;
     }
@@ -171,17 +220,26 @@ fn pricing(config: &Config, identity: Option<&Identity>, upstream: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Price, keys::Limits};
+    use crate::{
+        config::{Price, Provider, Route},
+        keys::Limits,
+    };
 
     fn model(id: &str) -> Model {
         Model {
             id: id.into(),
+            capability: Some(Capability::Chat),
+            routes: vec![Route {
+                provider: "p".into(),
+                model: id.into(),
+                ..Route::default()
+            }],
             ..Model::default()
         }
     }
 
-    fn identity(allowed: &[&str], markup: &str) -> Identity {
-        Identity {
+    fn key(allowed: &[&str], markup: &str) -> Caller {
+        Caller::Key(Identity {
             key_id: "k".into(),
             account_id: "a".into(),
             dashboard: false,
@@ -192,13 +250,18 @@ mod tests {
                 ..Limits::default()
             },
             markup: markup.into(),
-        }
+        })
     }
 
     fn config() -> Config {
         let mut config = Config::default();
         config.branding.name = "Acme".into();
         config.markup_pct = "30".into();
+        config.providers = vec![Provider {
+            id: "p".into(),
+            base_url: "https://p.example/v1".into(),
+            ..Provider::default()
+        }];
         config.prices.insert(
             "vendor/fast-1".into(),
             Price {
@@ -212,7 +275,6 @@ mod tests {
         );
         config.models = vec![
             Model {
-                upstream: "vendor/fast-1".into(),
                 aliases: vec!["Fast".into(), "latest".into()],
                 name: "Fast One".into(),
                 description: "Quick answers".into(),
@@ -222,12 +284,22 @@ mod tests {
                 input_modalities: vec!["text".into(), "image".into()],
                 output_modalities: vec!["text".into()],
                 show_pricing: true,
+                routes: vec![Route {
+                    provider: "p".into(),
+                    model: "vendor/fast-1".into(),
+                    ..Route::default()
+                }],
                 ..model("fast")
             },
             model("plain"),
             Model {
                 enabled: false,
                 ..model("retired")
+            },
+            Model {
+                tier: Tier::Free,
+                default: true,
+                ..model("gratis")
             },
         ];
         config
@@ -243,15 +315,31 @@ mod tests {
     }
 
     #[test]
-    fn list_hides_disabled_entries_and_aliases() {
-        let list = list(&config(), None);
-        assert_eq!(list["object"], "list");
-        assert_eq!(ids(&list), ["fast", "plain"]);
+    fn list_hides_disabled_entries_and_aliases_and_filters_by_caller() {
+        let config = config();
+        let anonymous = list(&config, &Caller::Anonymous);
+        assert_eq!(anonymous["object"], "list");
+        assert_eq!(
+            ids(&anonymous),
+            ["gratis"],
+            "anonymous callers see free models"
+        );
+        assert_eq!(anonymous["data"][0]["tier"], "free");
+        assert_eq!(
+            ids(&list(&config, &key(&[], "30"))),
+            ["fast", "plain", "gratis"]
+        );
+        assert_eq!(
+            ids(&list(&config, &Caller::Operator)),
+            ["fast", "plain", "gratis"]
+        );
+        let paid = list(&config, &key(&[], "30"));
+        assert_eq!(paid["data"][0]["tier"], "paid");
     }
 
     #[test]
     fn entries_carry_overrides_and_optional_fields_only_when_set() {
-        let list = list(&config(), None);
+        let list = list(&config(), &key(&[], "30"));
         let fast = &list["data"][0];
         assert_eq!(fast["object"], "model");
         assert_eq!(fast["created"], 1_700_000_000);
@@ -271,26 +359,22 @@ mod tests {
         let plain = &list["data"][1];
         assert_eq!(plain["owned_by"], "Acme", "empty owner is the brand");
         assert_eq!(plain["created"], 0);
-        for absent in [
-            "name",
-            "description",
-            "context_length",
-            "pricing",
-            "architecture",
-        ] {
+        for absent in ["name", "description", "context_length", "pricing"] {
             assert!(plain.get(absent).is_none(), "{absent}");
         }
         assert!(!list.to_string().contains("vendor/fast-1"), "upstream name");
+        assert!(!list.to_string().contains("\"p\""), "provider id");
     }
 
     #[test]
     fn pricing_is_hidden_by_default_and_shown_with_the_callers_markup() {
         let mut config = config();
-        assert_eq!(list(&config, None)["data"][1].get("pricing"), None);
-        // Global markup of 30 percent.
-        let anonymous = list(&config, None);
+        let caller = key(&[], "30");
+        assert_eq!(list(&config, &caller)["data"][1].get("pricing"), None);
+        // Global markup of 30 percent for a caller without a key.
+        let operator = list(&config, &Caller::Operator);
         assert_eq!(
-            anonymous["data"][0]["pricing"],
+            operator["data"][0]["pricing"],
             json!({
                 "prompt": "0.0000026",
                 "completion": "0.0000104",
@@ -300,45 +384,44 @@ mod tests {
             })
         );
         // The key's own markup wins.
-        let key = identity(&[], "100");
-        let doubled = list(&config, Some(&key));
+        let doubled = list(&config, &key(&[], "100"));
         assert_eq!(doubled["data"][0]["pricing"]["prompt"], "0.000004");
         // Optional prices are left out when unset or zero.
         config.prices.get_mut("vendor/fast-1").unwrap().cached_input = None;
         config.prices.get_mut("vendor/fast-1").unwrap().request = "0".into();
         assert!(
-            list(&config, None)["data"][0]["pricing"]
+            list(&config, &caller)["data"][0]["pricing"]
                 .get("characters")
                 .is_none()
         );
         let price = config.prices.get_mut("vendor/fast-1").unwrap();
         price.audio_second = "0.001".into();
         price.characters = "15".into();
-        let speech = &list(&config, None)["data"][0]["pricing"];
+        let speech = &list(&config, &caller)["data"][0]["pricing"];
         assert_eq!(speech["audio_second"], "0.0013");
         assert_eq!(speech["characters"], "0.0000195");
         let price = config.prices.get_mut("vendor/fast-1").unwrap();
         (price.audio_second, price.characters) = ("0".into(), "0".into());
-        let pricing = &list(&config, None)["data"][0]["pricing"];
+        let pricing = &list(&config, &caller)["data"][0]["pricing"];
         assert!(pricing.get("input_cache_read").is_none() && pricing.get("request").is_none());
     }
 
     #[test]
     fn keys_see_only_the_models_their_allowlist_names() {
         let config = config();
-        let key = identity(&["PLAIN"], "30");
-        assert_eq!(ids(&list(&config, Some(&key))), ["plain"]);
+        let caller = key(&["PLAIN"], "30");
+        assert_eq!(ids(&list(&config, &caller)), ["plain"]);
         assert_eq!(
-            retrieve(&config, Some(&key), "fast").unwrap_err().code,
+            retrieve(&config, &caller, "fast").unwrap_err().code,
             "model_not_found"
         );
-        assert!(retrieve(&config, Some(&key), "plain").is_ok());
+        assert!(retrieve(&config, &caller, "plain").is_ok());
         // Aliases and upstream names do not satisfy an allowlist.
-        let by_alias = identity(&["latest", "vendor/fast-1"], "30");
-        assert!(resolve(&config, Some(&by_alias), "fast").is_err());
-        assert!(resolve(&config, Some(&by_alias), "latest").is_err());
+        let by_alias = key(&["latest", "vendor/fast-1"], "30");
+        assert!(resolve(&config, &by_alias, Capability::Chat, Some("fast")).is_err());
+        assert!(resolve(&config, &by_alias, Capability::Chat, Some("latest")).is_err());
         assert!(
-            list(&config, Some(&by_alias))["data"]
+            list(&config, &by_alias)["data"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -348,14 +431,16 @@ mod tests {
     #[test]
     fn retrieval_and_resolution_follow_aliases_case_insensitively() {
         let config = config();
-        assert_eq!(retrieve(&config, None, "LATEST").unwrap()["id"], "fast");
-        assert_eq!(resolve(&config, None, "Fast").unwrap().id, "fast");
+        let caller = key(&[], "30");
+        assert_eq!(retrieve(&config, &caller, "LATEST").unwrap()["id"], "fast");
         assert_eq!(
-            resolve(&config, None, "fast").unwrap().upstream_name(),
-            "vendor/fast-1"
+            resolve(&config, &caller, Capability::Chat, Some("Fast"))
+                .unwrap()
+                .id,
+            "fast"
         );
         for hidden in ["retired", "vendor/fast-1", "missing"] {
-            let e = resolve(&config, None, hidden).unwrap_err();
+            let e = resolve(&config, &caller, Capability::Chat, Some(hidden)).unwrap_err();
             assert_eq!(
                 (e.status.as_u16(), e.code, e.param),
                 (404, "model_not_found", Some("model"))
@@ -364,43 +449,76 @@ mod tests {
                 e.message,
                 format!("The model '{hidden}' does not exist or you do not have access to it.")
             );
-            assert!(retrieve(&config, None, hidden).is_err());
+            assert!(retrieve(&config, &caller, hidden).is_err());
         }
     }
 
     #[test]
-    fn an_empty_catalog_lists_the_route_models() {
-        let mut config = Config::default();
-        config.branding.name = "Acme".into();
-        config.llm.model = "m".into();
-        config.llm.fallbacks = vec!["backup".into()];
-        config.tts.model = "tts-1".into();
-        let list = list(&config, None);
-        assert_eq!(ids(&list), ["m", "backup", "tts-1"]);
+    fn anonymous_callers_need_a_key_for_paid_models() {
+        let config = config();
+        let e = resolve(&config, &Caller::Anonymous, Capability::Chat, Some("fast")).unwrap_err();
+        assert_eq!((e.status.as_u16(), e.code), (401, "api_key_required"));
+        assert_eq!(e.message, "Model fast requires an API key");
         assert_eq!(
-            list["data"][0],
-            json!({
-                "id": "m", "object": "model", "created": 0, "owned_by": "Acme",
-                "architecture": {
-                    "input_modalities": ["text"],
-                    "output_modalities": ["text"],
-                    "modality": "text->text",
-                    "capability": "chat",
-                },
-            })
+            resolve(
+                &config,
+                &Caller::Anonymous,
+                Capability::Chat,
+                Some("gratis")
+            )
+            .unwrap()
+            .id,
+            "gratis"
+        );
+        // Unknown models stay unknown rather than asking for a key.
+        let e = resolve(&config, &Caller::Anonymous, Capability::Chat, Some("nope")).unwrap_err();
+        assert_eq!(e.code, "model_not_found");
+        assert!(retrieve(&config, &Caller::Anonymous, "fast").is_err());
+    }
+
+    #[test]
+    fn defaults_follow_the_caller_and_the_capability() {
+        let mut config = config();
+        // No paid default: keys fall back to the free one.
+        let caller = key(&[], "30");
+        assert_eq!(
+            resolve(&config, &caller, Capability::Chat, None)
+                .unwrap()
+                .id,
+            "gratis"
+        );
+        config.models[1].default = true;
+        assert_eq!(
+            resolve(&config, &caller, Capability::Chat, None)
+                .unwrap()
+                .id,
+            "plain"
         );
         assert_eq!(
-            list["data"][2]["architecture"],
-            json!({
-                "input_modalities": ["text"],
-                "output_modalities": ["audio"],
-                "modality": "text->audio",
-                "capability": "speech",
-            })
+            resolve(&config, &Caller::Operator, Capability::Chat, Some(""))
+                .unwrap()
+                .id,
+            "plain"
         );
-        let key = identity(&["BACKUP"], "30");
-        assert_eq!(ids(&super::list(&config, Some(&key))), ["backup"]);
-        assert!(retrieve(&config, None, "tts-1").is_ok());
-        assert!(retrieve(&config, None, "other").is_err());
+        // Anonymous callers only ever get the free default.
+        assert_eq!(
+            resolve(&config, &Caller::Anonymous, Capability::Chat, None)
+                .unwrap()
+                .id,
+            "gratis"
+        );
+        let e = resolve(&config, &Caller::Anonymous, Capability::Image, None).unwrap_err();
+        assert_eq!((e.status.as_u16(), e.code), (400, "model_required"));
+        // A restricted key whose defaults it may not use must name a model.
+        let restricted = key(&["fast"], "30");
+        assert_eq!(
+            resolve(&config, &restricted, Capability::Chat, None)
+                .unwrap_err()
+                .code,
+            "model_not_found"
+        );
+        // A model of another capability is refused with a clear error.
+        let e = resolve(&config, &caller, Capability::Speech, Some("plain")).unwrap_err();
+        assert_eq!((e.status.as_u16(), e.code), (400, "unsupported_model"));
     }
 }

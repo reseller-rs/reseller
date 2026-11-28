@@ -28,8 +28,18 @@ pub struct Error {
     pub no_auto_retry: bool,
     /// Methods the path accepts (`Allow` header of 405 responses).
     pub allow: Option<&'static str>,
+    /// Rarely used response parts, boxed so that the many errors without any
+    /// stay small.
+    extras: Option<Box<Extras>>,
+}
+
+/// The optional response parts of an [`Error`].
+#[derive(Debug, Default)]
+struct Extras {
     /// Replaces the `WWW-Authenticate` header of a 401 response.
-    pub challenge: Option<String>,
+    challenge: Option<String>,
+    /// Extra response headers (for example rate limit state).
+    headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 /// Result alias whose error type defaults to [`Error`].
@@ -46,8 +56,26 @@ impl Error {
             retry_after: None,
             no_auto_retry: false,
             allow: None,
-            challenge: None,
+            extras: None,
         }
+    }
+
+    /// Adds a response header.
+    #[must_use]
+    pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.extras_mut().headers.push((name, value));
+        self
+    }
+
+    /// Sets `Retry-After` (whole seconds, rounded up) and the millisecond
+    /// `retry-after-ms` header that the OpenAI SDKs prefer.
+    #[must_use]
+    pub fn retry_after_ms(self, ms: u64) -> Self {
+        let ms = ms.max(1);
+        self.retry_after(ms.div_ceil(1000)).with_header(
+            HeaderName::from_static("retry-after-ms"),
+            HeaderValue::from(ms),
+        )
     }
 
     /// Replaces the machine-readable code.
@@ -74,8 +102,17 @@ impl Error {
     /// Sets the `WWW-Authenticate` header of a 401 response.
     #[must_use]
     pub fn with_challenge(mut self, challenge: String) -> Self {
-        self.challenge = Some(challenge);
+        self.extras_mut().challenge = Some(challenge);
         self
+    }
+
+    fn extras_mut(&mut self) -> &mut Extras {
+        self.extras.get_or_insert_with(Box::default)
+    }
+
+    /// The extra response headers added with [`Error::with_header`].
+    pub fn headers(&self) -> &[(HeaderName, HeaderValue)] {
+        self.extras.as_ref().map_or(&[], |e| &e.headers)
     }
 
     /// Sets the `Retry-After` hint in seconds, with a minimum of one.
@@ -218,6 +255,10 @@ impl IntoResponse for Error {
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
         }
+        let extras = self.extras.map(|e| *e).unwrap_or_default();
+        for (name, value) in extras.headers {
+            response.headers_mut().insert(name, value);
+        }
         if self.no_auto_retry {
             response.headers_mut().insert(
                 HeaderName::from_static("x-should-retry"),
@@ -227,7 +268,7 @@ impl IntoResponse for Error {
         if self.status == StatusCode::UNAUTHORIZED {
             // RFC 6750 section 3: a request without credentials carries no
             // error attribute. Rejected credentials are `invalid_token`.
-            let custom = self
+            let custom = extras
                 .challenge
                 .as_deref()
                 .and_then(|c| HeaderValue::from_str(c).ok());
@@ -236,7 +277,7 @@ impl IntoResponse for Error {
                     .headers_mut()
                     .insert(header::WWW_AUTHENTICATE, custom);
                 return response;
-            } else if self.code == "missing_api_key" {
+            } else if matches!(self.code, "missing_api_key" | "api_key_required") {
                 "Bearer realm=\"reseller\""
             } else {
                 "Bearer realm=\"reseller\", error=\"invalid_token\""

@@ -2,14 +2,15 @@
 use super::{
     Kind,
     inspect::{RealtimeEvent, realtime_event},
-    models, timeout, upstream_headers,
+    models, rate_headers, target, unavailable, upstream_headers,
 };
 use crate::{
     App,
-    config::{Config, Policy, Upstream},
+    config::Config,
     error::{Error, Result},
-    identity::Identity,
+    identity::Caller,
     meter::{Meter, RequestMeta, Usage},
+    router::{Permit, free::Admission, hints::Hints},
 };
 use axum::{
     body::Body,
@@ -21,7 +22,10 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message as UpstreamMessage, client::IntoClientRequest},
@@ -35,23 +39,12 @@ const SETTLE_GRACE: Duration = Duration::from_secs(5);
 
 type UpstreamSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Applies the model policy to the `model` query parameter and returns the
-/// effective model, and whether the policy wrote it.
-fn apply_model_policy(url: &mut url::Url, configured: &str, policy: Policy) -> (String, bool) {
-    let requested = url
-        .query_pairs()
+/// The `model` query parameter, if it is not empty.
+fn requested_model(url: &url::Url) -> Option<String> {
+    url.query_pairs()
         .find(|(k, _)| k == "model")
         .map(|(_, v)| v.into_owned())
-        .filter(|m| !m.is_empty());
-    let (model, filled) = match (policy, requested) {
-        (Policy::Force, _) | (Policy::Default, None) if !configured.is_empty() => {
-            (configured.to_owned(), true)
-        }
-        (_, Some(requested)) => (requested, false),
-        (_, None) => return (String::new(), false),
-    };
-    set_model(url, &model);
-    (model, filled)
+        .filter(|m| !m.is_empty())
 }
 
 /// Sets the `model` query parameter.
@@ -67,43 +60,70 @@ fn set_model(url: &mut url::Url, model: &str) {
         .append_pair("model", model);
 }
 
+/// Relays a realtime session. The model comes from the query, the route is
+/// chosen up front, and there is a single attempt.
 pub(super) async fn relay(
     app: App,
     req: Request<Body>,
     ip: String,
-    identity: Option<Identity>,
-    upstream: &Upstream,
-    config: &Config,
-    mut url: url::Url,
+    caller: Caller,
+    config: Arc<Config>,
 ) -> Result<Response<Body>> {
     let (mut parts, _) = req.into_parts();
-    let (mut model, filled) = apply_model_policy(&mut url, &upstream.model, config.model_policy);
-    // A model the client chose is a public name. The one the policy wrote is
-    // already the upstream's.
-    let resolved = !filled && !model.is_empty() && !config.models.is_empty();
-    if resolved {
-        model = models::resolve(config, identity.as_ref(), &model)?
-            .upstream_name()
-            .to_owned();
-        set_model(&mut url, &model);
-    }
     let path = parts.uri.path().to_owned();
-    let meter = Meter::begin_with(
+    let kind = Kind::of(&path);
+    // Only the query matters: any base works to read it.
+    let incoming = url::Url::parse(&format!("http://x{}", parts.uri))
+        .map_err(|_| Error::bad("Invalid request URL"))?;
+    let model = models::resolve(
+        &config,
+        &caller,
+        kind.capability(),
+        requested_model(&incoming).as_deref(),
+    )?;
+    let free = super::free_admission(&app, &config, &caller, model, &ip).await?;
+    let route_models: Vec<&str> = model.routes.iter().map(|r| r.model.as_str()).collect();
+    let mut meter = Meter::begin(
         &app,
-        identity,
+        caller.identity().cloned(),
         RequestMeta {
             method: "WS",
             path: &path,
-            kind: Kind::of(&path).as_str(),
-            model: &model,
+            kind: kind.as_str(),
+            model: &model.id,
+            tier: model.tier,
+            routes: &route_models,
             ip: &ip,
             // A realtime session's usage is unknown up front: it holds the
             // configured minimum.
             estimate: &Usage::NONE,
         },
-        !resolved,
     )
-    .await?;
+    .await
+    .map_err(|e| rate_headers(e, free.as_ref()))?;
+    let picked = match app.router.pick(&config, model, &[], false) {
+        Ok(picked) => picked,
+        Err(wait) => {
+            return Err(settle_failure(
+                meter,
+                rate_headers(unavailable(wait), free.as_ref()),
+                "no route available",
+            )
+            .await);
+        }
+    };
+    let route = &model.routes[picked.index];
+    let mut permit = picked.permit;
+    let Some(provider) = config.provider(&route.provider) else {
+        return Err(settle_failure(
+            meter,
+            Error::internal("unknown provider"),
+            "no route available",
+        )
+        .await);
+    };
+    let mut url = target(&provider.base_url, &path, parts.uri.query())?;
+    set_model(&mut url, &route.model);
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(scheme)
         .map_err(|()| Error::bad("Invalid WebSocket URL"))?;
@@ -113,32 +133,58 @@ pub(super) async fn relay(
         .map_err(Error::internal)?;
     request
         .headers_mut()
-        .extend(upstream_headers(&parts.headers, upstream));
-    request.headers_mut().insert(
-        header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", upstream.api_key)).map_err(Error::internal)?,
-    );
+        .extend(upstream_headers(&parts.headers, provider));
+    if !provider.api_key.is_empty() {
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", provider.api_key))
+                .map_err(Error::internal)?,
+        );
+    }
     // Offer the client's subprotocols. Accept only the one upstream selects.
     if let Some(v) = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL) {
         request
             .headers_mut()
             .insert(header::SEC_WEBSOCKET_PROTOCOL, v.clone());
     }
+    let started = Instant::now();
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)).await;
     let (up, response) = match connected {
-        Ok(Ok(pair)) => pair,
+        Ok(Ok(pair)) => {
+            permit.finish(Some(200), &Hints::default(), false);
+            meter.attempt(&route.provider, &route.model, 101, started.elapsed());
+            pair
+        }
         Ok(Err(_)) => {
+            permit.finish(None, &Hints::default(), false);
+            meter.attempt(&route.provider, &route.model, 0, started.elapsed());
             return Err(settle_failure(
                 meter,
-                StatusCode::BAD_GATEWAY,
+                rate_headers(
+                    Error::new(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        "WebSocket connection failed",
+                    ),
+                    free.as_ref(),
+                ),
                 "WebSocket connection failed",
             )
             .await);
         }
         Err(_) => {
+            permit.finish(None, &Hints::default(), false);
+            meter.attempt(&route.provider, &route.model, 0, started.elapsed());
             return Err(settle_failure(
                 meter,
-                StatusCode::GATEWAY_TIMEOUT,
+                rate_headers(
+                    Error::new(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "upstream_error",
+                        "WebSocket connection timed out",
+                    ),
+                    free.as_ref(),
+                ),
                 "WebSocket connection timed out",
             )
             .await);
@@ -155,18 +201,19 @@ pub(super) async fn relay(
     {
         upgrade = upgrade.protocols([protocol.to_owned()]);
     }
-    let session_limit = timeout(config, upstream);
+    let session_limit = provider.timeout(config.upstream_timeout_seconds);
     Ok(upgrade
-        .on_upgrade(move |down| session(down, up, meter, session_limit))
+        .on_upgrade(move |down| session(down, up, meter, session_limit, permit, free))
         .into_response())
 }
 
-async fn settle_failure(mut meter: Meter, status: StatusCode, message: &'static str) -> Error {
-    meter.fail(status, message);
+/// Settles a request that never got a session and returns its error.
+async fn settle_failure(mut meter: Meter, error: Error, message: &str) -> Error {
+    meter.fail(error.status, message);
     if let Err(e) = meter.finish().await {
         tracing::error!(error = %e, "WebSocket settlement failed");
     }
-    Error::new(status, "upstream_error", message)
+    error
 }
 
 /// Responses the upstream has started but not yet finished, and the usage
@@ -186,7 +233,14 @@ fn observe_event(meter: &mut Meter, pending: &mut i64, text: &str) {
 
 /// Relays frames both ways until either side closes or the session limit
 /// elapses, metering bytes and realtime usage.
-async fn session(down: WebSocket, up: UpstreamSocket, mut meter: Meter, limit: Duration) {
+async fn session(
+    down: WebSocket,
+    up: UpstreamSocket,
+    mut meter: Meter,
+    limit: Duration,
+    permit: Permit,
+    free: Option<Admission>,
+) {
     meter.status = StatusCode::SWITCHING_PROTOCOLS.as_u16();
     // An established session counts as a successful request.
     meter.success = true;
@@ -263,6 +317,11 @@ async fn session(down: WebSocket, up: UpstreamSocket, mut meter: Meter, limit: D
     }
     let _ = down_tx.close().await;
     let _ = up_tx.close().await;
+    let tokens = u64::try_from(meter.usage.total).unwrap_or(0);
+    permit.charge_tokens(tokens);
+    if let Some(free) = &free {
+        free.guard.charge_tokens(tokens);
+    }
     if let Err(e) = meter.finish().await {
         tracing::error!(error = %e, "WebSocket settlement failed");
     }
@@ -277,41 +336,18 @@ mod tests {
     }
 
     #[test]
-    fn force_overrides_requested_model() {
-        let mut u = url("?model=expensive&x=1");
+    fn the_model_query_parameter_is_read_and_replaced() {
         assert_eq!(
-            apply_model_policy(&mut u, "cheap", Policy::Force),
-            ("cheap".to_owned(), true)
+            requested_model(&url("?model=gpt&x=1")).as_deref(),
+            Some("gpt")
         );
-        assert_eq!(u.query(), Some("x=1&model=cheap"));
-    }
-
-    #[test]
-    fn default_fills_only_missing_model() {
+        assert_eq!(requested_model(&url("?model=")), None);
+        assert_eq!(requested_model(&url("")), None);
+        let mut u = url("?model=public&x=1");
+        set_model(&mut u, "upstream/name");
+        assert_eq!(u.query(), Some("x=1&model=upstream%2Fname"));
         let mut u = url("");
-        assert_eq!(
-            apply_model_policy(&mut u, "cheap", Policy::Default),
-            ("cheap".to_owned(), true)
-        );
-        let mut u = url("?model=chosen");
-        assert_eq!(
-            apply_model_policy(&mut u, "cheap", Policy::Default),
-            ("chosen".to_owned(), false)
-        );
-    }
-
-    #[test]
-    fn passthrough_keeps_client_model() {
-        let mut u = url("?model=chosen");
-        assert_eq!(
-            apply_model_policy(&mut u, "cheap", Policy::Passthrough),
-            ("chosen".to_owned(), false)
-        );
-        let mut u = url("");
-        assert_eq!(
-            apply_model_policy(&mut u, "cheap", Policy::Passthrough),
-            (String::new(), false)
-        );
-        assert_eq!(u.query(), None);
+        set_model(&mut u, "m");
+        assert_eq!(u.query(), Some("model=m"));
     }
 }

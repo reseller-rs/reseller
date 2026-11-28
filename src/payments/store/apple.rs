@@ -13,7 +13,6 @@ use crate::{
     config::Config,
     db::{self, now},
     error::{Error, Result},
-    money,
     payments::{
         StoreCharge, provider_error, record_store_charge, refund_store_charge, unavailable,
     },
@@ -495,7 +494,7 @@ async fn consumption_request(
     };
     let used = crate::billing::consumption(&mut conn, &payment.get::<String, _>("id")).await?;
     drop(conn);
-    let sample = money::usd(&config.signup.free_credit_usd).is_ok_and(|credit| credit > 0);
+    let sample = config.offers_free_tier();
     let body = consumption_body(
         used.milli_percent,
         payment.get::<String, _>("kind") == "subscription",

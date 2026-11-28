@@ -1,5 +1,5 @@
 //! Reasoning effort: supported levels per upstream model and the level for
-//! free accounts.
+//! free models.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -28,10 +28,9 @@ pub struct ReasoningModel {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Reasoning {
-    /// Highest level for free accounts (only trial credit, no subscription
-    /// or paid credit). Higher requested levels are lowered to it, and
-    /// requests to a configured reasoning model without a level get it.
-    /// Empty disables the cap.
+    /// Highest level for requests to free models. Higher requested levels
+    /// are lowered to it, and requests to a configured reasoning model
+    /// without a level get it. Empty disables the cap.
     pub free_effort: String,
     /// Per upstream model name (case-insensitive). Models not listed pass
     /// the client's value through unchanged (apart from the free cap).

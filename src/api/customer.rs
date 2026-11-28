@@ -32,7 +32,6 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
             let mut plans = billing::plans(app, true).await?;
             plans["payment_methods"] = payments::methods(&config).into();
             plans["request_estimate_usd"] = config.billing.request_estimate_usd.clone().into();
-            plans["trial_credit_usd"] = config.signup.free_credit_usd.clone().into();
             return Ok(plans);
         }
         (["signup", "challenge"], "GET") => return signup_challenge(app, ip).await,
@@ -137,7 +136,10 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["account", "requests"], "GET") => requests(app, Some(account), &q, false).await,
         // The model list of the signed-in key, also for dashboard tokens,
         // which cannot call `/v1/models`.
-        (["account", "models"], "GET") => Ok(proxy::model_list(&*app.config().await, Some(&me))),
+        (["account", "models"], "GET") => Ok(proxy::model_list(
+            &*app.config().await,
+            &identity::Caller::Key(me.clone()),
+        )),
         _ => Err(Error::not_found("not_found", "Unknown customer endpoint")),
     }
 }

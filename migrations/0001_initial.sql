@@ -104,6 +104,10 @@ CREATE TABLE redeem_codes (
 ) STRICT;
 -- Request log, one row per proxied request.
 -- estimated is 1 when token usage was estimated instead of reported.
+-- public_model is the catalog id the caller asked for, model the upstream model
+-- that answered (the public id until a route has been tried), and provider the
+-- provider that answered (NULL until an attempt is made). tier is free or paid.
+-- attempts counts the routes tried.
 CREATE TABLE requests (
  id TEXT PRIMARY KEY, account_id TEXT REFERENCES accounts(id), key_id TEXT REFERENCES api_keys(id),
  created_at INTEGER NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL,
@@ -117,13 +121,15 @@ CREATE TABLE requests (
  audio_ms INTEGER NOT NULL DEFAULT 0 CHECK(audio_ms>=0), images INTEGER NOT NULL DEFAULT 0 CHECK(images>=0),
  -- Worst-case billed micro-USD and tokens held at admission. Holds of unfinished
  -- rows count against balance and limits until settlement closes the row.
- hold_micro INTEGER NOT NULL DEFAULT 0 CHECK(hold_micro>=0), hold_tokens INTEGER NOT NULL DEFAULT 0 CHECK(hold_tokens>=0)
+ hold_micro INTEGER NOT NULL DEFAULT 0 CHECK(hold_micro>=0), hold_tokens INTEGER NOT NULL DEFAULT 0 CHECK(hold_tokens>=0),
+ provider TEXT, tier TEXT NOT NULL CHECK(tier IN ('free','paid')), attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
+ public_model TEXT NOT NULL DEFAULT ''
 ) STRICT;
 CREATE INDEX requests_key_time ON requests(key_id,created_at);
 CREATE INDEX requests_account_time ON requests(account_id,created_at);
 CREATE INDEX requests_time ON requests(created_at);
 CREATE INDEX requests_in_flight ON requests(account_id,finished,created_at);
--- Hourly usage totals per key and model, used for limits and statistics.
+-- Hourly usage totals per key and public model, used for limits and statistics.
 CREATE TABLE usage_buckets (
  hour INTEGER NOT NULL, key_id TEXT NOT NULL REFERENCES api_keys(id), account_id TEXT NOT NULL REFERENCES accounts(id), model TEXT NOT NULL,
  requests INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, upstream_micro INTEGER NOT NULL DEFAULT 0, billed_micro INTEGER NOT NULL DEFAULT 0,
@@ -131,6 +137,17 @@ CREATE TABLE usage_buckets (
 ) STRICT;
 CREATE INDEX usage_account_time ON usage_buckets(account_id,hour);
 CREATE INDEX usage_key_time ON usage_buckets(key_id,hour);
+-- Hourly upstream usage per provider, upstream model and tier, including
+-- anonymous requests. requests counts attempts sent to the route, failures the
+-- attempts that ended in a timeout, connection error, 5xx, 401, 402, 403 or 408,
+-- and rate_limited the 429s. tokens, upstream_micro and latency_ms_sum describe
+-- the attempts that were answered. It warms up the daily budgets after a restart.
+CREATE TABLE route_usage (
+ hour INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, tier TEXT NOT NULL CHECK(tier IN ('free','paid')),
+ requests INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, rate_limited INTEGER NOT NULL DEFAULT 0,
+ tokens INTEGER NOT NULL DEFAULT 0, upstream_micro INTEGER NOT NULL DEFAULT 0, latency_ms_sum INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(hour,provider,model,tier)
+) STRICT;
 -- Running totals across all requests (id is always 1).
 CREATE TABLE totals (id INTEGER PRIMARY KEY CHECK(id=1), requests INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, upstream_micro INTEGER NOT NULL DEFAULT 0, billed_micro INTEGER NOT NULL DEFAULT 0) STRICT;
 INSERT INTO totals(id) VALUES (1);

@@ -4,6 +4,7 @@
 //!
 //! - [`web`]: HTTP router, static assets, and request dispatch.
 //! - [`proxy`]: streaming upstream transport (JSON, SSE, multipart, WebSocket).
+//! - [`router`]: route selection, failover, provider budgets, and free-tier admission.
 //! - [`meter`]: request admission, usage accounting, and settlement.
 //! - [`api`]: customer (`/v1/keys`, `/v1/account`) and administrator APIs.
 //! - [`identity`] / [`keys`]: authentication and API key lifecycle.
@@ -29,6 +30,7 @@ pub mod money;
 pub mod oauth;
 pub mod payments;
 pub mod proxy;
+pub mod router;
 pub mod security;
 pub mod stats;
 pub mod theme;
@@ -49,6 +51,8 @@ pub struct App {
     pub payroof: Arc<payments::payroof::Cache>,
     /// In-memory abuse limiter (per IP and per account).
     pub limiter: Arc<security::limiter::Limiter>,
+    /// Route health, provider budgets, and free-tier admission.
+    pub router: Arc<router::Router>,
     /// Recent business failures per IP, for adaptive proof of work.
     pub strikes: Arc<security::strikes::Strikes>,
     /// Optional directory of theme files served under `/theme/`.
@@ -73,6 +77,7 @@ impl App {
             tasks: tokio_util::task::TaskTracker::new(),
             payroof: Arc::default(),
             limiter: Arc::default(),
+            router: Arc::default(),
             strikes: Arc::default(),
             theme_dir: None,
             store: Arc::default(),

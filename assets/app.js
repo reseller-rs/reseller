@@ -344,9 +344,9 @@ const METHOD_LABELS = { stripe: 'Card', crypto: 'Crypto', app_store: 'App Store'
 const methodLabel = m => METHOD_LABELS[m] || m;
 const KIND_LABELS = { llm: 'Text', tts: 'Speech', stt: 'Transcription', image: 'Image' };
 const kindLabel = k => KIND_LABELS[k] || k || '-';
-const SOURCE_LABELS = { free: 'Trial credit', purchase: 'Purchase', admin: 'Operator grant', refund: 'Refund', subscription: 'Plan quota', topup: 'Top-up' };
+const SOURCE_LABELS = { purchase: 'Purchase', admin: 'Operator grant', refund: 'Refund', subscription: 'Plan quota', topup: 'Top-up' };
 const sourceLabel = s => SOURCE_LABELS[s] || s;
-const SOURCE_ICONS = { free: 'zap', purchase: 'card', admin: 'shield', refund: 'refresh', subscription: 'calendar', topup: 'plus' };
+const SOURCE_ICONS = { purchase: 'card', admin: 'shield', refund: 'refresh', subscription: 'calendar', topup: 'plus' };
 const sourceCell = s => `<span class="source">${ico(SOURCE_ICONS[s] || 'wallet')}<span>${esc(sourceLabel(s))}</span></span>`;
 const pill = (value, tone) => `<span class="pill tone-${tone || TONES.get(String(value).toLowerCase()) || 'muted'}">${esc(value)}</span>`;
 const requestPill = r => !r.finished ? pill('In progress', 'info') : r.status >= 400 ? pill(r.status, 'danger') : pill(r.status, 'ok');
@@ -491,7 +491,6 @@ document.addEventListener('keydown', e => {
 const ERROR_HINTS = {
   rotate_cooldown: 'This key was created or rotated too recently to rotate again.',
   key_creation_daily_limit: 'Daily limit for creating or rotating keys reached.',
-  ip_signup_limit: 'This network has reached its monthly limit of new accounts. Sign in to your existing account to create more keys.',
   signup_cooldown: 'Please wait a little before creating another account.',
   pow_required: 'Human verification is required. Please try again.',
   pow_invalid: 'Human verification failed. Please try again.',
@@ -501,12 +500,11 @@ const ERROR_HINTS = {
 };
 function apiError(r, v) {
   const code = v?.error?.code || v?.error?.type || '';
-  // The per-network signup limit always gets the fixed wording, with no retry hint: it resets monthly.
-  let message = (code === 'ip_signup_limit' && ERROR_HINTS[code]) || v?.error?.message || ERROR_HINTS[code] || `Request failed (${r.status})`;
+  let message = v?.error?.message || ERROR_HINTS[code] || `Request failed (${r.status})`;
   const wait = Number.parseInt(r.headers.get('retry-after'), 10);
   if (r.status === 429) {
     if (!v?.error?.message && !ERROR_HINTS[code]) message = 'Too many requests. Please slow down.';
-    if (wait > 0 && code !== 'ip_signup_limit') message = `${message.replace(/[.!]?$/, '.')} Try again in ${wait >= 120 ? `${Math.ceil(wait / 60)} minutes` : `${wait} second${wait === 1 ? '' : 's'}`}.`;
+    if (wait > 0) message = `${message.replace(/[.!]?$/, '.')} Try again in ${wait >= 7200 ? `${Math.ceil(wait / 3600)} hours` : wait >= 120 ? `${Math.ceil(wait / 60)} minutes` : `${wait} second${wait === 1 ? '' : 's'}`}.`;
   }
   return Object.assign(new Error(message), { status: r.status, code, retryAfter: wait > 0 ? wait : null, redirect: typeof v?.redirect === 'string' ? v.redirect : '' });
 }
@@ -622,6 +620,7 @@ const SKELETON_VIEWS = {
   accounts: () => `${skHead()}${skToolbar()}${skTable(8, 7, true)}${skPager()}`,
   payments: () => `${skHead(true)}${skToolbar()}${skTable(8, 7, true)}${skPager()}`,
   requests: () => `${skHead(true)}${skToolbar()}${skTable(8, 6, true)}${skPager()}`,
+  routing: () => `${skHead(true)}${skStats(4)}${skCard(`${skCardHead()}${skTable(3, 7, true)}`)}${skCard(`${skCardHead()}${skTable(5, 8, true)}`)}`,
   usage: () => `${skHead()}${skStats(3, false)}${skChart()}${skCard(`${skCardHead()}${skTable(4, 4)}`)}${skCard(`${skCardHead()}${skTable(5, 4)}`)}`,
   billing: () => billingSub === 'add'
     ? `${skSeg(3)}<div class="bill-body"><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div><div class="plan-tiles">${skel('skel-tile', 3)}</div></div><div class="bill-section"><div class="section-head">${skel('skel-h3')}</div><div class="ways">${skel('skel-way', 2)}</div></div>${skel('skel-more')}</div>`
@@ -634,7 +633,7 @@ const SKELETON_VIEWS = {
   settings: () => `${skHead()}${skel('skel-callout')}${skCard(`${skel('skel-line sm')}${skel('skel-textarea')}`)}`,
 };
 const viewSkeleton = name => skeleton((SKELETON_VIEWS[name] || SKELETON_VIEWS.keys)(), 'Loading');
-const tabsSkeleton = () => `<div class="tabs" aria-hidden="true">${skel('skel-tab', admin ? 8 : 6)}</div>`;
+const tabsSkeleton = () => `<div class="tabs" aria-hidden="true">${skel('skel-tab', admin ? 9 : 6)}</div>`;
 const modalSkeleton = () => skeleton(`${skel('skel-title')}${skFacts(4)}${skel('skel-chart')}${skTable(3, 4)}`, 'Loading details', 'skeleton-body stack');
 const plansSkeleton = () => skeleton(skPlans(3), 'Loading plans');
 // Docs and legal pages: contents column plus the article column.
@@ -727,13 +726,13 @@ const LIST_DEFAULTS = {
 const FILTERS = Object.fromEntries(Object.entries(LIST_DEFAULTS).map(([name, d]) => [name, Object.keys(d).filter(k => k !== 'limit' && k !== 'offset')]));
 const listStates = Object.fromEntries(Object.entries(LIST_DEFAULTS).map(([name, d]) => [name, { ...d }]));
 const TABS = admin
-  ? ['overview', 'accounts', 'keys', 'requests', 'payments', 'plans', 'codes', 'settings']
+  ? ['overview', 'accounts', 'keys', 'requests', 'routing', 'payments', 'plans', 'codes', 'settings']
   : ['overview', 'keys', 'requests', 'usage', 'billing', 'connect'];
 let billingSub = 'overview';
 const BILLING_SUBS = ['overview', 'add', 'history'];
-const TAB_LABELS = { overview: 'Overview', accounts: 'Accounts', keys: 'API keys', requests: 'Requests', payments: 'Payments', plans: 'Plans', codes: 'Redeem codes', settings: 'Settings', usage: 'Usage', billing: 'Billing', connect: 'Connect' };
+const TAB_LABELS = { overview: 'Overview', accounts: 'Accounts', keys: 'API keys', requests: 'Requests', routing: 'Routing', payments: 'Payments', plans: 'Plans', codes: 'Redeem codes', settings: 'Settings', usage: 'Usage', billing: 'Billing', connect: 'Connect' };
 
-const TAB_ICONS = { overview: 'home', accounts: 'users', keys: 'key', requests: 'list', payments: 'wallet', plans: 'tag', codes: 'ticket', settings: 'sliders', usage: 'chart', billing: 'card', connect: 'link' };
+const TAB_ICONS = { overview: 'home', accounts: 'users', keys: 'key', requests: 'list', routing: 'link', payments: 'wallet', plans: 'tag', codes: 'ticket', settings: 'sliders', usage: 'chart', billing: 'card', connect: 'link' };
 
 function hashFor(name) {
   const state = listStates[name];
@@ -1089,7 +1088,6 @@ function redeemForm() {
 function secrets(v, { embedded = false } = {}) {
   modal('Save your credentials', `
     ${alertBox('warn', 'Save these now', 'They are shown only once.')}
-    ${Number(v.trial_credit_usd) > 0 ? `<div class="trial-note">${ico('zap', 20)}<div><strong>${esc(approx(v.trial_credit_usd))} free requests to try the API</strong>${estimateNote()}</div></div>` : ''}
     <div class="cred-row">
       <span class="cred-label">API key</span>
       <code class="cred-value secret" title="${esc(v.key)}">${esc(v.key)}</code>
@@ -1135,7 +1133,7 @@ function keyForm() {
       <input id="key-name" name="name" maxlength="80" value="${esc(suggestedName())}" placeholder="My application" required>
       <label for="contact">Contact (optional)</label>
       <input id="contact" name="contact" type="email" placeholder="you@example.com">
-      ${signedIn ? '' : '<p class="field-help">Free trial usage included.</p>'}
+      ${signedIn ? '' : '<p class="field-help">An API key unlocks paid models and higher limits. Free models work without one.</p>'}
       <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span class="pow-text">Checking that you are human...</span></div><progress max="100" value="0"></progress></div>
       ${signedIn ? '' : clickwrap('Create key')}
       <div class="actions"><button type="button" class="ghost" data-cancel>Cancel</button><button class="primary" type="submit">${withIcon('plus', 'Create key')}</button></div>
@@ -1490,7 +1488,7 @@ function editAccountForm(a, done) {
       <input id="account-note" name="note" value="${esc(a.note)}" placeholder="VIP customer">
       <label for="account-markup">Markup %</label>
       <input id="account-markup" name="markup_pct" inputmode="decimal" value="${a.markup_pct ? esc(a.markup_pct) : ''}" placeholder="Global default">
-      <label class="inline check-line"><input type="checkbox" name="can_create_keys"${a.can_create_keys ? ' checked' : ''}> Trusted account${tip('Skips the daily key creation budget and does not count toward its network\'s monthly signup allowance.')}</label>
+      <label class="inline check-line"><input type="checkbox" name="can_create_keys"${a.can_create_keys ? ' checked' : ''}> Trusted account${tip('Skips the daily key creation budget and gets its own free-tier allowance instead of sharing its network\'s.')}</label>
       <div class="actions"><button class="primary" type="submit">Save changes</button></div>
     </form>`, d => bindForm(d.querySelector('form'), async b => {
     await api(endpoint(`accounts/${a.id}`), 'PATCH', {
@@ -1514,18 +1512,21 @@ function remember(rows) {
   if (requestIndex.size > 2000) requestIndex.clear();
   rows.forEach(r => requestIndex.set(r.id, r));
 }
+// The customer's model is already the public id. The operator's row carries the upstream name in `model`.
+const requestModel = r => (admin && r.public_model) || r.model;
+const tierPill = t => t ? pill(t === 'free' ? 'Free' : 'Paid', t === 'free' ? 'info' : 'muted') : '';
 const routeCell = r => `<span class="route">${methodTag(r.method)}<code>${esc(r.path)}</code></span>`;
 function requestTable(rows, { compact = false } = {}) {
   remember(rows);
   const columns = [
     ['Time', r => when(r.created_at)],
-    ['Request', r => `${routeCell(r)}${r.model ? `<div class="hint"><code>${esc(r.model)}</code></div>` : ''}`, 'wrap'],
+    ['Request', r => `${routeCell(r)}${requestModel(r) ? `<div class="hint"><code>${esc(requestModel(r))}</code>${r.tier === 'free' ? ` ${tierPill(r.tier)}` : ''}${admin && r.provider ? ` <span>${esc(r.provider)}</span>` : ''}</div>` : ''}`, 'wrap'],
   ];
-  if (!compact) columns.push(['Key', r => `${keyLink(r.key_id, r.key_name, r.key_prefix)}${admin ? `<div class="hint">${accountLink(r.account_id, r.account_contact)}</div>` : ''}`, 'wrap']);
+  if (!compact) columns.push(['Key', r => `${r.key_id ? keyLink(r.key_id, r.key_name, r.key_prefix) : '<span class="muted">No key</span>'}${admin ? `<div class="hint">${accountLink(r.account_id, r.account_contact)}</div>` : ''}`, 'wrap']);
   columns.push(
     ['Status', r => `${requestPill(r)}${r.finished ? `<div class="hint">${esc(ms(r.duration_ms))}</div>` : ''}`],
     ['Tokens', r => `<span class="num">${count(r.tokens)}</span>`, 'end'],
-    ['Billed', r => `<span class="num">${esc(usd(r.billed_usd))}</span>`, 'end'],
+    ['Billed', r => r.tier === 'free' ? '<span class="muted">Free</span>' : `<span class="num">${esc(usd(r.billed_usd))}</span>`, 'end'],
     ['', r => `<button type="button" class="small" data-request-details="${esc(r.id)}">Details</button>`, 'end'],
   );
   return table(columns, rows, { empty: ['No requests', 'Requests appear here as soon as a key is used.'] });
@@ -1549,16 +1550,20 @@ function requestDetails(r) {
     </div>
     ${r.error ? `<div class="callout danger"><strong>Error</strong><p>${esc(r.error)}</p></div>` : ''}
     <div class="tiles">
-      ${metric('Billed', usd(r.billed_usd), r.estimated ? 'Tokens estimated: the provider reported no usage' : 'Deducted from the balance')}
-      ${admin ? metric('Upstream cost', usd(r.upstream_usd), `Margin ${esc(usd(Number(r.billed_usd) - Number(r.upstream_usd)))}`) : ''}
+      ${r.tier === 'free' ? metric('Billed', 'Free', 'Free models are never billed') : metric('Billed', usd(r.billed_usd), r.estimated ? 'Tokens estimated: the provider reported no usage' : 'Deducted from the balance')}
+      ${admin ? metric('Upstream cost', usd(r.upstream_usd), r.tier === 'free' ? 'Free request, nothing billed' : `Margin ${esc(usd(Number(r.billed_usd) - Number(r.upstream_usd)))}`) : ''}
       ${metric('Tokens', count(r.tokens), r.estimated ? 'Estimated' : 'Reported by the provider')}
     </div>
     <div class="detail-columns">
       <section class="detail-section"><h4>Request</h4>${facts([
         ['Request ID', copyable(r.id, 'Request ID')],
-        ['Model', r.model ? `<code>${esc(r.model)}</code>` : '-'],
+        ['Model', requestModel(r) ? `<code>${esc(requestModel(r))}</code>` : '-'],
+        admin && r.public_model && r.model && r.model !== r.public_model && ['Upstream model', `<code>${esc(r.model)}</code>`],
+        admin && r.provider && ['Provider', `<code>${esc(r.provider)}</code>`],
+        r.tier && ['Tier', tierPill(r.tier)],
+        Number(r.attempts) > 0 && ['Attempts', Number(r.attempts) > 1 ? `${count(r.attempts)} (retried on another route)` : '1'],
         ['Kind', esc(kindLabel(r.kind))],
-        ['Key', `${keyLink(r.key_id, r.key_name, r.key_prefix)}${r.key_prefix ? ` ${keyPrefix(r.key_prefix)}` : ''}`],
+        ['Key', r.key_id ? `${keyLink(r.key_id, r.key_name, r.key_prefix)}${r.key_prefix ? ` ${keyPrefix(r.key_prefix)}` : ''}` : '<span class="muted">No key</span>'],
         admin && ['Account', accountLink(r.account_id, r.account_contact)],
         ['Client IP', `<code>${esc(r.ip || '-')}</code>`],
       ])}</section>
@@ -1616,6 +1621,56 @@ function exampleModels(models = []) {
     has: Object.fromEntries(Object.keys(CAPABILITIES).map(k => [k, Boolean(first[k])])),
     known: models.length > 0,
   };
+}
+
+// Free models need no credential. The anonymous model list is empty (or refused)
+// when the operator offers none, so the free sections stay hidden then.
+let freeModelsPromise;
+const freeModels = () => freeModelsPromise ||= fetch('/v1/models', { headers: { accept: 'application/json' } })
+  .then(r => r.ok ? r.json() : { data: [] })
+  .then(v => (v.data || []).filter(m => m.tier === 'free'))
+  .catch(() => []);
+const freeChatModel = models => (models.find(m => modelKind(m) === 'chat') || {}).id || '';
+function freeSnippets(model) {
+  const base = `${location.origin}/v1`;
+  return [
+    { label: 'cURL', code: `curl ${base}/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${model}",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'` },
+    { label: 'Python', code: `# pip install openai
+from openai import OpenAI
+
+# Any placeholder works as the key for free models.
+client = OpenAI(base_url="${base}", api_key="free")
+reply = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(reply.choices[0].message.content)` },
+    { label: 'Node', code: `// npm install openai
+import OpenAI from "openai";
+
+// Any placeholder works as the key for free models.
+const client = new OpenAI({ baseURL: "${base}", apiKey: "free" });
+const reply = await client.chat.completions.create({
+  model: "${model}",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(reply.choices[0].message.content);` },
+    { label: 'Rate headers', code: `curl -i ${base}/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hi"}]}'
+
+# Every free response carries:
+#   x-ratelimit-limit-requests: 10
+#   x-ratelimit-remaining-requests: 9
+#   x-ratelimit-reset-requests: 6s
+#   ratelimit-policy: "free";q=10;w=60, "free-day";q=300;w=86400
+#   ratelimit: "free";a=9;w=12, "free-day";a=299;w=40000` },
+  ];
 }
 
 function apiSnippets(m = exampleModels()) {
@@ -1748,15 +1803,28 @@ const ACCOUNT_DOCS = [
 ];
 const ERROR_DOCS = [
   ['400', 'invalid_request_error', '-', 'The request body or parameters are invalid.'],
-  ['401', 'invalid_request_error', 'missing_api_key, invalid_api_key', 'No key, or an unknown key, was sent.'],
+  ['400', 'invalid_request_error', 'model_required, unsupported_model', 'The request names no model and none is the default, or the model cannot be used with this endpoint.'],
+  ['400', 'invalid_request_error', 'model_must_precede_file', 'In a multipart upload, send the model field before the file, and do not change it later.'],
+  ['401', 'invalid_request_error', 'api_key_required', 'The model is a paid model. Send an API key. Free models need no key.'],
+  ['401', 'invalid_request_error', 'missing_api_key, invalid_api_key', 'No key was sent and free access is off, or the sk-res- key is unknown.'],
   ['401', 'invalid_request_error', 'key_revoked, key_blocked, key_expired', 'The key exists but cannot be used.'],
   ['401', 'invalid_request_error', 'dashboard_token_not_allowed', 'Dashboard tokens manage the account. Use the API key for API calls.'],
   ['403', 'permission_error', 'account_suspended', 'The operator suspended the account.'],
   ['404', 'invalid_request_error', 'model_not_found', 'The model does not exist or the key may not use it.'],
   ['404', 'invalid_request_error', 'unknown_url', 'The path is not an API route.'],
   ['402', 'insufficient_quota', 'insufficient_quota', 'The monthly quota and top-up balance are used up. The message explains how to add usage.'],
-  ['429', 'rate_limit_error', 'rate_limit_exceeded, request_limit_exceeded, token_limit_exceeded, spend_limit_exceeded, concurrency_limit_exceeded', 'A key or account limit was reached. Wait for Retry-After seconds.'],
+  ['413', 'invalid_request_error', 'request_too_large', 'The body is larger than allowed. Free requests have a smaller limit than keyed ones.'],
+  ['429', 'rate_limit_error', 'rate_limit_exceeded, request_limit_exceeded, token_limit_exceeded, spend_limit_exceeded, concurrency_limit_exceeded', 'A key, account, or free-tier limit was reached. Wait for Retry-After seconds. Free-tier answers also carry retry-after-ms.'],
+  ['429', 'rate_limit_error', 'free_quota_exceeded', 'The daily free request or token allowance is used up. The answer sends x-should-retry: false, so SDKs do not retry. Wait for Retry-After or use an API key.'],
+  ['503', 'server_error', 'capacity_exhausted', 'No route or free slot has room right now. Retry after Retry-After (seconds) or retry-after-ms.'],
   ['502, 504', 'server_error', 'upstream_error', 'The model provider failed or timed out. Nothing is billed for failed requests without usage.'],
+];
+const FREE_ERROR_DOCS = [
+  ['401', 'api_key_required', 'A paid model was requested without a key.', 'Send an API key, or choose a free model.'],
+  ['429', 'rate_limit_exceeded', 'The per-minute request limit was reached.', 'Wait for retry-after-ms. SDKs retry on their own.'],
+  ['429', 'concurrency_limit_exceeded', 'Too many free requests are in flight from your network.', 'Wait for one to finish, then retry.'],
+  ['429', 'free_quota_exceeded', 'The daily request or token allowance is used up.', 'Do not retry in a loop. Wait for Retry-After or get an API key.'],
+  ['503', 'capacity_exhausted', 'All free capacity or every upstream route is busy.', 'Retry after Retry-After. Backing off with jitter helps.'],
 ];
 const MCP_TOOL_DOCS = [
   ['generate_text', 'API key', 'Generate text with a chat model.'],
@@ -1855,6 +1923,7 @@ function modelCatalog(models) {
 const DOC_SECTIONS = [
   ['quick-start', 'Quick start'],
   ['authentication', 'Authentication'],
+  ['free-tier', 'Free tier'],
   ['models', 'Models'],
   ['endpoints', 'Endpoints'],
   ['examples', 'Examples'],
@@ -1903,7 +1972,7 @@ async function docs() {
       <nav class="docs-nav" aria-label="Documentation">
         <button type="button" class="docs-nav-toggle" aria-expanded="false" aria-controls="docs-toc"><span>On this page</span><strong data-toc-current>${esc(DOC_SECTIONS[0][1])}</strong></button>
         <div class="eyebrow">On this page</div>
-        <ol id="docs-toc">${DOC_SECTIONS.map(([id, label]) => `<li><a href="#${id}" data-doc-link="${id}">${esc(label)}</a></li>`).join('')}</ol>
+        <ol id="docs-toc">${DOC_SECTIONS.map(([id, label]) => `<li${id === 'free-tier' ? ' hidden' : ''}><a href="#${id}" data-doc-link="${id}">${esc(label)}</a></li>`).join('')}</ol>
         <div class="docs-nav-legal">${legalLink('terms', { label: 'Terms', icon: 'file' })}${legalLink('privacy', { label: 'Privacy', icon: 'lock' })}</div>
       </nav>
       <article class="docs-body">
@@ -1924,7 +1993,7 @@ async function docs() {
         <section id="quick-start" class="doc-section">
           <h2>Quick start</h2>
           <ol class="start-steps">
-            <li class="card"><span class="step-num">1</span><div><h3>Get a key</h3><p>${session ? 'Create one in the workspace under API keys.' : 'Create an account. A short proof of work runs in your browser, no card needed.'}</p></div></li>
+            <li class="card"><span class="step-num">1</span><div><h3>Get a key</h3><p>${session ? 'Create one in the workspace under API keys.' : 'Create an account. A short proof of work runs in your browser, no card needed.'} <span data-free-hint hidden>Free models need no key, see <a href="#free-tier">Free tier</a>.</span></p></div></li>
             <li class="card"><span class="step-num">2</span><div><h3>Export it</h3><p>Store it as <code>RESELLER_KEY</code> in your shell or secret store.</p></div></li>
             <li class="card"><span class="step-num">3</span><div><h3>Call the API</h3><p>Point your SDK at the base URL and send a request.</p></div></li>
           </ol>
@@ -1933,9 +2002,11 @@ async function docs() {
 
         <section id="authentication" class="doc-section">
           <h2>Authentication</h2>
-          <p>Every API call needs a credential, sent as a bearer token: <code>Authorization: Bearer sk-res-...</code>. The <code>x-api-key</code> header works as well.</p>
+          <p>Paid models need a credential, sent as a bearer token: <code>Authorization: Bearer sk-res-...</code>. The <code>x-api-key</code> header works as well. Free models need none.</p>
           ${facts([
+            ['No key', 'Send no credential, or any value that starts with neither <code>sk-res-</code> nor <code>dash_</code> (for SDKs that insist on a key, use <code>free</code>). You can call free models only, within the free-tier limits. A paid model answers <code>401 api_key_required</code>.'],
             ['API key', 'Starts with <code>sk-res-</code>. Calls the API and the MCP generation tools. Shown once when created or rotated.'],
+            ['Unknown key', 'A value that starts with <code>sk-res-</code> but is not a valid key answers <code>401 invalid_api_key</code>. It is never treated as anonymous.'],
             ['Dashboard token', 'Starts with <code>dash_</code>. Signs in to the workspace and manages the account (keys, usage, billing, MCP account tools). It cannot call generation endpoints.'],
             ['Several keys', 'All keys of an account share one balance. Create one key per app to see spend per app.'],
             ['Administrator token', 'The operator token is also accepted on <code>/v1</code> and <code>/mcp</code> as an unbilled operator credential. Nothing is charged to any account.'],
@@ -1943,9 +2014,29 @@ async function docs() {
           <p class="hint">Lost a key? Rotate it under API keys. The old secret stops working at once.</p>
         </section>
 
+        <section id="free-tier" class="doc-section" hidden>
+          <h2>Free tier</h2>
+          <p>Use free models without a key. Get a key to use paid models and higher limits. Free models are never billed.</p>
+          <div id="doc-free"></div>
+          ${facts([
+            ['Which models', 'Models with <code>"tier": "free"</code> in <code>GET /v1/models</code>. Without a credential, the list shows free models only. A request with no <code>model</code> field uses the free default.'],
+            ['Limits per client', 'Requests per minute, requests per day, tokens per day, requests in flight at once, and a cap on output tokens and request size. The operator sets the numbers, and every response shows your remaining allowance in the headers below.'],
+            ['Who is one client', 'Your IP address. IPv6 addresses are grouped by their /64 prefix, so one network shares one allowance. Accounts that have paid, or that the operator trusts, get their own allowance. Extra accounts on one network do not add allowance.'],
+            ['Output length', '<code>max_tokens</code>, <code>max_completion_tokens</code>, and <code>max_output_tokens</code> are lowered to the free cap, and the cap is added when a request has none. Reasoning effort is capped as well.'],
+            ['Rate headers', '<code>x-ratelimit-limit-requests</code>, <code>x-ratelimit-remaining-requests</code>, and <code>x-ratelimit-reset-requests</code> describe the per-minute window. <code>RateLimit-Policy</code> and <code>RateLimit</code> (IETF draft fields) list the minute and the day windows.'],
+            ['Retry', 'Over-limit requests fail at once and are never queued. The answer carries <code>Retry-After</code> (seconds) and <code>retry-after-ms</code>. The OpenAI SDKs wait that long and retry on their own. <code>free_quota_exceeded</code> (daily limit) sends <code>x-should-retry: false</code>, so do not loop on it.'],
+          ])}
+          ${table([
+            ['Status', r => `<strong class="num">${esc(r[0])}</strong>`],
+            ['Code', r => `<code>${esc(r[1])}</code>`],
+            ['When', r => esc(r[2]), 'wrap'],
+            ['What to do', r => esc(r[3]), 'wrap'],
+          ], FREE_ERROR_DOCS)}
+        </section>
+
         <section id="models" class="doc-section">
           <h2>Models</h2>
-          <p>Send the model ID in the <code>model</code> field. <code>GET /v1/models</code> lists the models your key may use, in the OpenAI format.</p>
+          <p>Send the model ID in the <code>model</code> field. <code>GET /v1/models</code> lists the models your key may use, in the OpenAI format. Each entry has a <code>tier</code> (<code>free</code> or <code>paid</code>) and <code>architecture.capability</code>.</p>
           <div id="doc-models">${modelsSlot}</div>
           ${codeBlock(`curl ${base}/models -H "Authorization: Bearer $RESELLER_KEY"`)}
         </section>
@@ -1967,7 +2058,8 @@ async function docs() {
           <h2>Billing and balance</h2>
           <ul class="doc-list">
             <li>Each request is priced from its reported usage (tokens, characters, audio seconds, or images) and counted against your monthly quota.</li>
-            <li>A plan gives a monthly quota that resets each month. Top-ups, codes, and the trial grant add usage on top. The quota is used first, then top-ups, which never expire.</li>
+            <li>A plan gives a monthly quota that resets each month. Top-ups and codes add usage on top. The quota is used first, then top-ups, which never expire.</li>
+            <li>Free models are never billed and never touch your quota or balance.</li>
             <li>A request that runs past the remaining balance completes. The difference is recorded as debt and settled from the next top-up.</li>
             <li>When the quota and top-ups are used up, calls return <code>402 insufficient_quota</code> with next steps in the message.</li>
             <li>Every charge is listed per request in the workspace under Requests, and <code>GET /v1/account</code> returns the quota and balance.</li>
@@ -1976,7 +2068,7 @@ async function docs() {
 
         <section id="errors" class="doc-section">
           <h2>Errors and limits</h2>
-          <p>Errors use the OpenAI shape: <code>{"error": {"message", "type", "param", "code"}}</code>. Every <code>429</code> carries a <code>Retry-After</code> header in seconds.</p>
+          <p>Errors use the OpenAI shape: <code>{"error": {"message", "type", "param", "code"}}</code>. Every <code>429</code> carries a <code>Retry-After</code> header in seconds. A <code>503 capacity_exhausted</code> does too, and free-tier answers add <code>retry-after-ms</code>.</p>
           ${table([
             ['Status', r => `<strong class="num">${esc(r[0])}</strong>`],
             ['Type', r => `<code>${esc(r[1])}</code>`],
@@ -2009,7 +2101,19 @@ async function docs() {
   wireCopies(main);
   main.querySelector('[data-create]')?.addEventListener('click', keyForm);
   wireToc(main);
-  if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
+  freeModels().then(list => {
+    const model = freeChatModel(list);
+    if (!model) return;
+    const section = main.querySelector('#free-tier');
+    section.hidden = false;
+    main.querySelector('[data-free-hint]').hidden = false;
+    main.querySelector('[data-doc-link="free-tier"]').parentElement.hidden = false;
+    main.querySelector('#doc-free').innerHTML = `${snippetTabs(freeSnippets(model))}<p class="hint">Free models: ${list.map(x => `<code>${esc(x.id)}</code>`).join(', ')}</p>`;
+    wireDocs(main);
+    wireCopies(main);
+    if (location.hash === '#free-tier') section.scrollIntoView();
+  });
+  if (location.hash && location.hash !== '#free-tier') document.getElementById(location.hash.slice(1))?.scrollIntoView();
   if (!session) return;
   // The model list arrives after the page: fill its slots in place.
   const slot = main.querySelector('#doc-models');
@@ -2034,7 +2138,7 @@ async function docs() {
    /terms and /privacy render from the data below. Operator values (legal name,
    contact address) are escaped once here and interpolated into trusted markup.
    Bump LEGAL_UPDATED whenever the wording changes. */
-const LEGAL_UPDATED = '2026-11-25';
+const LEGAL_UPDATED = '2026-11-28';
 const legalDate = () => new Date(`${LEGAL_UPDATED}T00:00:00Z`).toLocaleDateString('en-US', { dateStyle: 'long', timeZone: 'UTC' });
 
 function legalContent(kind) {
@@ -2057,12 +2161,12 @@ function legalContent(kind) {
         { id: 'data-we-collect', title: 'Data we collect', body: [
           { ul: [
             '<strong>Account data</strong>: an account ID, the names you give your API keys, hashed key secrets and short key prefixes, and an optional contact such as an email address if you provide one.',
-            '<strong>Technical data</strong>: the IP address of your requests and sign-ups, and anti-abuse signals such as proof-of-work results and rate-limit counters.',
+            '<strong>Technical data</strong>: the IP address of your requests and sign-ups, including requests to free models without a key, where it identifies your free-tier allowance, and anti-abuse signals such as proof-of-work results and rate-limit counters.',
             '<strong>API request metadata and usage</strong>: for each request we keep request metadata such as the route, model, token counts, characters, audio seconds or images, status, duration, timestamps and the amount billed. This data powers your usage history and billing.',
             '<strong>Payment records</strong>: the plan or top-up you bought, price, payment method, status, provider and transaction identifiers (including blockchain transaction hashes and your deposit addresses), and App Store or Google Play transaction identifiers. We do not receive or store full card numbers.',
             '<strong>Messages you send us</strong>, if you contact support.',
           ] },
-          `<strong>Prompts and outputs.</strong> The content of your requests and the model responses are forwarded to the upstream AI providers that serve the model you chose. We do not store prompts or outputs beyond the request metadata listed above.`,
+          `<strong>Prompts and outputs.</strong> The content of your requests and the model responses are forwarded to the upstream AI providers that serve the model you chose. We do not store prompts or outputs beyond the request metadata listed above. Free models are often served by providers whose free plans may keep requests or use them to improve their own products, so do not send sensitive data to a free model.`,
         ] },
         { id: 'how-we-use-data', title: 'How and why we use data', body: [
           'We use personal data only for the purposes below, each with its legal basis where data protection law requires one.',
@@ -2080,9 +2184,8 @@ function legalContent(kind) {
         { id: 'app-store-sharing', title: 'Sharing consumption data with app stores', body: [
           `When you request a refund from Apple for an App Store purchase, or a refund or chargeback through Google Play, the store may ask us for information about how the purchase was used. In that case we may send the store:`,
           { ul: [
-            'how much of the purchase was used (for example the share of the plan quota or credit that was consumed),',
-            'the delivery status of the purchase (whether the plan or credit was delivered to your account), and',
-            'whether trial usage was provided to your account.',
+            'how much of the purchase was used (for example the share of the plan quota or credit that was consumed), and',
+            'the delivery status of the purchase (whether the plan or credit was delivered to your account).',
           ] },
           'We do not send your prompts, outputs, API keys or dashboard tokens. The store uses this information only to decide the refund request.',
           '<strong>Legal basis.</strong> Our legitimate interests in preventing fraud and refund abuse, and your agreement, which you give by accepting the Terms and this Privacy Policy when you create your account.',
@@ -2157,7 +2260,7 @@ function legalContent(kind) {
           'break the law or infringe the rights of others, or generate content that is illegal, such as child sexual abuse material,',
           'violate the usage policies of the upstream model providers, which also apply to you,',
           'create malware, run fraud or phishing, or harass, threaten or deceive people,',
-          'bypass rate limits, spend limits, the sign-up proof of work, or other protections, or create several accounts to collect trial credit,',
+          'bypass rate limits, spend limits, the sign-up proof of work, or other protections, or use several accounts or addresses to get around free-tier limits,',
           'probe, overload or disrupt the Service, or attempt to access data that is not yours.',
         ] },
         'We may block keys or suspend accounts that break these rules, with or without notice when the risk is serious.',
@@ -2167,9 +2270,12 @@ function legalContent(kind) {
         'Each request is priced from its measured usage (tokens, characters, audio seconds or images) and counted against your quota. Numbers of requests shown in the Service are estimates for typical requests. Long prompts and outputs use more.',
         'Plans paid by card or crypto are prepaid for the chosen term and do not renew automatically. Plans bought through the App Store or Google Play renew according to the rules of that store, and you manage them in your store account.',
       ] },
-      { id: 'top-ups', title: 'Top-ups and trial credit', body: [
+      { id: 'top-ups', title: 'Top-ups', body: [
         'Where offered, top-ups add usage to your account. Top-ups never expire, and they are used after your monthly quota is used up.',
-        'New accounts may receive limited trial credit so that you can try the API. Trial credit has no cash value, cannot be transferred, may expire, and we may reduce it or stop offering it, for example to prevent abuse.',
+      ] },
+      { id: 'free-models', title: 'Free models', body: [
+        'Where offered, some models can be used without an account or API key. Free models are never billed and have no cash value. They are rate limited per client, with limits on requests per minute and per day, tokens per day, requests in flight at once, output length and request size. A client is identified by its network address, so people on one network share one allowance. Accounts that have paid, or that we trust, get their own allowance.',
+        'Free models are provided as is, may be slower or less capable than paid models, and may change or disappear at any time. We may lower or end free access, for example to prevent abuse. When you reach a limit the API answers with 429 or 503 and a Retry-After header, and you must wait before trying again.',
       ] },
       { id: 'payments', title: 'Payments', body: [
         'Prices are shown in US dollars and may exclude taxes, which are added where required. You can pay by card, by cryptocurrency, or through the App Store or Google Play where available.',
@@ -2185,7 +2291,7 @@ function legalContent(kind) {
         `When you ask Apple or Google for a refund, we may share consumption data with that store as described in the ${privacy}. Please contact us first if something is wrong with a purchase.`,
       ] },
       { id: 'limits', title: 'Usage limits and fair use', body: [
-        'We apply rate limits, concurrency limits, spend limits and daily limits on creating keys and new accounts. When you reach a limit the API answers with an error, such as 429 with a Retry-After header, or 402 when your quota and top-ups are used up.',
+        'We apply rate limits, concurrency limits, spend limits, free-tier limits and daily limits on creating keys and new accounts. When you reach a limit the API answers with an error, such as 429 or 503 with a Retry-After header, or 402 when your quota and top-ups are used up.',
         'We may change limits to keep the Service reliable and fair for everyone. Do not use the Service in ways that place an unreasonable load on it.',
       ] },
       { id: 'providers', title: 'Third-party model providers', body: [
@@ -2299,6 +2405,13 @@ async function landing() {
         <li class="card"><span class="step-icon">${ico('link', 20)}</span><div><h3><span class="step-count">3.</span> Connect an agent</h3><p>Paste <code>${esc(location.origin)}/mcp</code> into Claude, ChatGPT, Cursor, or VS Code and approve in your browser.</p></div></li>
       </ol>
     </section>
+    <section class="home-section" id="free-start" hidden>
+      ${sectionTitle('Try it free', 'No key needed', 'Use free models without a key. Get a key to use paid models and higher limits.')}
+      <div class="card">
+        <div class="card-head"><h3>Call a free model</h3><a class="button ghost small" href="/docs/#free-tier">${withIcon('book', 'Limits and details')}</a></div>
+        <div id="free-start-code"></div>
+      </div>
+    </section>
     <section class="home-section get-started" id="get-started">
       ${sectionTitle('Quick start', 'Copy, paste, run')}
       <div class="card">
@@ -2327,6 +2440,15 @@ async function landing() {
   document.querySelector('#create').onclick = keyForm;
   document.querySelector('#create-final').onclick = keyForm;
   wireDocs(main);
+  freeModels().then(list => {
+    const model = freeChatModel(list);
+    const section = document.querySelector('#free-start');
+    if (!model || !section) return;
+    section.querySelector('#free-start-code').innerHTML = snippetTabs(freeSnippets(model));
+    section.hidden = false;
+    wireDocs(section);
+    wireCopies(section);
+  });
   const slot = document.querySelector('#plans');
   try {
     const v = await api('/v1/plans');
@@ -2377,7 +2499,7 @@ function login() {
         <div class="auth-alt">
           <div>
             <div class="label">New here?</div>
-            <div class="hint">Create an account and get free trial usage. No card required.</div>
+            <div class="hint">Create an account to get a key for paid models and higher limits. No card required.</div>
           </div>
           <button type="button" id="create" class="button ghost">${withIcon('plus', 'Create a new account')}</button>
         </div>`}
@@ -2475,6 +2597,39 @@ async function load() {
 }
 
 const pageHead = (title, subtitle, actions = '') => `<div class="page-head"><div><h2>${esc(title)}</h2>${subtitle ? `<p class="muted">${subtitle}</p>` : ''}</div>${actions ? `<div class="actions">${actions}</div>` : ''}</div>`;
+
+/* Routing helpers ------------------------------------------------------------------ */
+
+const CIRCUIT_TONES = { closed: ['Closed', 'ok'], half_open: ['Half open', 'warn'], open: ['Open', 'danger'] };
+const circuitPill = c => pill(...(CIRCUIT_TONES[c] || [c || 'Unknown', 'muted']));
+function providerState(p) {
+  if (!p.enabled) return pill('Disabled', 'muted');
+  return p.cooldown_until && p.cooldown_until > nowSeconds()
+    ? `${pill('Cooling down', 'warn')}<div class="hint">Until ${when(p.cooldown_until)}</div>`
+    : pill('Available', 'ok');
+}
+// Remaining budget per window, with the time until each resets in the tooltip.
+const LIMIT_NAMES = { rpm: 'per minute', rpd: 'per day', tpm: 'tokens per minute', tpd: 'tokens per day' };
+function limitsCell(limits = {}, inFlight = 0) {
+  const lines = Object.entries(LIMIT_NAMES).filter(([k]) => limits[k]).map(([k, label]) => {
+    const l = limits[k];
+    const low = l.limit > 0 && l.remaining / l.limit < 0.1;
+    const reset = l.reset_seconds > 0 ? `resets in ${ms(l.reset_seconds * 1000)}` : 'full';
+    return `<div title="${esc(reset)}"><span class="num${low ? ' low' : ''}">${count(l.remaining)}</span> <span class="hint">of ${count(l.limit)} ${esc(label)}</span></div>`;
+  });
+  if (limits.concurrent) lines.push(`<div><span class="num">${count(limits.concurrent.in_flight ?? inFlight)}</span> <span class="hint">of ${count(limits.concurrent.limit)} at once</span></div>`);
+  return lines.length ? lines.join('') : '<span class="muted">No limits</span>';
+}
+function routingUsage(u = {}) {
+  const requests = Number(u.requests || 0);
+  const average = requests ? `${ms(u.avg_latency_ms)} average` : '';
+  return {
+    requests: `<span class="num">${count(requests)}</span>${Number(u.free_requests) ? `<div class="hint">${esc(count(u.free_requests))} free</div>` : ''}`,
+    failures: `<span class="num">${count(u.failures)}</span>${Number(u.rate_limited) ? `<div class="hint">${esc(count(u.rate_limited))} rate limited</div>` : ''}`,
+    latency: requests ? `<span class="num">${esc(ms(u.avg_latency_ms))}</span>` : DASH,
+    average,
+  };
+}
 
 /* Views -------------------------------------------------------------------------- */
 
@@ -2734,6 +2889,47 @@ const views = {
       ${requestTable(v.requests)}
       ${listPager('requests', state, Number(v.total || 0), v.requests.length)}`;
   },
+  async routing(signal) {
+    const v = await get(endpoint('routing'), signal);
+    const providers = v.providers || [], routes = v.routes || [];
+    const open = routes.filter(r => r.circuit === 'open').length;
+    const cooling = providers.filter(p => p.cooldown_until && p.cooldown_until > nowSeconds()).length;
+    const inFlight = providers.reduce((sum, p) => sum + Number(p.in_flight || 0), 0);
+    return `${pageHead('Routing', 'Live health of every provider and route. Circuit state, in-flight counts, and remaining budgets are kept in memory and start fresh after a restart. The 24 hour columns come from the request log.', `<button type="button" data-refresh class="ghost small">${withIcon('refresh', 'Refresh')}</button>`)}
+      <div class="stats">
+        ${metric('Free in flight', count(v.free?.in_flight), 'Free requests being served now', { icon: 'zap' })}
+        ${metric('Free clients tracked', count(v.free?.subjects), 'Addresses and accounts with a live allowance window', { icon: 'users' })}
+        ${metric('Upstream in flight', count(inFlight), plural(providers.length, 'provider'), { icon: 'link' })}
+        ${metric('Routes out of rotation', count(open), open || cooling ? `${plural(open, 'open circuit')}, ${plural(cooling, 'provider')} cooling down` : 'All circuits closed', { tone: open || cooling ? 'warn' : '', icon: 'alert' })}
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Providers</h3><span class="hint">One upstream key each</span></div>
+        ${table([
+          ['Provider', p => `<code>${esc(p.id)}</code>${p.enabled ? '' : ` ${pill('Disabled', 'muted')}`}`, 'wrap'],
+          ['State', p => providerState(p)],
+          ['In flight', p => `<span class="num">${count(p.in_flight)}</span>`, 'end'],
+          ['Remaining budget', p => limitsCell(p.limits), 'wrap'],
+          ['24 h requests', p => routingUsage(p.usage_24h).requests, 'end'],
+          ['Failures', p => routingUsage(p.usage_24h).failures, 'end'],
+          ['Latency', p => routingUsage(p.usage_24h).latency, 'end'],
+          ['Upstream cost', p => `<span class="num">${esc(usd(p.usage_24h?.upstream_cost_usd))}</span>`, 'end'],
+        ], providers, { empty: ['No providers', 'Add a provider under Settings.'] })}
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Routes</h3><span class="hint">A provider and the upstream model name</span></div>
+        ${table([
+          ['Route', r => `<code>${esc(r.provider)}</code> <code>${esc(r.model)}</code><div class="hint">${esc((r.models || []).join(', ') || 'Not used')}</div>`, 'wrap'],
+          ['Circuit', r => `${circuitPill(r.circuit)}${r.failures > 0 ? `<div class="hint">${esc(plural(r.failures, 'failure'))} in a row</div>` : ''}`],
+          ['Cooldown', r => r.cooldown_until && r.cooldown_until > nowSeconds() ? `${when(r.cooldown_until)}` : DASH],
+          ['In flight', r => `<span class="num">${count(r.in_flight)}</span>`, 'end'],
+          ['Remaining budget', r => limitsCell(r.limits, r.in_flight), 'wrap'],
+          ['24 h requests', r => routingUsage(r.usage_24h).requests, 'end'],
+          ['Failures', r => routingUsage(r.usage_24h).failures, 'end'],
+          ['Latency', r => `${r.latency_ms == null ? DASH : `<span class="num">${esc(ms(r.latency_ms))}</span>`}<div class="hint">${esc(routingUsage(r.usage_24h).average)}</div>`, 'end'],
+          ['Success rate', r => `<span class="num">${esc(percent(Number(r.success_rate), 1))}</span>`, 'end'],
+        ], routes, { empty: ['No routes', 'Add models with routes under Settings.'] })}
+      </div>`;
+  },
   async usage(signal) {
     const v = await get('/v1/account/usage', signal);
     const t = seriesTotals(v.series);
@@ -2764,7 +2960,7 @@ const views = {
   async settings(signal) {
     const v = await get(endpoint('settings'), signal);
     return `${pageHead('Settings', 'Runtime configuration stored in SQLite. Secret fields are redacted: leave them blank to keep their values. USD amounts and percentages are decimal strings. CORS changes need a restart.')}
-      <div class="callout info"><p><code>branding</code> controls the name, copy, logo, favicon, colours (<code>css_vars</code>), and custom CSS of these pages. <code>stripe</code> and <code>payroof</code> enable card and crypto checkout. <code>models</code> is the catalog customers see.</p></div>
+      <div class="callout info"><p><code>branding</code> controls the name, copy, logo, favicon, colours (<code>css_vars</code>), and custom CSS of these pages. <code>stripe</code> and <code>payroof</code> enable card and crypto checkout. <code>providers</code> are the upstream keys, <code>models</code> is the catalog customers see with the routes that serve each model, and <code>routing</code> and <code>free</code> tune failover and keyless access. See the Routing tab for live state.</p></div>
       <form id="settings" class="card">
         <label for="settings-json">Configuration JSON</label>
         <textarea id="settings-json" name="json" rows="30" spellcheck="false">${esc(JSON.stringify(v.settings, null, 2))}</textarea>
@@ -2797,9 +2993,6 @@ function renderBilling() {
   const topUp = v.top_up || {};
   const hasTopUp = Boolean(topUp.networks?.length);
   const lots = v.credits.filter(c => lotState(c) === 'active');
-  const trial = lots.filter(c => c.source === 'free');
-  const trialLeft = trial.reduce((sum, c) => sum + Number(c.remaining_usd), 0);
-  const trialEnds = Math.min(...trial.map(c => c.expires_at || Infinity));
   const subs = a.subscriptions || (a.subscription ? [a.subscription] : []);
   const sub = a.subscription;
   const refunded = a.status === 'suspended' && a.suspended_reason === 'refund';
@@ -2884,7 +3077,6 @@ function renderBilling() {
           <div class="hint">${sub ? `${sub.auto_renew ? 'Renews' : 'Ends'} ${esc(date(sub.expires_at))}` : 'Choose a plan to get a monthly quota.'}</div>
         </section>
       </div>
-      ${trialLeft > 0 ? alertBox('info', `Includes ${requestsText(trialLeft)} of trial usage`, Number.isFinite(trialEnds) ? `Valid until ${date(trialEnds)}.` : '') : ''}
       ${subs.length > 1 ? `<div class="bill-section"><div class="section-head"><h3>All plans</h3></div>${subs.map(subLine).join('')}</div>` : ''}
       <p class="hint spent-line">Spent so far: ${esc(usd(a.billed_usd))} across all keys.</p>`;
   }
@@ -3790,7 +3982,7 @@ async function oauthConsent() {
             <input id="consent-name" name="name" maxlength="80" value="${esc(clientName.slice(0, 80))}" autocomplete="off">
             <label for="consent-contact">Contact (optional)</label>
             <input id="consent-contact" name="contact" type="email" placeholder="you@example.com" autocomplete="email">
-            <p class="field-help">New accounts get free trial usage. No card needed.</p>
+            <p class="field-help">A key unlocks paid models and higher limits. No card needed.</p>
             <div class="pow" role="status" aria-live="polite" hidden><div class="loading"><span class="spinner" aria-hidden="true"></span><span>Checking that you are human...</span></div><progress max="100" value="0"></progress></div>
             ${clickwrap('Create account')}
             <div class="actions"><button type="button" class="primary" data-make-account>${withIcon('plus', 'Create account')}</button></div>

@@ -1,13 +1,18 @@
 //! Streaming upstream proxy for `/v1/*`.
 //!
-//! JSON bodies are buffered (bounded) so the model and voice policy and the
-//! fallbacks can be applied. Every other body, including multipart uploads,
-//! streams to the upstream. Responses always stream back unchanged while an
-//! [`Inspector`] extracts usage for the [`Meter`].
+//! The request names a public model of the catalog. JSON bodies are buffered
+//! (bounded) so the model can be resolved, free-tier limits applied and the
+//! request replayed on another route. Multipart uploads stream: the prefix up
+//! to the `model` part is buffered, the route is chosen from it, and the rest
+//! streams to that single route. Responses stream back while an [`Inspector`]
+//! extracts usage for the [`Meter`] from the upstream's own bytes. Successful
+//! JSON and event-stream bodies are white-labeled on the way out (see
+//! `rewrite`); every other body is relayed unchanged.
 mod inspect;
 mod models;
 mod multipart;
 pub mod reasoning;
+mod rewrite;
 mod websocket;
 
 pub use inspect::Inspector;
@@ -16,15 +21,20 @@ pub use multipart::Multipart;
 
 use crate::{
     App,
-    config::{Config, Policy, Upstream},
+    config::{Capability, Config, Model, Provider, Tier},
     db,
     error::{Error, Result},
-    identity::{self, Identity, Scope},
+    identity::{self, Caller, Identity},
     meter::{Meter, RequestMeta, Usage},
     money,
+    router::{
+        Permit,
+        free::{self, Admission},
+        hints::{self, Hints},
+    },
 };
 use axum::{
-    body::{Body, to_bytes},
+    body::{Body, BodyDataStream, to_bytes},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, header, request,
     },
@@ -37,14 +47,11 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 
-/// Upstream statuses after which the next fallback model is tried.
-const RETRYABLE: [u16; 5] = [400, 402, 404, 408, 429];
-
-/// Which upstream serves a path.
+/// Which kind of endpoint serves a path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Llm,
@@ -73,29 +80,21 @@ impl Kind {
         }
     }
 
-    pub fn upstream(self, config: &Config) -> &Upstream {
+    /// The capability a model needs to serve this kind of endpoint.
+    pub fn capability(self) -> Capability {
         match self {
-            Self::Llm => &config.llm,
-            Self::Tts => &config.tts,
-            Self::Stt => &config.stt,
-            Self::Image => &config.image,
+            Self::Llm => Capability::Chat,
+            Self::Tts => Capability::Speech,
+            Self::Stt => Capability::Transcription,
+            Self::Image => Capability::Image,
         }
     }
 }
 
-/// Effective timeout for `upstream`.
-pub(crate) fn timeout(config: &Config, upstream: &Upstream) -> Duration {
-    Duration::from_secs(if upstream.timeout_seconds > 0 {
-        upstream.timeout_seconds
-    } else {
-        config.upstream_timeout_seconds
-    })
-}
-
-/// Client headers to forward plus the upstream's configured extra headers.
-pub(crate) fn upstream_headers(client: &HeaderMap, upstream: &Upstream) -> HeaderMap {
+/// Client headers to forward plus the provider's configured extra headers.
+pub(crate) fn upstream_headers(client: &HeaderMap, provider: &Provider) -> HeaderMap {
     let mut headers = forward_headers(client, true);
-    for (name, value) in &upstream.headers {
+    for (name, value) in &provider.headers {
         // Validated when the settings were saved.
         if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), HeaderValue::from_str(value)) {
             headers.insert(name, value);
@@ -121,20 +120,6 @@ pub fn target(base: &str, path: &str, query: Option<&str>) -> Result<url::Url> {
         .map_err(Error::internal)?;
     url.set_query(query);
     Ok(url)
-}
-
-/// Applies `policy` for one JSON field. Returns whether the configured value
-/// was written, so the field no longer holds what the client sent.
-fn apply_policy(body: &mut Value, key: &str, configured: &str, policy: Policy) -> bool {
-    let apply = match policy {
-        Policy::Force => true,
-        Policy::Default => body.get(key).is_none_or(Value::is_null),
-        Policy::Passthrough => false,
-    } && !configured.is_empty();
-    if apply {
-        body[key] = configured.into();
-    }
-    apply
 }
 
 /// Whether a content type names JSON.
@@ -207,13 +192,21 @@ pub(crate) fn forward_headers(input: &HeaderMap, request: bool) -> HeaderMap {
     out
 }
 
-/// Request body after policy rewriting.
+/// The body of a request while it waits for a route.
 enum Payload {
-    /// Buffered JSON object and its serialized form. The form is re-serialized
-    /// when a fallback model is substituted.
+    /// Buffered JSON object and its serialized form. The model (and the
+    /// reasoning effort) is rewritten for each attempt.
     Json(Value, Bytes),
     /// Streamed body. It can be sent only once.
-    Stream(Option<reqwest::Body>),
+    Stream(Option<Upload>),
+}
+
+/// A streamed request body.
+enum Upload {
+    /// Forwarded unchanged.
+    Raw(reqwest::Body),
+    /// A multipart form whose `model` part is rewritten to the route's model.
+    Multipart(Box<PendingUpload>),
 }
 
 /// State shared between the streaming upload (polled by the HTTP client)
@@ -222,95 +215,91 @@ enum Payload {
 struct UploadCounter {
     bytes: Arc<AtomicI64>,
     too_large: Arc<AtomicBool>,
-    observed: Arc<Mutex<Observed>>,
-}
-
-/// What the upload learned about the request while streaming.
-#[derive(Default)]
-struct Observed {
-    /// Effective model from the multipart body.
-    model: Option<String>,
-    /// Why the upload was aborted (the client gets this error, not a 502).
-    rejection: Option<Error>,
+    rejection: Arc<Mutex<Option<Error>>>,
 }
 
 impl UploadCounter {
-    fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
-        self.observed.lock().unwrap_or_else(|e| e.into_inner())
+    /// Takes the reason the upload was aborted (the client gets this error,
+    /// not a 502).
+    fn take_rejection(&self) -> Option<Error> {
+        self.rejection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Records the abort reason (first one wins).
     fn reject(&self, error: Error) -> std::io::Error {
         let message = error.to_string();
-        self.observed().rejection.get_or_insert(error);
+        self.rejection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(error);
         std::io::Error::other(message)
+    }
+
+    /// Counts `len` more uploaded bytes. False when that exceeds `max`.
+    fn add(&self, len: usize, max: usize) -> bool {
+        let len = i64::try_from(len).unwrap_or(i64::MAX);
+        let over = self
+            .bytes
+            .fetch_add(len, Ordering::Relaxed)
+            .saturating_add(len)
+            > i64::try_from(max).unwrap_or(i64::MAX);
+        if over {
+            self.too_large.store(true, Ordering::Relaxed);
+        }
+        !over
     }
 }
 
 /// Proxies one `/v1/*` request.
 pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response<Body>> {
     let config = app.config().await;
-    let identity =
-        identity::authenticate_request(&app, req.headers(), req.extensions(), Scope::Proxy).await?;
+    let caller = identity::caller(&app, req.headers(), req.extensions()).await?;
+    // With the free tier off, a request without a key has nothing to use.
+    if matches!(caller, Caller::Anonymous) && !config.free.enabled {
+        return Err(identity::missing_credential());
+    }
     let path = req.uri().path().to_owned();
     if path == "/v1/models" || path.starts_with("/v1/models/") {
-        return models::serve(&app, identity.as_ref(), &path).await;
+        return models::serve(&app, &caller, &path).await;
     }
     let kind = Kind::of(&path);
-    let upstream = kind.upstream(&config);
-    if upstream.api_key.is_empty() {
-        return Err(Error::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "proxy_configuration_error",
-            "Upstream API key is not configured",
-        ));
-    }
-    let url = target(&upstream.base_url, &path, req.uri().query())?;
     if req
         .headers()
         .get(header::UPGRADE)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
     {
-        return websocket::relay(app.clone(), req, ip, identity, upstream, &config, url).await;
+        return websocket::relay(app.clone(), req, ip, caller, config).await;
     }
 
+    let query = req.uri().query().map(str::to_owned);
     let (parts, body) = req.into_parts();
     let counter = UploadCounter::default();
-    let prepared = prepare(
-        &config,
-        kind,
-        &path,
-        &parts,
-        body,
-        &counter,
-        identity.as_ref(),
-    )
-    .await?;
-    let (model, mut payload) = (prepared.model, prepared.payload);
-    // Reasoning effort: validated and capped for the requested model here,
-    // and again for each fallback model from the original request.
+    let prepared = prepare(&config, kind, &path, &parts, body, &counter, &caller).await?;
+    let model = &config.models[prepared.model];
+    let mut payload = prepared.payload;
+    // Reasoning effort: validated for the model's first route here (a 400
+    // before anything is admitted), and mapped again for the model of each
+    // attempt.
     let mut effort = Effort::default();
     if reasoning::applies(&path)
-        && let Payload::Json(value, bytes) = &mut payload
+        && let Payload::Json(value, _) = &mut payload
     {
         effort.original = reasoning::requested(value)?;
-        effort.free = match &identity {
-            Some(i) => {
-                crate::billing::is_free(&mut *app.db.acquire().await?, &i.account_id).await?
-            }
-            None => false,
-        };
+        effort.free = model.tier == Tier::Free;
         effort.path = Some(path.clone());
+        let mut probe = value.clone();
         reasoning::apply(
-            value,
+            &mut probe,
             &path,
             &config,
-            &model,
+            &model.routes[0].model,
             effort.original.as_ref(),
             effort.free,
             true,
         )?;
-        *bytes = Bytes::from(serde_json::to_vec(value)?);
     }
     let estimate = match &payload {
         Payload::Json(value, bytes) => inspect::worst_case(
@@ -321,44 +310,31 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
         ),
         Payload::Stream(_) => Usage::NONE,
     };
-    let meter = Meter::begin_with(
+    // Free-tier admission is in memory and comes before any database write.
+    let free = free_admission(&app, &config, &caller, model, &ip).await?;
+    let identity = caller.identity().cloned();
+    let route_models: Vec<&str> = model.routes.iter().map(|r| r.model.as_str()).collect();
+    let meter = Meter::begin(
         &app,
         identity.clone(),
         RequestMeta {
             method: parts.method.as_str(),
             path: &path,
             kind: kind.as_str(),
-            model: &model,
+            model: &model.id,
+            tier: model.tier,
+            routes: &route_models,
             ip: &ip,
             estimate: &estimate,
         },
-        !prepared.checked,
     )
-    .await?;
+    .await
+    .map_err(|e| rate_headers(e, free.as_ref()))?;
     let balance = match &identity {
         Some(i) => Some(db::balance(&mut *app.db.acquire().await?, &i.account_id).await?),
         None => None,
     };
 
-    // Fallbacks apply only to JSON requests for the configured model, and
-    // only to models the key may use.
-    let mut models = vec![model.clone()];
-    if matches!(payload, Payload::Json(..))
-        && !upstream.model.is_empty()
-        && model.eq_ignore_ascii_case(&upstream.model)
-    {
-        models.extend(
-            upstream
-                .fallbacks
-                .iter()
-                .filter(|m| {
-                    identity
-                        .as_ref()
-                        .is_none_or(|i| config.upstream_allowed(&i.limits, m))
-                })
-                .cloned(),
-        );
-    }
     // Quantities known from the request: text-to-speech input characters,
     // and the input-token estimate used if an LLM upstream reports no usage.
     let (characters, estimate) = match &payload {
@@ -387,9 +363,10 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
     app.tasks.spawn(
         Exchange {
             app: app.clone(),
-            config,
-            kind,
-            url,
+            config: Arc::clone(&config),
+            model: prepared.model,
+            path,
+            query,
             method: parts.method,
             headers: parts.headers,
             payload,
@@ -397,10 +374,10 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
             meter,
             identity,
             balance,
-            models,
             characters,
             estimate,
             effort,
+            free,
         }
         .run(head_tx),
     );
@@ -409,12 +386,61 @@ pub async fn handle(app: App, req: Request<Body>, ip: String) -> Result<Response
         .map_err(|_| Error::internal("upstream exchange ended without a response"))?
 }
 
+/// Free-tier admission of a request to `model`, or `None` when the request is
+/// not subject to it (a paid model, or the operator).
+///
+/// The client is charged by address, except for a key of a paying or trusted
+/// account, which has a budget of its own.
+async fn free_admission(
+    app: &App,
+    config: &Config,
+    caller: &Caller,
+    model: &Model,
+    ip: &str,
+) -> Result<Option<Admission>> {
+    if model.tier != Tier::Free || matches!(caller, Caller::Operator) {
+        return Ok(None);
+    }
+    let subject = match caller {
+        Caller::Key(identity)
+            if crate::billing::is_paying(&mut *app.db.acquire().await?, &identity.account_id)
+                .await? =>
+        {
+            format!("acct:{}", identity.account_id)
+        }
+        _ => free::ip_subject(ip, config.free.ipv6_prefix),
+    };
+    app.router.free.admit(config, &subject).map(Some)
+}
+
+/// 503 `capacity_exhausted`: no route can take the request for `wait`.
+fn unavailable(wait: Duration) -> Error {
+    Error::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "capacity_exhausted",
+        "No upstream capacity is available for this model right now. Retry shortly",
+    )
+    .retry_after_ms(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Adds the free-tier rate limit headers to an error.
+fn rate_headers(mut error: Error, free: Option<&Admission>) -> Error {
+    if let Some(free) = free {
+        for (name, value) in free.rate.headers() {
+            error = error.with_header(name, value);
+        }
+    }
+    error
+}
+
 /// One proxied upstream exchange, owned by its task.
 struct Exchange {
     app: App,
     config: Arc<Config>,
-    kind: Kind,
-    url: url::Url,
+    /// Index of the model in `config.models`.
+    model: usize,
+    path: String,
+    query: Option<String>,
     method: Method,
     headers: HeaderMap,
     payload: Payload,
@@ -422,36 +448,73 @@ struct Exchange {
     meter: Meter,
     identity: Option<Identity>,
     balance: Option<i64>,
-    /// The requested model followed by its fallbacks.
-    models: Vec<String>,
     characters: i64,
     estimate: Option<i64>,
     effort: Effort,
+    /// The free-tier slot of the request. Dropping it frees the client's
+    /// concurrency.
+    free: Option<Admission>,
 }
 
-/// The reasoning effort of a request, kept to re-apply the policy for each
-/// fallback model.
+/// The reasoning effort of a request, kept to apply the policy again for the
+/// model of each attempt.
 #[derive(Default)]
 struct Effort {
     /// The route, when it carries a reasoning level.
     path: Option<String>,
     original: Option<reasoning::Requested>,
+    /// Requests to free models are capped at `reasoning.free_effort`.
     free: bool,
+}
+
+/// An attempt that did not produce a response to stream.
+enum Failed {
+    /// The upstream answered with an error status.
+    Http {
+        status: StatusCode,
+        /// The body, when it was JSON and small enough to read.
+        raw: Option<Bytes>,
+        headers: HeaderMap,
+    },
+    /// No response head arrived.
+    Transport { timeout: bool },
+}
+
+/// How the attempts ended.
+enum Finished {
+    /// A response to relay, with the permit of its route and the deadline of
+    /// its provider.
+    Stream(reqwest::Response, Permit, tokio::time::Instant),
+    Failed(Failed),
+    /// No route could take the request. The wait is how long until one can.
+    Unavailable(Duration),
 }
 
 /// Chunks buffered between the upstream reader and the client.
 const RELAY_BUFFER: usize = 8;
 
+/// Statuses after which the next route is tried. Server errors are retried
+/// as well.
+fn retryable(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status.as_u16(),
+            400 | 401 | 402 | 403 | 404 | 408 | 409 | 429
+        )
+}
+
 impl Exchange {
-    /// Sends the request (trying fallback models), hands the response head
-    /// to the waiting handler, then relays and inspects the body until the
-    /// upstream finishes, whether or not the client is still listening.
+    /// Picks routes and sends the request (trying the next route after a
+    /// retryable failure), hands the response head to the waiting handler,
+    /// then relays and inspects the body until the upstream finishes, whether
+    /// or not the client is still listening.
     async fn run(self, head: oneshot::Sender<Result<Response<Body>>>) {
         let Self {
             app,
             config,
-            kind,
-            url,
+            model,
+            path,
+            query,
             method,
             headers: client_headers,
             mut payload,
@@ -459,123 +522,280 @@ impl Exchange {
             mut meter,
             identity,
             balance,
-            models,
             characters,
             estimate,
             effort,
+            free,
         } = self;
-        let upstream = kind.upstream(&config);
-        let timeout = timeout(&config, upstream);
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut fallback = None;
-        let mut index = 0;
-        let response = loop {
-            let model = &models[index];
-            let last = index + 1 == models.len();
-            meter.model.clone_from(model);
+        let model = &config.models[model];
+        let replayable = matches!(payload, Payload::Json(..));
+        let max_attempts = if replayable {
+            usize::try_from(config.routing.max_attempts).unwrap_or(1)
+        } else {
+            1
+        };
+        let mut tried: Vec<usize> = Vec::new();
+        // Fallback routes get their own attempts once the others' are spent.
+        let fallbacks = if replayable {
+            model.routes.iter().filter(|r| r.fallback).count()
+        } else {
+            0
+        };
+        let (mut primary_tries, mut fallback_tries) = (0usize, 0usize);
+        let mut failed: Option<Failed> = None;
+        // Routes that refused this request with 400. When a later route
+        // serves it, the refusals were about those routes.
+        let mut refused: Vec<usize> = Vec::new();
+        let finished = loop {
+            let picked =
+                match app
+                    .router
+                    .pick(&config, model, &tried, primary_tries >= max_attempts)
+                {
+                    Ok(picked) => picked,
+                    Err(wait) => {
+                        break match failed.take() {
+                            Some(f) => Finished::Failed(f),
+                            None => Finished::Unavailable(wait),
+                        };
+                    }
+                };
+            tried.push(picked.index);
+            let route = &model.routes[picked.index];
+            if route.fallback {
+                fallback_tries += 1;
+            } else {
+                primary_tries += 1;
+            }
+            let can_retry = primary_tries < max_attempts || fallback_tries < fallbacks;
+            let mut permit = picked.permit;
+            let Some(provider) = config.provider(&route.provider) else {
+                break Finished::Unavailable(Duration::from_secs(1));
+            };
+            let url = match target(&provider.base_url, &path, query.as_deref()) {
+                Ok(url) => url,
+                Err(e) => {
+                    meter.fail(e.status, "invalid proxy path");
+                    settle(meter).await;
+                    let _ = head.send(Err(e));
+                    return;
+                }
+            };
+            let timeout = provider.timeout(config.upstream_timeout_seconds);
+            let deadline = tokio::time::Instant::now() + timeout;
             let mut request = app
                 .client
-                .request(method.clone(), url.clone())
-                .headers(upstream_headers(&client_headers, upstream))
-                .bearer_auth(&upstream.api_key)
+                .request(method.clone(), url)
+                .headers(upstream_headers(&client_headers, provider))
                 .header(header::ACCEPT_ENCODING, "identity")
                 .timeout(timeout);
+            // A provider without a key (a local server) gets no credential.
+            if !provider.api_key.is_empty() {
+                request = request.bearer_auth(&provider.api_key);
+            }
             request = match &mut payload {
                 Payload::Json(value, bytes) => {
-                    if index > 0 {
-                        value["model"] = model.as_str().into();
-                        if let Some(path) = &effort.path {
-                            // Lenient: a level the fallback lacks maps down.
-                            let _ = reasoning::apply(
-                                value,
-                                path,
-                                &config,
-                                model,
-                                effort.original.as_ref(),
-                                effort.free,
-                                false,
-                            );
-                        }
-                        match serde_json::to_vec(value) {
-                            Ok(v) => *bytes = Bytes::from(v),
-                            Err(e) => {
-                                meter.fail(StatusCode::INTERNAL_SERVER_ERROR, "invalid request");
-                                settle(meter).await;
-                                let _ = head.send(Err(Error::internal(e)));
-                                return;
-                            }
+                    value["model"] = route.model.as_str().into();
+                    if let Some(path) = &effort.path {
+                        // Lenient: a level the model lacks maps down.
+                        let _ = reasoning::apply(
+                            value,
+                            path,
+                            &config,
+                            &route.model,
+                            effort.original.as_ref(),
+                            effort.free,
+                            false,
+                        );
+                    }
+                    match serde_json::to_vec(value) {
+                        Ok(v) => *bytes = Bytes::from(v),
+                        Err(e) => {
+                            meter.fail(StatusCode::INTERNAL_SERVER_ERROR, "invalid request");
+                            settle(meter).await;
+                            let _ = head.send(Err(Error::internal(e)));
+                            return;
                         }
                     }
                     request.body(bytes.clone())
                 }
-                Payload::Stream(body) => match body.take() {
-                    Some(body) => request.body(body),
+                Payload::Stream(upload) => match upload.take() {
+                    Some(Upload::Raw(body)) => request.body(body),
+                    Some(Upload::Multipart(pending)) => request.body((*pending).into_body(
+                        &route.model,
+                        counter.clone(),
+                        config.max_stream_body_bytes,
+                    )),
                     None => request,
                 },
             };
+            let started = Instant::now();
             let sent = request.send().await;
-            // The upload may have learned the model or aborted itself.
-            let (observed_model, rejection) = {
-                let mut observed = counter.observed();
-                (observed.model.clone(), observed.rejection.take())
-            };
-            if let Some(model) = observed_model {
-                meter.model = model;
-            }
-            if let Some(error) = rejection {
+            let latency = started.elapsed();
+            // The upload may have aborted itself.
+            if let Some(error) = counter.take_rejection() {
+                permit.finish(None, &Hints::default(), false);
+                meter.attempt(&route.provider, &route.model, 0, latency);
                 meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
                 meter.fail(error.status, &error.to_string());
                 settle(meter).await;
-                let _ = head.send(Err(error));
+                let _ = head.send(Err(rate_headers(error, free.as_ref())));
                 return;
             }
             match sent {
                 Ok(response) => {
                     let status = response.status();
-                    if !last && (status.is_server_error() || RETRYABLE.contains(&status.as_u16())) {
-                        index += 1;
-                        fallback = Some(models[index].clone());
+                    let errored = status.is_client_error() || status.is_server_error();
+                    if !errored {
+                        permit.finish(
+                            Some(status.as_u16()),
+                            &Hints::parse(response.headers(), None),
+                            false,
+                        );
+                        meter.attempt(&route.provider, &route.model, status.as_u16(), latency);
+                        for index in refused.drain(..) {
+                            let other = &model.routes[index];
+                            app.router.refused_where_others_served(
+                                &config.routing,
+                                &other.provider,
+                                &other.model,
+                            );
+                        }
+                        break Finished::Stream(response, permit, deadline);
+                    }
+                    let response_headers = response.headers().clone();
+                    let content_type = response_headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let raw = if is_json(content_type) {
+                        read_capped(response, deadline, UPSTREAM_ERROR_LIMIT).await
+                    } else {
+                        None
+                    };
+                    let parsed: Option<Value> =
+                        raw.as_deref().and_then(|b| serde_json::from_slice(b).ok());
+                    let hints = Hints::parse(&response_headers, parsed.as_ref());
+                    let credit = parsed.as_ref().is_some_and(hints::is_out_of_credit);
+                    permit.finish(Some(status.as_u16()), &hints, credit);
+                    meter.attempt(&route.provider, &route.model, status.as_u16(), latency);
+                    let error = Failed::Http {
+                        status,
+                        raw,
+                        headers: response_headers,
+                    };
+                    if retryable(status) && can_retry {
+                        if status == StatusCode::BAD_REQUEST {
+                            refused.push(picked.index);
+                        }
+                        failed = Some(error);
                         continue;
                     }
-                    break response;
-                }
-                Err(_) if !last => {
-                    index += 1;
-                    fallback = Some(models[index].clone());
+                    break Finished::Failed(error);
                 }
                 Err(e) => {
-                    meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
-                    let (status, code, detail) = if counter.too_large.load(Ordering::Relaxed) {
-                        (
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "request_too_large",
-                            "upload exceeds limit",
-                        )
-                    } else if e.is_timeout() {
-                        (
-                            StatusCode::GATEWAY_TIMEOUT,
-                            "upstream_error",
-                            "upstream timed out",
-                        )
-                    } else {
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            "upstream_error",
-                            "upstream connection failed",
-                        )
+                    permit.finish(None, &Hints::default(), false);
+                    meter.attempt(&route.provider, &route.model, 0, latency);
+                    let error = Failed::Transport {
+                        timeout: e.is_timeout(),
                     };
-                    meter.fail(status, detail);
-                    settle(meter).await;
-                    let _ = head.send(Err(Error::new(
-                        status,
-                        code,
-                        "Upstream request could not be completed",
-                    )));
-                    return;
+                    if can_retry && !counter.too_large.load(Ordering::Relaxed) {
+                        failed = Some(error);
+                        continue;
+                    }
+                    break Finished::Failed(error);
                 }
             }
         };
 
+        let (response, permit, deadline) = match finished {
+            Finished::Stream(response, permit, deadline) => (response, permit, deadline),
+            Finished::Unavailable(wait) => {
+                meter.fail(StatusCode::SERVICE_UNAVAILABLE, "no route available");
+                settle(meter).await;
+                let _ = head.send(Err(rate_headers(unavailable(wait), free.as_ref())));
+                return;
+            }
+            Finished::Failed(Failed::Transport { timeout }) => {
+                meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+                let (status, code, detail) = if counter.too_large.load(Ordering::Relaxed) {
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_too_large",
+                        "upload exceeds limit",
+                    )
+                } else if timeout {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "upstream_error",
+                        "upstream timed out",
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        "upstream connection failed",
+                    )
+                };
+                meter.fail(status, detail);
+                settle(meter).await;
+                let _ = head.send(Err(rate_headers(
+                    Error::new(status, code, "Upstream request could not be completed"),
+                    free.as_ref(),
+                )));
+                return;
+            }
+            Finished::Failed(Failed::Http {
+                status,
+                raw,
+                headers,
+            }) => {
+                // Upstream errors are rebuilt in the API's shape: an error
+                // page that is not JSON (for example an HTML 502 from a
+                // gateway) gets a generic message, and a JSON error keeps only
+                // message, type, param and code, so upstream account details
+                // never reach the customer.
+                meter.status = status.as_u16();
+                meter.success = false;
+                let (out_status, body) = upstream_error(status, raw.as_deref());
+                let mut out_headers =
+                    response_head(&headers, &meter, identity.as_ref(), balance, free.as_ref());
+                if let Ok(h) = &mut out_headers {
+                    if out_status != status {
+                        // A rewritten status (for example 429 to 502) must
+                        // not keep the upstream's retry hint.
+                        h.remove(header::RETRY_AFTER);
+                    }
+                    h.remove(header::CONTENT_ENCODING);
+                    h.remove(header::CONTENT_LENGTH);
+                    h.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                }
+                let body = Bytes::from(body.to_string());
+                meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
+                meter.bytes_out = body.len() as i64;
+                match out_headers {
+                    Ok(h) => {
+                        let mut out = Response::new(Body::from(body));
+                        *out.status_mut() = out_status;
+                        *out.headers_mut() = h;
+                        settle(meter).await;
+                        let _ = head.send(Ok(out));
+                    }
+                    Err(e) => {
+                        meter.fail(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "invalid response headers",
+                        );
+                        settle(meter).await;
+                        let _ = head.send(Err(e));
+                    }
+                }
+                return;
+            }
+        };
         let status = response.status();
         let content_type = response
             .headers()
@@ -586,57 +806,44 @@ impl Exchange {
         meter.status = status.as_u16();
         meter.success = status.is_success();
         let mut inspector = Inspector::new(&content_type);
+        // Successful JSON and event streams name the public model, not the
+        // upstream's, and carry no provider metadata.
+        let mut rewriter = if meter.success {
+            rewrite::Rewriter::new(
+                &content_type,
+                response
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                &model.id,
+                config.max_json_body_bytes,
+            )
+        } else {
+            rewrite::Rewriter::Passthrough
+        };
         if meter.success {
             inspector = inspector.with_characters(characters);
             if let Some(input) = estimate {
                 inspector = inspector.with_estimate(input);
             }
         }
-
-        // Upstream errors are rebuilt in the API's shape: an error page that
-        // is not JSON (for example an HTML 502 from a gateway) gets a generic
-        // message, and a JSON error keeps only message, type, param and code,
-        // so upstream account details (user ids, provider metadata) never
-        // reach the customer.
-        let failed = !status.is_success() && (status.is_client_error() || status.is_server_error());
-        let head_result = response_head(&response, &meter, identity.as_ref(), balance, fallback);
-        let mut response = Some(response);
-        let (out_status, replacement) = if failed {
-            let raw = if is_json(&content_type)
-                && let Some(response) = response.take()
-            {
-                read_capped(response, deadline, UPSTREAM_ERROR_LIMIT).await
-            } else {
-                None
-            };
-            let (out_status, body) = upstream_error(status, raw.as_deref());
-            (out_status, Some(body))
-        } else {
-            (status, None)
-        };
+        let head_result = response_head(
+            response.headers(),
+            &meter,
+            identity.as_ref(),
+            balance,
+            free.as_ref(),
+        );
         let (out_tx, mut out_rx) = mpsc::channel::<std::io::Result<Bytes>>(RELAY_BUFFER);
         let gone = match head_result {
-            Ok(mut headers) => {
-                if out_status != status {
-                    // A rewritten status (for example 429 to 502) must not
-                    // keep the upstream's retry hint.
-                    headers.remove(header::RETRY_AFTER);
-                }
-                if replacement.is_some() {
-                    headers.remove(header::CONTENT_ENCODING);
-                    headers.remove(header::CONTENT_LENGTH);
-                    headers.insert(
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    );
-                }
+            Ok(headers) => {
                 let stream = async_stream::stream! {
                     while let Some(item) = out_rx.recv().await {
                         yield item;
                     }
                 };
                 let mut out = Response::new(Body::from_stream(stream));
-                *out.status_mut() = out_status;
+                *out.status_mut() = status;
                 *out.headers_mut() = headers;
                 head.send(Ok(out)).is_err()
             }
@@ -650,17 +857,6 @@ impl Exchange {
             }
         };
 
-        if let Some(body) = replacement {
-            let body = Bytes::from(body.to_string());
-            meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
-            meter.bytes_out = body.len() as i64;
-            let _ = out_tx.send(Ok(body)).await;
-            settle(meter).await;
-            return;
-        }
-        let Some(response) = response else {
-            return;
-        };
         let mut gone = gone;
         let mut source = response.bytes_stream();
         loop {
@@ -678,17 +874,29 @@ impl Exchange {
                 }
             };
             meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
-            meter.bytes_out = meter.bytes_out.saturating_add(chunk.len() as i64);
             inspector.feed(&chunk);
             meter.usage = inspector.usage();
+            // Metering saw the upstream's bytes; the client gets the
+            // rewritten ones, which are what bytes_out counts.
+            let chunk = rewriter.feed(chunk);
+            meter.bytes_out = meter.bytes_out.saturating_add(chunk.len() as i64);
             // After the client leaves, keep draining (inspecting, not
             // buffering) so end-of-stream usage is still observed.
-            if !gone && out_tx.send(Ok(chunk)).await.is_err() {
+            if !gone && !chunk.is_empty() && out_tx.send(Ok(chunk)).await.is_err() {
                 gone = true;
             }
             if gone && meter.error.is_none() {
                 meter.status = 499;
                 meter.error = Some("client disconnected".into());
+            }
+        }
+        // Whatever the rewriter held back (a buffered JSON body, a last
+        // unterminated line) goes out unless the stream broke.
+        if meter.error.is_none() {
+            let rest = rewriter.finish();
+            meter.bytes_out = meter.bytes_out.saturating_add(rest.len() as i64);
+            if !gone && !rest.is_empty() && out_tx.send(Ok(rest)).await.is_err() {
+                gone = true;
             }
         }
         if gone && meter.error.is_none() {
@@ -698,6 +906,12 @@ impl Exchange {
         meter.bytes_in = counter.bytes.load(Ordering::Relaxed);
         inspector.finish();
         meter.usage = inspector.usage();
+        // Token budgets are charged once the usage is known.
+        let tokens = u64::try_from(meter.usage.total).unwrap_or(0);
+        permit.charge_tokens(tokens);
+        if let Some(free) = &free {
+            free.guard.charge_tokens(tokens);
+        }
         // Settle before closing the body so a client that read to the end
         // can rely on the books being up to date.
         settle(meter).await;
@@ -711,7 +925,6 @@ async fn settle(meter: Meter) {
     }
 }
 
-/// Response headers returned to the client.
 /// Largest upstream error body read for rewriting.
 const UPSTREAM_ERROR_LIMIT: usize = 64 * 1024;
 
@@ -804,14 +1017,17 @@ fn upstream_error(status: StatusCode, raw: Option<&[u8]>) -> (StatusCode, Value)
     (status, body)
 }
 
+/// Response headers returned to the client: the upstream's end-to-end
+/// headers, the request id, the key prefix and balance, and (for free
+/// requests) the rate limit state.
 fn response_head(
-    response: &reqwest::Response,
+    upstream: &HeaderMap,
     meter: &Meter,
     identity: Option<&Identity>,
     balance: Option<i64>,
-    fallback: Option<String>,
+    free: Option<&Admission>,
 ) -> Result<HeaderMap> {
-    let mut headers = forward_headers(response.headers(), false);
+    let mut headers = forward_headers(upstream, false);
     let mut set = |name: &'static str, value: &str| -> Result<()> {
         headers.insert(
             HeaderName::from_static(name),
@@ -826,23 +1042,53 @@ fn response_head(
     if let Some(balance) = balance {
         set("x-account-balance-usd", &money::display(balance))?;
     }
-    if let Some(model) = &fallback {
-        set("x-model-fallback", model)?;
+    if let Some(free) = free {
+        for (name, value) in free.rate.headers() {
+            headers.insert(name, value);
+        }
     }
     Ok(headers)
 }
 
 /// A request body ready to send.
 struct Prepared {
-    /// Effective model (empty when unknown).
-    model: String,
+    /// Index of the resolved model in `config.models`.
+    model: usize,
     payload: Payload,
-    /// The key's allowlist is already enforced, or will be while the upload
-    /// streams, so admission skips it.
-    checked: bool,
 }
 
-/// Reads and rewrites the request body.
+fn index_of(config: &Config, model: &Model) -> usize {
+    config
+        .models
+        .iter()
+        .position(|m| std::ptr::eq(m, model))
+        .expect("the model comes from the catalog")
+}
+
+/// Caps every output token limit of a free request at `max`, and sets one
+/// when the request has none. Chat, completions and responses requests only.
+fn clamp_output_tokens(body: &mut Value, path: &str, max: u32) {
+    let field = match path {
+        "/v1/chat/completions" | "/v1/completions" => "max_tokens",
+        "/v1/responses" => "max_output_tokens",
+        _ => return,
+    };
+    let max = i64::from(max);
+    let mut present = false;
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+        if let Some(n) = body.get(key).filter(|v| !v.is_null()) {
+            present = true;
+            if n.as_i64().is_none_or(|n| n > max) {
+                body[key] = max.into();
+            }
+        }
+    }
+    if !present {
+        body[field] = max.into();
+    }
+}
+
+/// Reads the request body and resolves its model.
 async fn prepare(
     config: &Arc<Config>,
     kind: Kind,
@@ -850,51 +1096,66 @@ async fn prepare(
     parts: &request::Parts,
     body: Body,
     counter: &UploadCounter,
-    identity: Option<&Identity>,
+    caller: &Caller,
 ) -> Result<Prepared> {
-    let upstream = kind.upstream(config);
     let content_type = parts
         .headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let capability = kind.capability();
+    // The free-tier rules do not apply to the operator.
+    let limited = !matches!(caller, Caller::Operator);
 
     // Everything except multipart uploads and speech-to-text is read as JSON,
-    // whatever the Content-Type says, so a mislabelled body cannot skip the
-    // model policy, allowlist, or billing. Only an empty body passes through.
+    // whatever the Content-Type says, so a mislabelled body cannot skip model
+    // resolution, allowlists, or billing. Only an empty body passes through.
     if is_json(content_type) || (kind != Kind::Stt && multipart::boundary(content_type).is_none()) {
-        let bytes = to_bytes(body, config.max_json_body_bytes)
+        // Anonymous callers can only use free models: bound the read by the
+        // free body limit.
+        let read_limit = match caller {
+            Caller::Anonymous if config.free.max_body_bytes > 0 => {
+                config.max_json_body_bytes.min(config.free.max_body_bytes)
+            }
+            _ => config.max_json_body_bytes,
+        };
+        let bytes = to_bytes(body, read_limit)
             .await
             .map_err(|_| Error::too_large("JSON body exceeds limit"))?;
         counter.bytes.store(bytes.len() as i64, Ordering::Relaxed);
         if bytes.is_empty() && !is_json(content_type) {
+            let model = models::resolve(config, caller, capability, None)?;
             return Ok(Prepared {
-                model: String::new(),
-                payload: Payload::Stream(Some(reqwest::Body::from(bytes))),
-                checked: false,
+                model: index_of(config, model),
+                payload: Payload::Stream(Some(Upload::Raw(reqwest::Body::from(bytes)))),
             });
         }
         let mut value: Value = serde_json::from_slice(&bytes)?;
         if !value.is_object() {
             return Err(Error::bad("JSON body must be an object"));
         }
-        let filled = apply_policy(&mut value, "model", &upstream.model, config.model_policy);
-        if kind == Kind::Tts {
-            apply_policy(&mut value, "voice", &upstream.voice, config.voice_policy);
-        }
-        let mut model = match value.get("model") {
-            None | Some(Value::Null) => String::new(),
-            Some(Value::String(m)) => m.clone(),
+        let requested = match value.get("model") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(m)) => Some(m.clone()),
             Some(_) => return Err(Error::bad("model must be a string")),
         };
-        // A model the client chose is a public name. The one the policy wrote
-        // is already the upstream's.
-        let resolved = !filled && !model.is_empty() && !config.models.is_empty();
-        if resolved {
-            model = models::resolve(config, identity, &model)?
-                .upstream_name()
-                .to_owned();
-            value["model"] = model.clone().into();
+        let model = models::resolve(config, caller, capability, requested.as_deref())?;
+        let free = model.tier == Tier::Free && limited;
+        if free && config.free.max_body_bytes > 0 && bytes.len() > config.free.max_body_bytes {
+            return Err(Error::too_large(format!(
+                "Free requests accept bodies of at most {} bytes",
+                config.free.max_body_bytes
+            )));
+        }
+        value["model"] = model.id.clone().into();
+        if kind == Kind::Tts
+            && !model.voice.is_empty()
+            && value.get("voice").is_none_or(Value::is_null)
+        {
+            value["voice"] = model.voice.clone().into();
+        }
+        if free && config.free.max_output_tokens > 0 {
+            clamp_output_tokens(&mut value, path, config.free.max_output_tokens);
         }
         if path == "/v1/chat/completions" && value["stream"] == true {
             // Ask for the final usage chunk so streamed responses can be billed.
@@ -908,9 +1169,8 @@ async fn prepare(
         }
         let bytes = Bytes::from(serde_json::to_vec(&value)?);
         return Ok(Prepared {
-            model,
+            model: index_of(config, model),
             payload: Payload::Json(value, bytes),
-            checked: resolved,
         });
     }
 
@@ -924,109 +1184,198 @@ async fn prepare(
     {
         return Err(Error::too_large("Upload exceeds limit"));
     }
-    // Multipart bodies are always parsed so the client's model is seen,
-    // whatever the policy. Only the rewrite itself depends on it.
-    let configured = upstream.model.as_str();
-    let identity = identity.cloned();
-    let mut parser = multipart::boundary(content_type).map(|boundary| {
-        let parser = Multipart::new(
-            &boundary,
-            configured,
-            config.model_policy == Policy::Force && !configured.is_empty(),
-            config.model_policy != Policy::Passthrough && !configured.is_empty(),
-        );
-        if config.models.is_empty() {
-            return parser;
-        }
-        let (config, identity) = (Arc::clone(config), identity.clone());
-        parser.with_resolver(move |requested| {
-            models::resolve(&config, identity.as_ref(), requested)
-                .map(|m| m.upstream_name().to_owned())
-        })
-    });
-    // A forced multipart model is known up front, so admission, metering,
-    // and allowlists see it.
-    let force = parser.is_some() && config.model_policy == Policy::Force && !configured.is_empty();
-    let model = if force {
-        configured.to_owned()
-    } else {
-        String::new()
-    };
-    let checked = parser.is_some() && !force;
-    let counter = counter.clone();
-    let config = Arc::clone(config);
-    let mut source = body.into_data_stream();
-    let upload = async_stream::stream! {
-        while let Some(chunk) = source.next().await {
-            let chunk = chunk.map_err(std::io::Error::other)?;
-            let len = chunk.len() as i64;
-            if counter.bytes.fetch_add(len, Ordering::Relaxed) + len > max as i64 {
-                counter.too_large.store(true, Ordering::Relaxed);
-                yield Err(std::io::Error::other("upload exceeds limit"));
-                return;
-            }
-            match &mut parser {
-                Some(p) => {
-                    let out = match p.push(&chunk) {
-                        Ok(out) => out,
-                        Err(e) => {
-                            yield Err(counter.reject(e));
-                            return;
-                        }
-                    };
-                    if let Err(e) = observe_models(p, &counter, &config, identity.as_ref()) {
-                        yield Err(e);
-                        return;
-                    }
-                    if !out.is_empty() {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
-                    }
+    let Some(boundary) = multipart::boundary(content_type) else {
+        // Not a form: the model cannot be read or rewritten.
+        let model = models::resolve(config, caller, capability, None)?;
+        let counter = counter.clone();
+        let mut source = body.into_data_stream();
+        let upload = async_stream::stream! {
+            while let Some(chunk) = source.next().await {
+                let chunk = chunk.map_err(std::io::Error::other)?;
+                if !counter.add(chunk.len(), max) {
+                    yield Err(std::io::Error::other("upload exceeds limit"));
+                    return;
                 }
-                None => yield Ok(chunk),
+                yield Ok::<Bytes, std::io::Error>(chunk);
             }
-        }
-        if let Some(p) = &mut parser {
-            let out = p.finish();
-            if counter.observed().model.is_none()
-                && identity.as_ref().is_some_and(|i| !i.limits.allowed_models.is_empty())
-            {
-                yield Err(counter.reject(Error::model_not_found("")));
-                return;
-            }
-            if !out.is_empty() {
-                yield Ok(Bytes::from(out));
-            }
-        }
+        };
+        return Ok(Prepared {
+            model: index_of(config, model),
+            payload: Payload::Stream(Some(Upload::Raw(reqwest::Body::wrap_stream(upload)))),
+        });
     };
+    let mut pending = PendingUpload::read(config, &boundary, body, counter).await?;
+    let model = models::resolve(config, caller, capability, pending.requested.as_deref())?;
+    // Later `model` parts must name the same model.
+    let bound = Bound {
+        config: Arc::clone(config),
+        caller: caller.clone(),
+        capability,
+        id: model.id.clone(),
+    };
+    for later in &pending.later {
+        check_same_model(&bound, later)?;
+    }
+    pending.bound = Some(bound);
     Ok(Prepared {
-        model,
-        payload: Payload::Stream(Some(reqwest::Body::wrap_stream(upload))),
-        checked,
+        model: index_of(config, model),
+        payload: Payload::Stream(Some(Upload::Multipart(Box::new(pending)))),
     })
 }
 
-/// Applies newly completed multipart model parts: records the effective
-/// model for metering and enforces the key's allowlist, aborting the upload
-/// with a `model_not_found` rejection when it does not pass. Models the
-/// catalog resolved already passed it.
-fn observe_models(
-    parser: &mut Multipart,
-    counter: &UploadCounter,
-    config: &Config,
-    identity: Option<&Identity>,
-) -> std::result::Result<(), std::io::Error> {
-    for model in parser.take_resolved() {
-        counter.observed().model = Some(model);
-    }
-    for model in parser.take_models() {
-        counter.observed().model = Some(model.clone());
-        if let Some(identity) = identity
-            && let Err(e) = crate::meter::check_model(config, identity, &model)
-        {
-            return Err(counter.reject(e));
+/// The start of a multipart upload, read until its `model` part completed
+/// (or a bounded amount of it), and the rest of the stream.
+struct PendingUpload {
+    boundary: String,
+    /// Everything read so far, unmodified.
+    prefix: Vec<u8>,
+    /// The rest of the body, or `None` when it ended while the prefix was read.
+    rest: Option<BodyDataStream>,
+    /// Follows the model parts of the rest of the body.
+    sniff: Multipart,
+    /// The first `model` part, when the prefix holds one.
+    requested: Option<String>,
+    /// Further `model` parts of the prefix.
+    later: Vec<String>,
+    /// The resolved model, for checking later parts. Set once it is known.
+    bound: Option<Bound>,
+}
+
+/// What later `model` parts are compared with.
+struct Bound {
+    config: Arc<Config>,
+    caller: Caller,
+    capability: Capability,
+    id: String,
+}
+
+impl PendingUpload {
+    /// Reads the body until the first `model` part is complete, or until
+    /// `max_json_body_bytes` were buffered, or the body ends.
+    async fn read(
+        config: &Arc<Config>,
+        boundary: &str,
+        body: Body,
+        counter: &UploadCounter,
+    ) -> Result<Self> {
+        let max = config.max_stream_body_bytes;
+        let mut sniff = Multipart::new(boundary, "", false, false);
+        let mut rest = body.into_data_stream();
+        let mut prefix = Vec::new();
+        let mut models = Vec::new();
+        let mut ended = false;
+        loop {
+            let Some(chunk) = rest.next().await else {
+                ended = true;
+                break;
+            };
+            let chunk = chunk.map_err(|_| Error::bad("The upload was interrupted"))?;
+            if !counter.add(chunk.len(), max) {
+                return Err(Error::too_large("Upload exceeds limit"));
+            }
+            sniff.push(&chunk)?;
+            prefix.extend_from_slice(&chunk);
+            models.extend(sniff.take_models());
+            if !models.is_empty() || prefix.len() > config.max_json_body_bytes {
+                break;
+            }
         }
+        let mut models = models.into_iter();
+        Ok(Self {
+            boundary: boundary.to_owned(),
+            prefix,
+            rest: (!ended).then_some(rest),
+            sniff,
+            requested: models.next(),
+            later: models.collect(),
+            bound: None,
+        })
     }
-    Ok(())
+
+    /// The upload body, with the `model` part rewritten to `route_model`.
+    /// A form without one gains it at the end.
+    fn into_body(self, route_model: &str, counter: UploadCounter, max: usize) -> reqwest::Body {
+        let Self {
+            boundary,
+            prefix,
+            mut rest,
+            mut sniff,
+            bound,
+            ..
+        } = self;
+        let mut rewrite = Multipart::new(&boundary, route_model, true, true);
+        let upload = async_stream::stream! {
+            match rewrite.push(&prefix) {
+                Ok(out) if !out.is_empty() => yield Ok::<Bytes, std::io::Error>(Bytes::from(out)),
+                Ok(_) => {}
+                Err(e) => {
+                    yield Err(counter.reject(e));
+                    return;
+                }
+            }
+            loop {
+                let next = match rest.as_mut() {
+                    Some(rest) => rest.next().await,
+                    None => None,
+                };
+                let Some(chunk) = next else { break };
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        yield Err(std::io::Error::other(e));
+                        return;
+                    }
+                };
+                if !counter.add(chunk.len(), max) {
+                    yield Err(std::io::Error::other("upload exceeds limit"));
+                    return;
+                }
+                if let Err(e) = sniff.push(&chunk) {
+                    yield Err(counter.reject(e));
+                    return;
+                }
+                if let Some(bound) = &bound {
+                    for value in sniff.take_models() {
+                        if let Err(e) = check_same_model(bound, &value) {
+                            yield Err(counter.reject(e));
+                            return;
+                        }
+                    }
+                }
+                match rewrite.push(&chunk) {
+                    Ok(out) if !out.is_empty() => yield Ok(Bytes::from(out)),
+                    Ok(_) => {}
+                    Err(e) => {
+                        yield Err(counter.reject(e));
+                        return;
+                    }
+                }
+            }
+            let out = rewrite.finish();
+            if !out.is_empty() {
+                yield Ok(Bytes::from(out));
+            }
+        };
+        reqwest::Body::wrap_stream(upload)
+    }
+}
+
+/// Fails with `model_must_precede_file` when `value` (a `model` part) names
+/// another model than the one the request resolved to.
+fn check_same_model(bound: &Bound, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let model = models::resolve(&bound.config, &bound.caller, bound.capability, Some(value))?;
+    if model.id == bound.id {
+        Ok(())
+    } else {
+        Err(
+            Error::bad("The model part must come before the file and may not change")
+                .with_code("model_must_precede_file")
+                .with_param("model"),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1091,5 +1440,56 @@ mod tests {
         assert_eq!(out, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["type"], "server_error");
         assert!(body["error"]["message"].as_str().unwrap().contains("503"));
+    }
+
+    #[test]
+    fn output_tokens_are_clamped_or_injected_for_free_requests() {
+        use serde_json::json;
+        let chat = "/v1/chat/completions";
+        let mut body = json!({"max_tokens": 100000, "max_completion_tokens": 50});
+        clamp_output_tokens(&mut body, chat, 4096);
+        assert_eq!(
+            body,
+            json!({"max_tokens": 4096, "max_completion_tokens": 50})
+        );
+        let mut body = json!({"messages": []});
+        clamp_output_tokens(&mut body, chat, 4096);
+        assert_eq!(body["max_tokens"], 4096);
+        let mut body = json!({"input": "x", "max_output_tokens": 9000});
+        clamp_output_tokens(&mut body, "/v1/responses", 4096);
+        assert_eq!(body["max_output_tokens"], 4096);
+        let mut body = json!({"input": "x"});
+        clamp_output_tokens(&mut body, "/v1/responses", 4096);
+        assert_eq!(body["max_output_tokens"], 4096);
+        // A nonsense value is replaced, and other routes are untouched.
+        let mut body = json!({"max_tokens": "lots"});
+        clamp_output_tokens(&mut body, "/v1/completions", 10);
+        assert_eq!(body["max_tokens"], 10);
+        let mut body = json!({"input": "x"});
+        clamp_output_tokens(&mut body, "/v1/embeddings", 10);
+        assert_eq!(body, json!({"input": "x"}));
+    }
+
+    #[test]
+    fn failures_fall_through_to_the_next_route() {
+        for code in [400, 401, 402, 403, 404, 408, 409, 429, 500, 502, 503, 504] {
+            assert!(retryable(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+        for code in [200, 301, 413, 422] {
+            assert!(!retryable(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+    }
+
+    #[test]
+    fn endpoints_need_the_matching_capability() {
+        for (path, capability) in [
+            ("/v1/chat/completions", Capability::Chat),
+            ("/v1/embeddings", Capability::Chat),
+            ("/v1/audio/speech", Capability::Speech),
+            ("/v1/audio/transcriptions", Capability::Transcription),
+            ("/v1/images/generations", Capability::Image),
+        ] {
+            assert_eq!(Kind::of(path).capability(), capability, "{path}");
+        }
     }
 }

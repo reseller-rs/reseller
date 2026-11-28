@@ -376,10 +376,16 @@ fn request_filters(sql: &mut QueryBuilder<Sqlite>, account: Option<&str>, q: &Qu
     if let Some(account) = account {
         sql.push(" AND account_id=").push_bind(account.to_owned());
     }
+    // Customers see and filter by the public model id, never the upstream's.
+    let model = if account.is_some() {
+        "public_model"
+    } else {
+        "model"
+    };
     for (param, column) in [
         ("key", "key_id"),
         ("account", "account_id"),
-        ("model", "model"),
+        ("model", model),
         ("kind", "kind"),
         ("path", "path"),
         ("ip", "ip"),
@@ -403,7 +409,7 @@ fn request_filters(sql: &mut QueryBuilder<Sqlite>, account: Option<&str>, q: &Qu
     }
     if let Some(v) = q.get("q") {
         let like = like(v);
-        sql.push(" AND (model LIKE ")
+        sql.push(format_args!(" AND ({model} LIKE "))
             .push_bind(like.clone())
             .push(" ESCAPE '\\' OR path LIKE ")
             .push_bind(like.clone())
@@ -429,7 +435,10 @@ async fn requests(app: &App, account: Option<&str>, q: &Query, grouped: bool) ->
     let page = Page::from(q);
     if grouped {
         let field = match q.get("field").map(String::as_str).unwrap_or("model") {
+            "model" if account.is_some() => "public_model",
             "model" => "model",
+            "provider" if account.is_none() => "provider",
+            "tier" => "tier",
             "ip" => "ip",
             "status" => "status",
             "kind" => "kind",
@@ -473,11 +482,16 @@ async fn requests(app: &App, account: Option<&str>, q: &Query, grouped: bool) ->
         .iter()
         .map(|r| {
             let mut v = row_json(r);
-            // Customers see what they were billed, never the provider cost.
+            // Customers see what they were billed, never the provider cost,
+            // the provider, or the upstream's model name.
             if account.is_some()
                 && let Some(row) = v.as_object_mut()
             {
                 row.remove("upstream_usd");
+                row.remove("provider");
+                if let Some(public) = row.remove("public_model") {
+                    row.insert("model".into(), public);
+                }
             }
             v
         })

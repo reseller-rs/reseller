@@ -8,7 +8,7 @@ use axum::{
 };
 use reseller::{
     App, billing,
-    config::{Config, Policy},
+    config::{Capability, Config, Tier},
     db, identity, keys,
     meter::{Meter, RequestMeta, Usage},
     money,
@@ -24,6 +24,8 @@ use std::{
 };
 use tower::ServiceExt;
 
+mod common;
+
 struct Test {
     app: App,
     _dir: tempfile::TempDir,
@@ -37,7 +39,6 @@ impl Test {
             key_pepper: "pepper-test-secret-12345678".into(),
             signup: reseller::config::Signup {
                 cooldown_seconds: 0,
-                ip_limit_per_month: 0,
                 global_hourly_limit: 0,
                 pow_max_number: 0,
                 ..Default::default()
@@ -54,15 +55,18 @@ impl Test {
             _dir: dir,
         }
     }
+    /// A new account with 0.10 USD of credit.
     async fn key(&self) -> Value {
-        keys::create(
+        let key = keys::create(
             &self.app,
             keys::Requester::Signup { altcha: None },
             "127.0.0.1",
             &json!({"name":"test"}),
         )
         .await
-        .unwrap()
+        .unwrap();
+        common::fund(&self.app, key["account_id"].as_str().unwrap(), common::DIME).await;
+        key
     }
     async fn call(
         &self,
@@ -130,6 +134,8 @@ fn meta() -> RequestMeta<'static> {
         path: "/v1/chat/completions",
         kind: "llm",
         model: "test-model",
+        tier: Tier::Paid,
+        routes: &[],
         ip: "127.0.0.1",
         estimate: &Usage::NONE,
     }
@@ -253,9 +259,9 @@ async fn signup_hashes_secrets_and_dashboard_cannot_proxy() {
     );
 }
 #[tokio::test]
-async fn concurrent_signup_cannot_exceed_monthly_allowance() {
+async fn concurrent_signups_cannot_beat_the_cooldown() {
     let t = Test::new().await;
-    t.app.config_mut().await.signup.ip_limit_per_month = 2;
+    t.app.config_mut().await.signup.cooldown_seconds = 60;
     let mut tasks = Vec::new();
     for _ in 0..12 {
         let app = t.app.clone();
@@ -275,15 +281,15 @@ async fn concurrent_signup_cannot_exceed_monthly_allowance() {
             successes += 1;
         }
     }
-    assert_eq!(successes, 2);
+    assert_eq!(successes, 1);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
         .fetch_one(&t.app.db)
         .await
         .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 1);
 }
 #[tokio::test]
-async fn child_keys_share_credit_without_trial_mining() {
+async fn child_keys_share_the_accounts_credit_and_add_none() {
     let t = Test::new().await;
     let k = t.key().await;
     let i = t.identity(&k).await;
@@ -497,35 +503,10 @@ async fn redemption_is_atomic_under_retries() {
     );
 }
 #[tokio::test]
-async fn plan_grants_expiring_credit_and_frees_the_signup_allowance() {
+async fn plan_grants_expiring_credit() {
     let t = Test::new().await;
     let k = t.key().await;
     let aid = k["account_id"].as_str().unwrap();
-    t.app.config_mut().await.signup.ip_limit_per_month = 1;
-    let i = t.identity(&k).await;
-    let body = json!({});
-    let signup = || {
-        keys::create(
-            &t.app,
-            keys::Requester::Signup { altcha: None },
-            "127.0.0.1",
-            &body,
-        )
-    };
-    // Keys on the existing account never count against the address.
-    assert!(
-        keys::create(
-            &t.app,
-            keys::Requester::Customer(&i),
-            "127.0.0.1",
-            &json!({})
-        )
-        .await
-        .is_ok()
-    );
-    // A second free account from the same address is over the allowance.
-    let blocked = signup().await.unwrap_err();
-    assert_eq!(blocked.code, "ip_signup_limit");
     let (s, _) = t
         .call(
             "POST",
@@ -535,8 +516,6 @@ async fn plan_grants_expiring_credit_and_frees_the_signup_allowance() {
         )
         .await;
     assert_eq!(s, 200);
-    // A subscribed account no longer uses up the free allowance.
-    assert!(signup().await.is_ok());
     let v = billing::account(&t.app, aid).await.unwrap();
     assert_eq!(v["account"]["balance_usd"], "20.1");
     assert!(v["account"]["subscription"]["expires_at"].as_i64().unwrap() > db::now());
@@ -556,16 +535,11 @@ async fn request_admission_counts_concurrent_inflight_requests() {
     m.finish().await.unwrap();
 }
 #[tokio::test]
-async fn rpm_is_persistent_and_model_allowlist_applies() {
+async fn rpm_is_persistent() {
     let t = Test::new().await;
     let k = t.key().await;
     let mut i = t.identity(&k).await;
     i.limits.rpm = Some(1);
-    i.limits.allowed_models = vec!["other".into()];
-    assert!(
-        matches!(Meter::begin(&t.app,Some(i.clone()),meta()).await,Err(e) if e.code=="model_not_found")
-    );
-    i.limits.allowed_models = vec!["test-model".into()];
     Meter::begin(&t.app, Some(i.clone()), meta())
         .await
         .unwrap()
@@ -633,7 +607,7 @@ async fn settings_are_redacted_validated_and_persisted() {
             "PATCH",
             "/admin/api/settings",
             Some(ADMIN),
-            json!({"llm":{"base_url":"file:///secret"}})
+            json!({"providers":[{"id":"x","base_url":"file:///secret"}]})
         )
         .await
         .0,
@@ -677,9 +651,8 @@ async fn json_proxy_rewrites_model_strips_secrets_and_bills() {
  }}))).await;
     {
         let mut c = t.app.config_mut().await;
-        c.llm.base_url = format!("{base}/api/v1");
-        c.llm.api_key = "upstream-secret".into();
-        c.llm.model = "configured".into();
+        common::llm(&mut c, "configured");
+        common::point(&mut c, "llm", &format!("{base}/api/v1"), "upstream-secret");
     }
     let k = t.key().await;
     let req = Request::builder()
@@ -717,8 +690,8 @@ async fn sse_proxy_streams_before_upstream_finishes_and_tracks_final_usage() {
  })) ).await;
     {
         let mut c = t.app.config_mut().await;
-        c.llm.base_url = format!("{base}/v1");
-        c.llm.api_key = "upstream".into();
+        common::llm(&mut c, "m");
+        common::point(&mut c, "llm", &format!("{base}/v1"), "upstream");
     }
     let k = t.key().await;
     let req = Request::builder()
@@ -750,7 +723,7 @@ async fn sse_proxy_streams_before_upstream_finishes_and_tracks_final_usage() {
     task.abort();
 }
 #[tokio::test]
-async fn fallback_retries_configured_models_only() {
+async fn fallback_retries_the_models_own_routes_only() {
     let t = Test::new().await;
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = hits.clone();
@@ -778,11 +751,18 @@ async fn fallback_retries_configured_models_only() {
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.llm.base_url = format!("{base}/v1");
-        c.llm.api_key = "upstream".into();
-        c.llm.model = "primary".into();
-        c.llm.fallbacks = vec!["backup".into()];
-        c.model_policy = Policy::Default;
+        common::llm(&mut c, "primary");
+        common::ordered(&mut c, "primary");
+        common::add_route(&mut c, "primary", "llm", "backup");
+        common::model(
+            &mut c,
+            "custom",
+            Capability::Chat,
+            Tier::Paid,
+            "llm",
+            "custom",
+        );
+        common::point(&mut c, "llm", &format!("{base}/v1"), "upstream");
     }
     let k = t.key().await;
     assert_eq!(
@@ -812,7 +792,7 @@ async fn fallback_retries_configured_models_only() {
     task.abort();
 }
 #[tokio::test]
-async fn fallback_skips_models_outside_the_key_allowlist() {
+async fn the_allowlist_names_public_models_and_every_route_of_one_is_usable() {
     let t = Test::new().await;
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let log = seen.clone();
@@ -834,10 +814,19 @@ async fn fallback_skips_models_outside_the_key_allowlist() {
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.llm.base_url = format!("{base}/v1");
-        c.llm.api_key = "upstream".into();
-        c.llm.model = "primary".into();
-        c.llm.fallbacks = vec!["forbidden".into(), "second".into()];
+        common::llm(&mut c, "primary");
+        common::ordered(&mut c, "primary");
+        common::add_route(&mut c, "primary", "llm", "forbidden");
+        common::add_route(&mut c, "primary", "llm", "second");
+        common::model(
+            &mut c,
+            "forbidden",
+            Capability::Chat,
+            Tier::Paid,
+            "llm",
+            "forbidden",
+        );
+        common::point(&mut c, "llm", &format!("{base}/v1"), "upstream");
     }
     let k = t.key().await;
     let (status, _) = t
@@ -845,7 +834,7 @@ async fn fallback_skips_models_outside_the_key_allowlist() {
             "PATCH",
             &format!("/admin/api/keys/{}", k["id"].as_str().unwrap()),
             Some(ADMIN),
-            json!({"limits":{"allowed_models":["primary","second"]}}),
+            json!({"limits":{"allowed_models":["primary"]}}),
         )
         .await;
     assert_eq!(status, 200);
@@ -858,12 +847,25 @@ async fn fallback_skips_models_outside_the_key_allowlist() {
         )
         .await;
     assert_eq!(status, 200);
-    assert_eq!(*seen.lock().unwrap(), ["primary", "second"]);
-    let logged: String = sqlx::query_scalar("SELECT model FROM requests WHERE status=200")
-        .fetch_one(&t.app.db)
-        .await
-        .unwrap();
-    assert_eq!(logged, "second");
+    assert_eq!(*seen.lock().unwrap(), ["primary", "forbidden", "second"]);
+    let logged: (String, String, i64) =
+        sqlx::query_as("SELECT model,public_model,attempts FROM requests WHERE status=200")
+            .fetch_one(&t.app.db)
+            .await
+            .unwrap();
+    assert_eq!(logged, ("second".into(), "primary".into(), 3));
+    // Another public model is outside the allowlist, even though its route
+    // is one the allowed model uses.
+    let (status, v) = t
+        .call(
+            "POST",
+            "/v1/chat/completions",
+            k["key"].as_str(),
+            json!({"model":"forbidden","messages":[]}),
+        )
+        .await;
+    assert_eq!(status, 404, "{v}");
+    assert_eq!(seen.lock().unwrap().len(), 3);
     task.abort();
 }
 #[tokio::test]
@@ -882,8 +884,8 @@ async fn multipart_is_streamed_unchanged_to_stt() {
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.stt.base_url = format!("{base}/api");
-        c.stt.api_key = "stt-secret".into();
+        common::serve(&mut c, "stt", Capability::Transcription, "whisper-1");
+        common::point(&mut c, "stt", &format!("{base}/api"), "stt-secret");
     }
     let k = t.key().await;
     let req = Request::builder()
@@ -903,12 +905,12 @@ async fn multipart_is_streamed_unchanged_to_stt() {
     to_bytes(r.into_body(), 10000).await.unwrap();
     task.abort();
 }
-/// A multipart STT upload obeys model_policy = "force" like JSON routes: the
-/// body's model field is replaced, the audio payload streams through, the
-/// request is admitted against the configured model (not ""), and the metered
-/// model is the configured one.
+/// A multipart STT upload names a public model: the body's model field is
+/// replaced by the route's upstream model, the audio payload streams through,
+/// the allowlist applies to the public name, and the request is metered under
+/// both names.
 #[tokio::test]
-async fn multipart_stt_model_follows_force_policy() {
+async fn multipart_stt_model_is_replaced_by_the_routes_model() {
     let t = Test::new().await;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
     let (base, task) = upstream(Router::new().fallback(any(move |req: Request<Body>| {
@@ -923,14 +925,18 @@ async fn multipart_stt_model_follows_force_policy() {
     .await;
     {
         let mut c = t.app.config_mut().await;
-        c.stt.base_url = format!("{base}/api");
-        c.stt.api_key = "stt-secret".into();
-        c.stt.model = "configured-stt".into();
-        c.model_policy = Policy::Force;
+        common::model(
+            &mut c,
+            "configured-stt",
+            Capability::Transcription,
+            Tier::Paid,
+            "stt",
+            "vendor/stt",
+        );
+        common::point(&mut c, "stt", &format!("{base}/api"), "stt-secret");
     }
     let k = t.key().await;
-    // Allowlist only the configured model: before the rewrite, opaque
-    // multipart bodies were admitted with model = "" and would 403 here.
+    // Allowlist only the public model.
     let (s, v) = t
         .call(
             "PATCH",
@@ -941,7 +947,7 @@ async fn multipart_stt_model_follows_force_policy() {
         .await;
     assert_eq!(s, 200, "{v}");
 
-    let payload = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n\x00\x01AUDIO\xff\r\n--b--\r\n".to_vec();
+    let payload = b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nconfigured-stt\r\n--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n\x00\x01AUDIO\xff\r\n--b--\r\n".to_vec();
     let req = Request::builder()
         .method("POST")
         .uri("/v1/audio/transcriptions")
@@ -960,21 +966,18 @@ async fn multipart_stt_model_follows_force_policy() {
 
     let forwarded = rx.recv().await.unwrap();
     let s = String::from_utf8_lossy(&forwarded);
-    assert!(
-        s.contains("name=\"model\"\r\n\r\nconfigured-stt\r\n"),
-        "{s}"
-    );
-    assert!(!s.contains("whisper-1"), "{s}");
+    assert!(s.contains("name=\"model\"\r\n\r\nvendor/stt\r\n"), "{s}");
+    assert!(!s.contains("configured-stt"), "{s}");
     assert!(
         forwarded.windows(8).any(|w| w == &b"\x00\x01AUDIO\xff"[..]),
         "audio payload must stream through"
     );
-    let metered: String =
-        sqlx::query_scalar("SELECT model FROM requests ORDER BY created_at DESC LIMIT 1")
+    let metered: (String, String) =
+        sqlx::query_as("SELECT model,public_model FROM requests ORDER BY created_at DESC LIMIT 1")
             .fetch_one(&t.app.db)
             .await
             .unwrap();
-    assert_eq!(metered, "configured-stt");
+    assert_eq!(metered, ("vendor/stt".into(), "configured-stt".into()));
     task.abort();
 }
 #[tokio::test]
@@ -984,7 +987,6 @@ async fn request_body_limit_is_enforced_before_upstream() {
     {
         let mut c = t.app.config_mut().await;
         c.max_json_body_bytes = 10;
-        c.llm.api_key = "upstream".into();
     }
     assert_eq!(
         t.call(
@@ -999,33 +1001,51 @@ async fn request_body_limit_is_enforced_before_upstream() {
     );
 }
 #[tokio::test]
-async fn anonymous_mode_does_not_bill_accounts() {
+async fn anonymous_and_operator_callers_are_not_billed() {
+    use identity::Caller;
     let t = Test::new().await;
-    {
-        let mut c = t.app.config_mut().await;
-        c.require_key = false;
-        c.accept_any_token = false;
+    let k = t.key().await;
+    let caller = |token: Option<&str>| {
+        let app = t.app.clone();
+        let token = token.map(str::to_owned);
+        async move {
+            let mut h = HeaderMap::new();
+            if let Some(token) = token {
+                h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            }
+            identity::caller(&app, &h, &axum::http::Extensions::new()).await
+        }
+    };
+    assert!(matches!(caller(None).await, Ok(Caller::Anonymous)));
+    // Any token that is not one of ours is a placeholder.
+    for placeholder in ["placeholder", "free", "sk-or-v1-abc", "Bearer"] {
+        assert!(
+            matches!(caller(Some(placeholder)).await, Ok(Caller::Anonymous)),
+            "{placeholder}"
+        );
     }
-    let mut h = HeaderMap::new();
-    assert!(
-        identity::authenticate(&t.app, &h, identity::Scope::Proxy)
-            .await
-            .unwrap()
-            .is_none()
+    assert!(matches!(caller(Some(ADMIN)).await, Ok(Caller::Operator)));
+    assert!(matches!(
+        caller(k["key"].as_str()).await,
+        Ok(Caller::Key(i)) if i.key_id == k["id"].as_str().unwrap()
+    ));
+    // Look-alikes of our own credentials are checked.
+    assert_eq!(
+        caller(Some("sk-res-unknown")).await.unwrap_err().code,
+        "invalid_api_key"
     );
-    h.insert("authorization", "Bearer placeholder".parse().unwrap());
-    assert!(
-        identity::authenticate(&t.app, &h, identity::Scope::Proxy)
-            .await
-            .is_err()
+    assert_eq!(
+        caller(Some("dash_unknown")).await.unwrap_err().code,
+        "invalid_api_key"
     );
-    t.app.config_mut().await.accept_any_token = true;
-    assert!(
-        identity::authenticate(&t.app, &h, identity::Scope::Proxy)
+    assert_eq!(
+        caller(k["dashboard_token"].as_str())
             .await
-            .unwrap()
-            .is_none()
+            .unwrap_err()
+            .code,
+        "dashboard_token_not_allowed"
     );
+    // An unbilled request still logs the upstream cost.
     let mut m = Meter::begin(&t.app, None, meta()).await.unwrap();
     m.usage = Usage::parse(&json!({"cost":0.02}));
     m.finish().await.unwrap();
@@ -1131,7 +1151,7 @@ fn starter_config_with_every_option_uncommented_parses() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let c: Config = toml::from_str(&text).unwrap();
+    let c = Config::from_toml_str(&text, |_| None).unwrap();
     Config {
         admin_token: "a".repeat(24),
         key_pepper: "p".repeat(24),
@@ -1146,7 +1166,23 @@ fn starter_config_documents_every_option_and_validates() {
     // `reseller init` copies this file verbatim, so it must parse, pass
     // validation, and mention every configurable field at least once.
     let text = include_str!("../reseller.example.toml");
-    let c: Config = toml::from_str(text).unwrap();
+    let c = Config::from_toml_str(text, |_| None).unwrap();
+    // Without any key in the environment every provider is disabled, so the
+    // catalog serves nothing. With one key its provider serves both models.
+    assert!(c.providers.iter().all(|p| !p.enabled));
+    assert!(c.find_model("free").is_none() && c.find_model("gpt-6-luna").is_none());
+    let one = Config::from_toml_str(text, |name| {
+        (name == "OPENROUTER_API_KEY").then(|| "sk-or-test".to_owned())
+    })
+    .unwrap();
+    let enabled: Vec<_> = one
+        .providers
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(enabled, ["openrouter"]);
+    assert!(one.find_model("free").is_some() && one.find_model("gpt-6-luna").is_some());
     // Secrets are generated on first start. Validation requires them.
     assert!(c.validate().is_err(), "empty secrets must not validate");
     let seeded = Config {
@@ -1161,30 +1197,23 @@ fn starter_config_documents_every_option_and_validates() {
         "public_url",
         "admin_token",
         "key_pepper",
-        "llm",
-        "tts",
-        "stt",
-        "image",
-        "model_policy",
-        "voice_policy",
+        "providers",
+        "models",
+        "routes",
+        "routing",
+        "free",
         "markup_pct",
         "signup",
         "keys",
         "rate_limits",
         "mcp",
         "prices",
-        "require_key",
-        "accept_any_token",
         // Signup, key policy, rate limits, MCP
         "enabled",
-        "free_credit_usd",
-        "free_credit_expiry_days",
-        "ip_limit_per_month",
         "cooldown_seconds",
         "global_hourly_limit",
         "pow_max_number",
         "pow_ttl_seconds",
-        "ip_overrides",
         "max_per_account",
         "max_new_per_day",
         "rotate_cooldown_seconds",
@@ -1264,14 +1293,32 @@ fn starter_config_documents_every_option_and_validates() {
         "native_rates_usd",
         "quote_ttl_minutes",
         "underpayment_tolerance_pct",
-        // Upstream
+        // Providers, models, routes, routing, free tier
         "base_url",
         "api_key",
         "model",
         "voice",
-        "fallbacks",
         "timeout_seconds",
         "headers",
+        "tier",
+        "capability",
+        "default",
+        "strategy",
+        "weight",
+        "provider",
+        "limits",
+        "rpd",
+        "tpm",
+        "tpd",
+        "concurrent",
+        "max_attempts",
+        "failure_threshold",
+        "max_cooldown_seconds",
+        "ipv6_prefix",
+        "max_concurrent",
+        "max_concurrent_total",
+        "max_output_tokens",
+        "max_body_bytes",
         // Price
         "input",
         "output",
@@ -1295,8 +1342,12 @@ fn starter_config_documents_every_option_and_validates() {
             "starter config does not document `{key}`"
         );
     }
-    // The starter file must be directly usable: upstreams present, no secrets
-    // baked in, and the placeholder key clearly marked.
-    assert!(c.llm.api_key.contains("replace"));
+    // The starter file must be directly usable: providers and models present,
+    // and no secrets baked in (keys come from the environment).
+    let raw: toml::Table = toml::from_str(text).unwrap();
+    for provider in raw["providers"].as_array().unwrap() {
+        assert!(provider["api_key"].as_str().unwrap().starts_with("${"));
+    }
+    assert_eq!(c.models[0].routes[0].provider, c.providers[0].id);
     assert!(c.admin_token.is_empty() && c.key_pepper.is_empty());
 }

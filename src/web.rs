@@ -183,7 +183,13 @@ fn cors(origin: &str) -> CorsLayer {
             HeaderName::from_static("x-request-id"),
             HeaderName::from_static("x-key-prefix"),
             HeaderName::from_static("x-account-balance-usd"),
-            HeaderName::from_static("x-model-fallback"),
+            HeaderName::from_static("x-ratelimit-limit-requests"),
+            HeaderName::from_static("x-ratelimit-remaining-requests"),
+            HeaderName::from_static("x-ratelimit-reset-requests"),
+            HeaderName::from_static("ratelimit"),
+            HeaderName::from_static("ratelimit-policy"),
+            HeaderName::from_static("retry-after-ms"),
+            header::RETRY_AFTER,
             header::WWW_AUTHENTICATE,
         ])
 }
@@ -210,9 +216,9 @@ fn discovery() -> serde_json::Value {
         "signup": "/v1/signup",
         "mcp": "/mcp",
         "routes": {
-            "llm": ["/v1/chat/completions", "/v1/responses", "/v1/completions", "/v1/embeddings", "/v1/realtime"],
-            "tts": ["/v1/audio/speech"],
-            "stt": ["/v1/audio/transcriptions", "/v1/audio/translations"],
+            "chat": ["/v1/chat/completions", "/v1/responses", "/v1/completions", "/v1/embeddings", "/v1/moderations", "/v1/realtime"],
+            "speech": ["/v1/audio/speech"],
+            "transcription": ["/v1/audio/transcriptions", "/v1/audio/translations"],
             "image": ["/v1/images", "/v1/images/generations", "/v1/images/edits", "/v1/images/variations"],
         },
         "docs": "/docs/",

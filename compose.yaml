@@ -7,10 +7,30 @@ services:
     # Publish the HTTP port on every host interface.
     ports:
       - "56787:56787"
-    # Bootstrap values. They seed the settings only on the first start. Later
-    # changes belong in Admin > Settings or reseller config import (see
-    # reseller.example.toml).
+    # Bootstrap values. They seed the settings only on the first start, and
+    # later changes to them have no effect (edit Admin > Settings instead).
+    #
+    # The starter settings file (reseller.example.toml, mounted below) lists
+    # the providers, a balanced free model, and a paid model, and reads the
+    # provider keys from the variables in the first block. Providers whose key
+    # is unset stay disabled. Each OPENAI_, TTS_, STT_, and IMG_ group also
+    # creates one provider and one paid model, with *_MODEL_FALLBACKS as extra
+    # routes.
     environment:
+      RESELLER_CONFIG: /config/reseller.toml
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OPENROUTER2_API_KEY: ${OPENROUTER2_API_KEY:-}
+      OPENROUTER2_MODEL: ${OPENROUTER2_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_AUTH_TOKEN: ${CLOUDFLARE_AUTH_TOKEN:-}
+      CLOUDFLARE_MODEL: ${CLOUDFLARE_MODEL:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
@@ -45,6 +65,9 @@ services:
     # Named volume for the SQLite database and generated files.
     volumes:
       - reseller-data:/data
+      # Settings file read on the first start. Copy it to reseller.toml to
+      # customize it, and mount that file instead.
+      - ./reseller.example.toml:/config/reseller.toml:ro
       # - ./theme:/theme:ro
     # Time Docker waits for a graceful shutdown before it kills the container.
     stop_grace_period: 330s

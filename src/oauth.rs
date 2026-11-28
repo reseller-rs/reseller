@@ -785,8 +785,7 @@ pub async fn authorize_decide(app: &App, req: Request<Body>, ip: &str) -> Result
     }
     security::check_auth_failures(app, ip).await?;
     let verified = match identity::credential(app, &config, credential, Scope::Manage).await {
-        Ok(Some(me)) => identity::by_key_id(app, &me.key_id).await,
-        Ok(None) => Err(Error::unauthorized("invalid_api_key", "Invalid API key")),
+        Ok(me) => identity::by_key_id(app, &me.key_id).await,
         Err(e) => Err(e),
     };
     let me = match verified {

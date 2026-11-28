@@ -1522,7 +1522,6 @@ dialog.sheet .dialog-content { overflow-x: hidden; }
 @media (max-width: 760px) { .addr-main .qr-box { order: 2; } }
 @media (max-width: 760px) { .addr-main .qr-box { order: 2; } }
 
-.trial-note { margin: 0 0 12px; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--ok-bg); color: var(--ok); font-size: 13.5px; }
 
 .sub-line { padding: 6px 0; }
 .sub-line + .sub-line { border-top: 1px solid var(--border); }
@@ -1546,9 +1545,6 @@ button.small .ico, .button.small .ico { width: 14px; height: 14px; }
 .estimate-note .ico { margin-top: 2px; }
 .assurance + .estimate-note { justify-content: center; text-align: center; }
 .bill-body .estimate-note, .more .estimate-note { margin: 10px 0 0; }
-.trial-note { display: flex; align-items: flex-start; gap: 10px; }
-.trial-note .ico { margin-top: 3px; }
-.trial-foot { display: block; margin-top: 2px; font-size: 12px; opacity: .85; }
 .clickwrap { margin: 14px 0 0; font-size: 12px; line-height: 1.5; color: var(--faint); }
 .clickwrap a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; display: inline; }
 .plan-credit { display: flex; align-items: flex-start; gap: 8px; }
@@ -1734,16 +1730,6 @@ p.callout { color: var(--text); }
 .card.error { border-left: 4px solid var(--danger); color: var(--text); }
 .card.error p { color: var(--muted); }
 .card.error strong { color: var(--danger); }
-.trial-note {
-  display: flex; align-items: flex-start; gap: var(--s3);
-  margin: var(--s4) 0; padding: var(--s3) var(--s4);
-  border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--border));
-  border-left: 4px solid var(--ok);
-  border-radius: var(--radius-sm);
-  background: var(--ok-bg); color: var(--text); font-size: 13px;
-}
-.trial-note > .ico { color: var(--ok); margin-top: 1px; }
-.trial-note strong { display: block; }
 .consent-error { border-left: 4px solid var(--danger); }
 
 /* Estimate notes sit directly under the figures they qualify, left-aligned. */
@@ -2156,3 +2142,6 @@ button.primary, button.primary:hover, .button.primary, .button.primary:hover,
 a.button.primary, a.button.primary:hover, a.button.primary:visited { color: var(--on-accent); }
 .addr-line .icon-btn[data-tip]::after { left: auto; right: 0; transform: none; }
 .co-credit > div { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); }
+
+/* Routing view: a remaining budget under 10% turns amber. */
+.num.low { color: var(--warn); }

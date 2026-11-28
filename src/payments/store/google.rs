@@ -17,7 +17,6 @@ use crate::{
     config::Config,
     db::{self, now},
     error::{Error, Result},
-    money,
     payments::{
         StoreCharge, provider_error, record_store_charge, refund_store_charge, unavailable,
     },
@@ -801,7 +800,7 @@ async fn refund_review(app: &App, config: &Config, event: &str, n: &Value) -> Re
     };
     let used = crate::billing::consumption(&mut conn, &payment).await?;
     drop(conn);
-    let sample = money::usd(&config.signup.free_credit_usd).is_ok_and(|credit| credit > 0);
+    let sample = config.offers_free_tier();
     let request = json!({
         "pendingRefundToken": pending,
         "sampleContentProvided": sample,

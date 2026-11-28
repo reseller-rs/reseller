@@ -11,9 +11,10 @@ reseller is a self-hosted, OpenAI-compatible API reseller written in Rust. Point
 ## Features
 
 - **Proxy:** streaming JSON, SSE, audio, multipart uploads, and WebSocket (realtime) transport.
-- **Upstreams:** separate LLM, TTS, STT, and image upstreams with per-upstream timeouts, headers, model policies, and fallback chains.
+- **Providers and routing:** any number of OpenAI-compatible upstream providers, a public model catalog with several routes per model, per-route and per-provider budgets, balanced or ordered selection, automatic failover, circuit breakers, and cooldowns learned from upstream rate-limit hints. See [docs/routing.md](docs/routing.md).
+- **Free tier without a key:** models marked `tier = "free"` work with no credential, are never billed, and are rate limited per client (IPv4 address or IPv6 /64). Over-limit requests fail at once with `429` or `503` and exact retry hints. Paid models need a key and a balance.
 - **MCP for AI agents:** a remote `POST /mcp` endpoint with OAuth 2.1 sign-in (add the URL in Claude, ChatGPT, Cursor, or VS Code) and a local `reseller mcp` stdio bridge. Agents can generate content and manage their account. See [docs/mcp.md](docs/mcp.md).
-- **Signup and abuse control:** proof-of-work signup (ALTCHA-compatible), per-IP and per-account limits, rotation limits, and an auth-failure lockout.
+- **Signup and abuse control:** proof-of-work signup (ALTCHA-compatible), a signup cooldown and global hourly cap, rotation limits, free-tier limits that extra accounts cannot multiply, and an auth-failure lockout.
 - **Accounts and keys:** self-service accounts, shared balances, key rotation, model allowlists, and per-key usage limits.
 - **Accurate metering:** integer micro-USD accounting with cached-input, per-character, per-image, per-second, and flat per-request prices. Per-request holds stop concurrent requests from overdrawing a balance or limit. Monthly quota and top-up lots, markup overrides, and debt tracking are included.
 - **Payments:** subscriptions with a monthly quota, non-expiring top-ups, single-use redeem codes, Stripe Checkout, Payroof crypto payments (stablecoins and native coins on EVM chains), and native App Store (StoreKit 2) and Google Play purchases with verified, idempotent webhooks and refund-abuse protection.
@@ -30,6 +31,8 @@ reseller is a self-hosted, OpenAI-compatible API reseller written in Rust. Point
 - [Security model](#security-model)
 - [Customer API](#customer-api)
 - [Proxying](#proxying)
+- [Free tier](#free-tier)
+- [Routing guide](docs/routing.md) (architecture, free providers, capacity planning)
 - [MCP](#mcp)
 - [Admin API](#admin-api)
 - [CLI reference](#cli-reference)
@@ -63,7 +66,7 @@ Building from source requires **Rust 1.98 or newer**. The default database is `.
    reseller init
    ```
 
-3. Edit `reseller.toml` and set `[llm].api_key`, plus your upstream URL and model.
+3. Edit `reseller.toml`. Set the `api_key` (and `base_url`) of the `[[providers]]` entry, and the upstream `model` of the route under `[[models]]`.
 4. Start the server.
 
    ```sh
@@ -113,7 +116,46 @@ To build locally instead, run `docker build -t reseller:local .`.
    docker compose up -d
    ```
 
-Pin a release tag instead of `latest` to keep deployments reproducible.
+Pin a release tag instead of `latest` to keep deployments reproducible. Compose passes only the bootstrap variables. For several providers, free models, or routing limits, mount a settings file and set `RESELLER_CONFIG` (see the comments in `compose.yaml`), or edit the settings in the admin console after the first start.
+
+### Try a free model without a key
+
+Free models need no account. Add a provider and a free model (see [Free tier](#free-tier) for the settings), then call it with no credential:
+
+```sh
+curl http://localhost:56787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"free","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+An SDK that insists on a key can send any placeholder, such as `free`. Paid models answer `401 api_key_required` until the caller sends a key.
+
+### Run the starter configuration with your keys
+
+`reseller.example.toml` lists ready providers (OpenRouter with two keys, Gemini, NVIDIA, Groq, and Cloudflare Workers AI), a balanced free model `free`, and a paid model `gpt-6-luna`. It reads every key from the environment, so put the keys you have in an `.env` file next to `compose.yaml`:
+
+```sh
+# .env (only the keys you have, the other providers stay disabled)
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER2_API_KEY=sk-or-v1-...
+GEMINI_API_KEY=...
+NVIDIA_API_KEY=nvapi-...
+GROQ_API_KEY=gsk_...
+CLOUDFLARE_ACCOUNT_ID=...
+CLOUDFLARE_AUTH_TOKEN=...
+# Optional route model overrides: OPENROUTER_MODEL, OPENROUTER2_MODEL,
+# GEMINI_MODEL, NVIDIA_MODEL, GROQ_MODEL, CLOUDFLARE_MODEL
+```
+
+`compose.yaml` mounts the starter file and passes these variables, and Docker Compose reads `.env` from the project directory:
+
+```sh
+docker compose up -d
+```
+
+With plain `docker run`, pass the same variables with `-e` (or `--env-file`, which takes values literally, so write them without quotes) and mount the file at the path in `RESELLER_CONFIG`.
+
+The file seeds the database on the first start only (see [Environment references](#environment-references)).
 
 ### Container details
 
@@ -149,7 +191,7 @@ If no `ADMIN_TOKEN` is supplied, the first start generates one and prints it. Sa
 
 - Run `reseller token` to print a random administrator token.
 - Run `reseller reset-admin` to replace the stored token. Stop the server first.
-- The token also works as an operator credential: `curl https://HOST/v1/models -H "Authorization: Bearer $ADMIN_TOKEN"` and the same on `/v1/*` and `/mcp` generation tools. It is accepted even when `require_key` is on, sees the full model catalog, is never billed, has no limits, and its requests are logged without an account. On `/v1/keys`, `/v1/account`, and the account tools it is answered with `403 admin_token_not_customer` (use `/admin/api`), which does not count as an authentication failure.
+- The token also works as an operator credential: `curl https://HOST/v1/models -H "Authorization: Bearer $ADMIN_TOKEN"` and the same on `/v1/*` and `/mcp` generation tools. It sees the full model catalog (free and paid), is never billed, has no free-tier limits, and its requests are logged without an account. On `/v1/keys`, `/v1/account`, and the account tools it is answered with `403 admin_token_not_customer` (use `/admin/api`), which does not count as an authentication failure.
 
 ## Configuration
 
@@ -170,18 +212,20 @@ Defaults appear in parentheses.
 
 | Section | Purpose |
 |---|---|
-| Top level | `public_url` (`http://localhost:56787`), `admin_token`, `key_pepper` (both at least 24 characters, generated if unset), `model_policy` and `voice_policy` (`default`, `force`, or `passthrough`, default `default`), `markup_pct` (`30`), `require_key` (`true`), `accept_any_token` (`false`), `trust_proxy` (`false`), `cors_origin` (empty), `max_json_body_bytes` (50 MiB), `max_stream_body_bytes` (512 MiB), `upstream_timeout_seconds` (300), `log_retention_days` (30), `max_log_entries` (5000) |
+| Top level | `public_url` (`http://localhost:56787`), `admin_token`, `key_pepper` (both at least 24 characters, generated if unset), `markup_pct` (`30`), `trust_proxy` (`false`), `cors_origin` (empty), `max_json_body_bytes` (50 MiB), `max_stream_body_bytes` (512 MiB), `upstream_timeout_seconds` (300), `log_retention_days` (30), `max_log_entries` (5000) |
 | `[branding]` | White-label name, copy, logos, colours, and CSS (see [Branding and themes](#branding-and-themes)) |
-| `[llm]`, `[tts]`, `[stt]`, `[image]` | Upstreams: `base_url` (`https://api.openai.com/v1`), `api_key`, `model`, `fallbacks` (max 10), `timeout_seconds` (0 uses `upstream_timeout_seconds`, max 3600), and `headers` (max 20, credential and framing headers are refused). `[tts]` also has `voice`. |
+| `[[providers]]` | Upstream connections, one per API key: `id`, `base_url`, `api_key`, `enabled` (`true`), `timeout_seconds` (0 uses `upstream_timeout_seconds`, max 3600), `headers` (max 20, credential and framing headers are refused), and `limits` (see [Providers, models, and routing](#providers-models-and-routing)) |
+| `[[models]]` | Public model catalog and the routes that serve each model (see [Providers, models, and routing](#providers-models-and-routing)) |
+| `[routing]` | Failover and cooldowns: `max_attempts` (3, 1 to 10), `failure_threshold` (3, 1 to 1000), `cooldown_seconds` (30, at least 1), `max_cooldown_seconds` (600, at most 86400) |
+| `[free]` | Keyless access: `enabled` (`true`), `ipv6_prefix` (64, 32 to 128), `rpm` (10), `rpd` (300), `tpd` (300000), `max_concurrent` (2), `max_concurrent_total` (64), `max_output_tokens` (4096), `max_body_bytes` (1 MiB). 0 turns a limit off. |
 | `[prices.<model>]` | Upstream prices in USD (see [Pricing and metering](#pricing-and-metering)) |
-| `[signup]` | Anonymous signup: `enabled` (`true`), `free_credit_usd` (`"0.10"`), `free_credit_halving` (`true`, when true each further signup from the same IP in a calendar month gets half the previous trial credit, so with `ip_limit_per_month = 4` and `"0.1"` the signups get $0.1, $0.05, $0.025, and $0.0125), `free_credit_expiry_days` (30, 0 means never, max 3650), `ip_limit_per_month` (4, 0 turns it off), `cooldown_seconds` (30, 0 turns it off), `global_hourly_limit` (100, 0 turns it off), `pow_max_number` (100000, 0 disables proof of work, max 10000000), `pow_ttl_seconds` (300, 10 to 86400), `adaptive_pow` (`true`), `pow_max_number_ceiling` (1000000, from `pow_max_number` to 10000000), `adaptive_pow_reset_minutes` (30, 1 to 1440), and `[signup.ip_overrides]` (`"1.2.3.4" = N`, where 0 means unlimited) |
+| `[signup]` | Anonymous signup: `enabled` (`true`), `cooldown_seconds` (30, 0 turns it off), `global_hourly_limit` (100, 0 turns it off), `pow_max_number` (100000, 0 disables proof of work, max 10000000), `pow_ttl_seconds` (300, 10 to 86400), `adaptive_pow` (`true`), `pow_max_number_ceiling` (1000000, from `pow_max_number` to 10000000), and `adaptive_pow_reset_minutes` (30, 1 to 1440). New accounts start with no credit. |
 | `[keys]` | `max_per_account` (10 active keys, must be above 0), `max_new_per_day` (20 created or rotated per account in a rolling 24 hours, 0 turns it off), `rotate_cooldown_seconds` (300, 0 turns it off, max 86400), and `[keys.default_limits]` (`rpm`, `requests`, `tokens`, `spend`, `max_children`, `allowed_models`, copied onto each new account's first key, child keys inherit their parent's limits) |
 | `[rate_limits]` | `management_per_minute` (120), `auth_failures_per_hour` (20), `max_concurrent_requests` (8), `checkouts_per_hour` (10), `redeem_failures_per_hour` (10), `challenges_per_minute` (10), `new_account_hours` (48) and `new_account_daily_spend_pct` (`"20"`): the new-account spending cap (see [Refund protection](#refund-protection)). 0 disables each one. |
-| `[reasoning]` | `free_effort` (`"low"`) and `[reasoning.models."<upstream model>"]` with `efforts` and `default` (see [Reasoning effort](#reasoning-effort)) |
+| `[reasoning]` | `free_effort` (`"low"`, the cap for requests to free models) and `[reasoning.models."<upstream model>"]` with `efforts` and `default` (see [Reasoning effort](#reasoning-effort)) |
 | `[billing]` | `request_estimate_usd` (`"0.001"`, the typical billed cost of one request, used to show customers approximate request counts), `default_max_output_tokens` (4096, held for LLM requests without an output limit), `min_hold_usd` (`"0.01"`, the smallest hold per request), `refund_ip_block_days` (30, 0 turns the address block off), `refund_decline_pct` (50, share of a purchase that must be used before refund answers ask the store to decline) |
 | `[mcp]` | `enabled` (`true`), `oauth` (`true`, OAuth sign-in for `/mcp`, see [MCP](#mcp)), and `max_media_bytes` (16 MiB, 1 byte to 256 MiB), the largest audio or image returned inline |
 | `[stripe]` | `secret_key`, `webhook_secret` |
-| `[[models]]` | Public model catalog: `id`, `upstream`, `aliases`, `enabled`, `name`, `description`, `owned_by`, `created`, `context_length`, `input_modalities`, `output_modalities` (left empty, they derive from the upstream route that serves the model: chat text to text, TTS text to audio, STT audio to text, image text to image), `show_pricing` |
 | `[apple]` | App Store purchases: `bundle_id`, `app_apple_id`, `environment` (`production` or `sandbox`), `issuer_id`, `key_id`, `private_key` (the `.p8` PEM), `api_url` (empty uses Apple's host for the environment), `consumption_reporting` (`false`) |
 | `[google]` | Google Play purchases: `package_name`, `service_account_json`, `pubsub_audience` (empty uses `<public_url>/webhooks/google`), `pubsub_service_account`, `refund_review` (`false`), `api_url`, `certs_url` |
 | `[payroof]` | Crypto payments: `deposits` (`false`), `deposit_eta_minutes` (`5`), `project`, `token`, `webhook_secret`, `stablecoins`, `native_coins`, `chains`, rate source, `quote_ttl_minutes`, and `underpayment_tolerance_pct` (`0.5`) |
@@ -213,24 +257,79 @@ tokens = { max = 1000000, window_hours = 720 }
 spend = { max_usd = "5", window_hours = 720 }
 ```
 
+### Providers, models, and routing
+
+Three lists describe what you sell and where it comes from. A **provider** is one upstream connection (one API key). A **model** is a public catalog entry that clients name in requests. Each model has one or more **routes**, and each route points at a provider and the model name that provider knows.
+
+```toml
+[[providers]]
+id = "openai"                    # 1-32 characters of a-z, 0-9, _ and -
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+# enabled = true
+# timeout_seconds = 0            # 0 uses upstream_timeout_seconds, max 3600
+# headers = { "HTTP-Referer" = "https://api.example.com" }
+# limits = { rpm = 0, rpd = 0, tpm = 0, tpd = 0, concurrent = 0 }   # budget of this key, 0 = unlimited
+
+[[models]]
+id = "gpt-6-luna"                # the name clients send
+capability = "chat"              # required: chat, speech, transcription, or image
+tier = "paid"                    # "paid" (default) or "free"
+default = true                   # used when a request names no model
+strategy = "ordered"             # "balanced" (default) or "ordered"
+aliases = ["luna"]
+name = "GPT-6 Luna"
+context_length = 128000
+show_pricing = true              # paid models only
+
+[[models.routes]]
+provider = "openai"
+model = "gpt-6-luna"             # the upstream name
+# weight = 1                     # 1-100, the share in "balanced"
+# limits = { rpm = 0, rpd = 0, tpm = 0, tpd = 0, concurrent = 0 }   # budget of this provider and model pair
+
+[routing]
+# max_attempts = 3
+# failure_threshold = 3
+# cooldown_seconds = 30
+# max_cooldown_seconds = 600
+```
+
+#### Environment references
+
+String values in a settings file may reference environment variables, which keeps credentials out of the file. `"${NAME}"` is the value of `NAME` (an unset variable is a startup error), `"${NAME:-fallback}"` is the value or `fallback` when `NAME` is unset or empty, and `"$${"` is a literal `${`. A provider whose `api_key` references variables that are unset or empty is loaded **disabled**, and a model without an enabled provider is hidden from `/v1/models` and refused like a disabled one. One file can therefore list every provider you might use. References are expanded when the file is read, on the first start and by `reseller config import`. `reseller config export` writes a literal `${` as `$${`, so an export imports unchanged.
+
+| Setting | Meaning |
+|---|---|
+| `providers.limits`, `models.routes.limits` | Budgets: requests per minute (`rpm`) and per day (`rpd`), tokens per minute (`tpm`) and per day (`tpd`), and requests in flight (`concurrent`). 0 is unlimited, the maximum is 1000000000. A route is skipped while its own or its provider's budget is empty. Token budgets are charged after a request finishes. |
+| `models.capability` | `chat` also covers embeddings, moderations, responses, completions, and realtime. `speech`, `transcription`, and `image` map to `/v1/audio/speech`, `/v1/audio/transcriptions` and translations, and `/v1/images/*`. |
+| `models.default` | At most one servable default (enabled, with an enabled provider) per capability and tier. A request without a model gets the paid default of its capability when the caller has a key (else the free default), and the free default when the caller is anonymous. |
+| `models.strategy` | `balanced` spreads traffic by `weight`, remaining budget, success rate, and load. `ordered` takes the first available route in list order, so the later routes are fallbacks. |
+| `models.voice` | Speech only. The voice sent when the client names none. |
+| `models.routes` | 1 to 20 routes. Each provider and model pair may appear once per model. |
+| `models.routes.fallback` | A last resort: tried, in listed order, only after every other route of the model is unavailable or has failed the request, with its own attempts beyond `routing.max_attempts`. At least one route must not be a fallback. Use it for an inexpensive paid model behind free routes, and cap its cost with route `limits` (free requests stay unbilled for the caller). |
+| `routing.*` | `max_attempts` routes are tried per request, a route's circuit opens after `failure_threshold` failures in a row, and cooldowns start at `cooldown_seconds`, double on each reopen with 20% jitter, and stop at `max_cooldown_seconds`. |
+
+There is no catalog-free mode: a model that is not in `[[models]]` is `404 model_not_found`. Upstream names, provider ids, and base URLs are never shown to customers. Prices stay keyed by **upstream** model name in `[prices.<model>]`, and a paid request holds the highest price among the model's routes. [docs/routing.md](docs/routing.md) explains selection, failover, and capacity planning.
+
 ### Environment bootstrap
 
 These variables seed the settings on **first start only**. They override the TOML file at that point. `ADMIN_TOKEN` and `KEY_PEPPER` must be at least 24 characters. Leave them unset to have secure values generated.
 
 | Group | Variables |
 |---|---|
-| LLM upstream | `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_MODEL_FALLBACKS` |
-| TTS upstream | `TTS_BASE_URL`, `TTS_API_KEY`, `TTS_MODEL`, `TTS_MODEL_FALLBACKS`, `TTS_VOICE` |
-| STT upstream | `STT_BASE_URL`, `STT_API_KEY`, `STT_MODEL`, `STT_MODEL_FALLBACKS` |
-| Image upstream | `IMG_BASE_URL`, `IMG_API_KEY`, `IMG_MODEL`, `IMG_MODEL_FALLBACKS` |
-| Core | `ADMIN_TOKEN`, `KEY_PEPPER`, `MARKUP_PCT`, `FREE_CREDIT_USD` (sets `signup.free_credit_usd`) |
+| LLM provider | `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_MODEL_FALLBACKS`: creates the provider `llm` and a paid default chat model named `OPENAI_MODEL` |
+| TTS provider | `TTS_BASE_URL`, `TTS_API_KEY`, `TTS_MODEL`, `TTS_MODEL_FALLBACKS`, `TTS_VOICE`: provider `tts` and a paid speech model with that voice |
+| STT provider | `STT_BASE_URL`, `STT_API_KEY`, `STT_MODEL`, `STT_MODEL_FALLBACKS`: provider `stt` and a paid transcription model |
+| Image provider | `IMG_BASE_URL`, `IMG_API_KEY`, `IMG_MODEL`, `IMG_MODEL_FALLBACKS`: provider `image` and a paid image model |
+| Core | `ADMIN_TOKEN`, `KEY_PEPPER`, `MARKUP_PCT` |
 | Public site | `PUBLIC_URL`, `BRAND_NAME` |
 | Stripe | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` |
 | Payroof | `PAYROOF_API_URL`, `PAYROOF_PROJECT`, `PAYROOF_TOKEN`, `PAYROOF_WEBHOOK_SECRET` |
 | App Store | `APPLE_BUNDLE_ID`, `APPLE_ISSUER_ID`, `APPLE_KEY_ID`, `APPLE_PRIVATE_KEY` |
 | Google Play | `GOOGLE_PACKAGE_NAME`, `GOOGLE_SERVICE_ACCOUNT_JSON`, `GOOGLE_PUBSUB_SERVICE_ACCOUNT` |
 
-Fallback lists are comma-separated.
+Fallback lists are comma-separated. Each fallback becomes one more route of the same model on the same provider, tried in order (the model's strategy is `ordered`). There are no variables for free models, other providers, limits, or routing, so use the settings file (`RESELLER_CONFIG`) or the admin console for those. Providers from the file and the variables are merged by `id`. The variables take precedence for the ids `llm`, `tts`, `stt`, and `image`.
 
 ### Runtime environment variables
 
@@ -284,12 +383,12 @@ Cached tokens are the tokens the provider reports in `prompt_tokens_details.cach
 
 1. A provider-reported `usage.cost` (USD) replaces the token, audio, image, and character components. This includes an explicit zero. The flat `request` fee is still added for successful requests.
 2. Markup resolves in this order: key, then account, then global `markup_pct`.
-3. Credit is consumed soonest-expiring first: the current month's subscription quota and trial credit before top-ups, which never expire and come last.
+3. Credit is consumed soonest-expiring first: the current month's subscription quota before top-ups, which never expire and come last.
 4. Usage, debit, request metadata, and counters commit in one transaction.
 5. For `/v1/chat/completions`, `/v1/responses`, and `/v1/completions`, tokens are **estimated** when the upstream reports no usage at all. The estimate uses about four characters per token, based on the request text and the generated text. The request row is flagged `estimated: 1`. MCP generation results report this as `usage_estimated`.
 6. For other routes, if a provider returns no usage and no supported audio duration, only the flat `request` fee applies. Use providers that report usage.
 
-Every request row records the full breakdown behind its charge: `tokens`, `input_tokens`, `cached_tokens`, `output_tokens`, `characters`, `audio_ms`, `images`, `upstream_usd`, `billed_usd`, and `estimated`. Customers audit each line with everything except `upstream_usd`: customer request and usage views never show the provider cost. Administrators see all fields.
+Requests to free models are never billed: `billed_usd` is always 0, no balance is needed, and the provider's reported `usage.cost`, if any, is recorded as `upstream_usd`. Every request row records the full breakdown behind its charge: `tokens`, `input_tokens`, `cached_tokens`, `output_tokens`, `characters`, `audio_ms`, `images`, `upstream_usd`, `billed_usd`, and `estimated`. Customers audit each line with everything except `upstream_usd`: customer request and usage views never show the provider cost. Administrators see all fields.
 
 Each key also keeps its lifetime billed spend (`billed_usd`), which outlives request log and usage retention. An account's lifetime spend is the sum over its keys.
 
@@ -344,6 +443,30 @@ Both secrets are stored only as HMAC-SHA256 digests keyed with `key_pepper`. Red
 
 Send credentials as `Authorization: Bearer ...` or `x-api-key`. Tokens in query strings are not supported. The administrator token goes in `x-admin-token` or the bearer header, and it is compared in constant time. Blocked or expired API keys keep read-only workspace access (and their dashboard tokens too): they cannot create, rotate, or edit keys (`403 key_inactive`). Revoked credentials get no access.
 
+### Anonymous access and caller classes
+
+`/v1` serves four kinds of caller. The class is decided from the credential alone:
+
+| Caller | Credential | May use | Limits |
+|---|---|---|---|
+| Anonymous | None, or any bearer or `x-api-key` value that starts with neither `sk-res-` nor `dash_` and is not the administrator token (a placeholder such as `free` works for SDKs that demand a key) | Free models only. A paid model answers `401 api_key_required`. | Free-tier limits per client address |
+| Customer | A valid `sk-res-` key | Free and paid models the key may use | Key limits and balance for paid models. Free models also pass the free-tier limits. |
+| Operator | The administrator token | Everything, never billed | No free-tier limits |
+| Invalid | An `sk-res-` or `dash_` value that is not a known credential | Nothing: `401 invalid_api_key`, and it counts toward the auth-failure lockout | |
+
+A valid `dash_` token on the proxy is `401 dashboard_token_not_allowed`. With `free.enabled = false`, an anonymous request answers `401 missing_api_key` and free models are used with a key only.
+
+**Who is one client.** The free-tier limits count per client, where a client is:
+
+- an IPv4 address, or an IPv6 address grouped by its `free.ipv6_prefix` (default `/64`, the block one host controls, so rotating addresses inside it buys nothing),
+- or, for a key of a **paying or trusted** account, the account itself. That means the account has an order that was paid, an active subscription, a spendable balance, or `can_create_keys`.
+
+A key of any other account is counted under its client address like an anonymous caller, so opening more accounts adds no free allowance. Several people behind one address share one allowance until they pay.
+
+**Admission order.** A free request is checked before the database is touched: free requests in flight overall (`503 capacity_exhausted`), then in flight for the client (`429 concurrency_limit_exceeded`), then requests per minute (`429 rate_limit_exceeded`), requests per day, and tokens per day (`429 free_quota_exceeded`). The rate limits (`rpm`, `rpd`, `tpd`) are GCRA allowances, not strict rolling counts: a client may use the full `rpd` at once, then the allowance refills continuously at `rpd` per 24 hours, so over any 24 hours it can use at most about twice `rpd`, and `Retry-After` gives the exact wait. Nothing waits in a queue.
+
+**`trust_proxy` matters here.** The client address is the TCP peer unless `trust_proxy` is on (see [Behind a proxy](#behind-a-proxy)). Without it behind a reverse proxy, every anonymous caller shares the proxy's address and one allowance. With it on and the app reachable directly, callers can forge the address and get unlimited free allowance.
+
 ### Signup with proof of work
 
 Anonymous signup uses `GET /v1/signup/challenge`, then `POST /v1/signup`. The challenge is an ALTCHA v1 (SHA-256) puzzle:
@@ -394,8 +517,8 @@ Signup errors:
 
 Every `429` response carries a `Retry-After` header in seconds, computed from the limit that was hit:
 
-- **Throttles.** These are request rate, concurrency, auth failures, checkouts, cooldowns, and requests in flight holding the balance (`balance_reserved`). The wait is short and exact, and a retry after it succeeds.
-- **Usage windows.** These are the key `requests`, `tokens`, and `spend` windows, the monthly per-IP allowance, and the new-account daily cap. `Retry-After` is the time until enough settled usage leaves the window (or until next month or the account's 48th hour). These responses also send `x-should-retry: false`, so the OpenAI and Anthropic SDKs do not retry them right away. Show the error, or schedule the request after `Retry-After`.
+- **Throttles.** These are request rate, concurrency, auth failures, checkouts, cooldowns, free-tier request rate and concurrency, and requests in flight holding the balance (`balance_reserved`). The wait is short and exact, and a retry after it succeeds. Free-tier answers also carry `retry-after-ms`.
+- **Usage windows.** These are the key `requests`, `tokens`, and `spend` windows, the free daily request and token allowances (`free_quota_exceeded`), and the new-account daily cap. `Retry-After` is the time until enough settled usage leaves the window (or until next month or the account's 48th hour). These responses also send `x-should-retry: false`, so the OpenAI and Anthropic SDKs do not retry them right away. Show the error, or schedule the request after `Retry-After`.
 
 | Limit | Scope | Config | 429 `code` |
 |---|---|---|---|
@@ -405,7 +528,10 @@ Every `429` response carries a `Retry-After` header in seconds, computed from th
 | Invalid redeem codes | Account, per hour | `rate_limits.redeem_failures_per_hour` | `redeem_rate_limited` |
 | Checkout attempts | Account, per hour | `rate_limits.checkouts_per_hour` | `checkout_rate_limited` |
 | In-flight proxy requests | Account | `rate_limits.max_concurrent_requests` | `concurrency_limit_exceeded` |
-| New accounts (signups) per calendar month. Keys on an existing account and accounts that pay or are trusted do not count. | IP | `signup.ip_limit_per_month`, `signup.ip_overrides` | `ip_signup_limit` |
+| Free requests per minute | Client address, or paying account | `free.rpm` | `rate_limit_exceeded` |
+| Free requests per day (GCRA) | Client address, or paying account | `free.rpd` | `free_quota_exceeded` |
+| Free tokens per day (GCRA) | Client address, or paying account | `free.tpd` | `free_quota_exceeded` |
+| Free requests in flight | Client address, or paying account | `free.max_concurrent` | `concurrency_limit_exceeded` |
 | Gap between two signups | IP | `signup.cooldown_seconds` | `signup_cooldown` |
 | Key creations (signup, child keys, rotations) per hour | Global | `signup.global_hourly_limit` | `creation_rate_limited` |
 
@@ -418,6 +544,7 @@ Every `429` response carries a `Retry-After` header in seconds, computed from th
 | Spend per window | Key | `spend` | `spend_limit_exceeded` |
 | Spend per rolling 24 hours of a new account | Account | `rate_limits.new_account_hours`, `rate_limits.new_account_daily_spend_pct` | `new_account_daily_limit` |
 | Balance held by requests in flight | Account | none | `balance_reserved` |
+| Free requests in flight overall (a `503`, not a `429`) | Global | `free.max_concurrent_total` | `capacity_exhausted` |
 
 Counts that only drop when something is removed are not rate limits and are not 429s. `account_key_limit` (`keys.max_per_account`) and `child_key_limit` (`max_children`) are `403` without `Retry-After`: revoke a key to create another.
 
@@ -430,12 +557,11 @@ A request whose own hold can never fit a key window (for example a 4096-token ho
 | Empty balance, or a hold larger than the balance (`insufficient_quota`) | `429`, `Retry-After: 60` | `402`, no `Retry-After` | Waiting never helps. Only a top-up or a smaller request does, and SDKs do not retry 402. |
 | Key `spend`, `tokens`, `requests` windows | `429`, `Retry-After: 60` | `429`, exact `Retry-After`, `x-should-retry: false` | The window frees up hours later, not in 60 s |
 | Requests per minute | `429`, `Retry-After: 60` | `429`, seconds until the oldest counted request is a minute old | Exact wait |
-| Monthly per-IP key allowance | `429`, `Retry-After: 60` | `429`, seconds until next month (UTC), `x-should-retry: false` | Exact wait |
 | `account_key_limit`, `child_key_limit` | `429`, `Retry-After: 60` | `403`, no `Retry-After` | A count cap, not a rate |
 | Upstream `insufficient_quota` (the operator's provider account is out of credit) | Passed through as `429` | `502 upstream_error` | It is not the caller's quota |
 | Upstream status rewritten (for example 401 to 502) | Kept the upstream `Retry-After` | Header dropped | The hint belonged to the upstream status |
 
-The per-address allowance limits free trials, not keys: a household sharing one connection can open up to `ip_limit_per_month` accounts each month, and each person can hold several keys on their own account (`keys.max_per_account`, `keys.max_new_per_day`). Accounts with a paid order or an active subscription, and accounts the operator trusts (`can_create_keys`), no longer count. Trusted accounts also skip the daily key creation budget, but not the account key cap or the global hourly cap.
+Trusted accounts (`can_create_keys`) skip the daily key creation budget, but not the account key cap or the global hourly cap. Accounts carry no signup credit, so the signup guards are only the gap between signups (`signup.cooldown_seconds`), the global hourly cap, proof of work, and the refund blocks. A household sharing one connection can open as many accounts as it likes, and each person can hold several keys on their own account (`keys.max_per_account`, `keys.max_new_per_day`).
 
 ### Auth-failure lockout
 
@@ -459,8 +585,8 @@ Place a TLS reverse proxy in front of public deployments.
 
 - `trust_proxy` defaults to off. The TCP peer address is then the client IP.
 - Enable it **only** when direct access to the application is blocked and your edge overwrites incoming forwarding headers. It trusts `CF-Connecting-IP`, then the **last** `X-Forwarded-For` address. Earlier entries are controlled by the client.
-- If `trust_proxy` is enabled wrongly, clients can spoof their IP and evade every per-IP limit.
-- If it is disabled behind a proxy, all users share one IP. The per-IP limits (signup allowance, cooldown, and lockout) then apply to everyone at once.
+- If `trust_proxy` is enabled wrongly, clients can spoof their IP and evade every per-IP limit, including the free-tier limits.
+- If it is disabled behind a proxy, all users share one IP. The per-IP limits (free-tier allowance, signup cooldown, and lockout) then apply to everyone at once.
 
 ### Database secrets
 
@@ -481,8 +607,9 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `GET` | `/v1/keys/:id` | Any | One of the caller's keys with its 30-day usage series |
 | `PATCH` | `/v1/keys/:id` | Any | Rename or block (`{"name"?, "status":"blocked"}`). Customers cannot reactivate a key. |
 | `POST` | `/v1/keys/:id/rotate` | Any | Replace the key and keep its limits, pricing, expiry, usage windows (so rotating does not reset limits), and connected OAuth apps. The old key is blocked. |
-| `GET` | `/v1/models` | Key | Model catalog, local and not metered. `architecture` carries modalities and a `capability` (`chat`, `speech`, `transcription`, `image`) |
-| `GET` | `/v1/models/:id` | Key | One catalog entry, or `404 model_not_found` |
+| `GET` | `/v1/` | Public | Discovery: links and `routes` per capability (`chat`, `speech`, `transcription`, `image`) |
+| `GET` | `/v1/models` | Optional | Model catalog, local and not metered. Anonymous callers see free models only, keys see the free and paid models they may use. Each entry has a `tier` (`free` or `paid`), and `architecture` carries modalities and a `capability` (`chat`, `speech`, `transcription`, `image`) |
+| `GET` | `/v1/models/:id` | Optional | One catalog entry, or `404 model_not_found` |
 | `GET` | `/v1/account/models` | Any | The `/v1/models` list for the caller's key, also with a dashboard token |
 | `GET` | `/v1/account` | Any | Account, balance (`balance_usd`, split into `quota_remaining_usd` and `topup_remaining_usd`), lifetime `billed_usd`, active `subscriptions` with their monthly quota, credit lots, `consumption_consent`, and `top_up` instructions |
 | `PATCH` | `/v1/account` | Any | Body `{"consumption_consent": false}` withdraws (or `true` grants again) the consent to share consumption data with app stores for refund requests |
@@ -490,7 +617,7 @@ Customer routes use `Authorization: Bearer <api key or dashboard token>` unless 
 | `POST` | `/v1/account/store/apple` | Any | Body `{"signed_transaction":"<JWS>"}` or `{"transaction_id":"..."}` after a StoreKit 2 purchase. Returns the account and `purchase: {order_id, credited}` |
 | `POST` | `/v1/account/store/google` | Any | Body `{"product_id","purchase_token"}` after a Play Billing purchase. Same response |
 | `GET` | `/v1/account/usage?days=30&key=` | Any | Daily and per-model usage (`days` 1 to 365) |
-| `GET` | `/v1/account/requests?limit=20&offset=0&key=&model=&kind=&status=` | Any | Request history. Rows carry `key_name` and `key_prefix`. |
+| `GET` | `/v1/account/requests?limit=20&offset=0&key=&model=&kind=&status=` | Any | Request history. Rows carry `key_name` and `key_prefix`, the public `model`, a `tier`, and the number of `attempts`. They never name the provider or the upstream model, and carry no upstream cost. |
 | `POST` | `/v1/account/redeem` | Any | Body `{"code":"RES-..."}` |
 | `POST` | `/v1/account/checkout` | Any | Buy a plan or top-up by card or crypto. Body `{"plan_code":"monthly","method":"stripe"}` or `"crypto"` |
 | `GET` | `/v1/account/payments` | Any | The caller's orders (latest 50) |
@@ -554,44 +681,46 @@ curl http://localhost:56787/v1/chat/completions \
   -d '{"model":"your-model","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-### Routing
+### White-labeled responses
 
-Routing replaces `/v1` with the configured base path and keeps the query string.
+Successful JSON and `text/event-stream` responses of the chat, completions, responses, embeddings, moderations, transcription (JSON), and image routes name the public model, never the upstream's: `model` (and `response.model` in streamed Responses events) is replaced with the public id, and a top-level `provider` key is dropped. Other fields, SSE framing, `data: [DONE]`, keep-alives, and non-JSON lines pass through untouched. Event streams use a bounded line buffer (a single huge line is passed through unmodified), plain JSON bodies are buffered up to `max_json_body_bytes` (larger ones pass through unmodified), and binary bodies are never touched. Usage metering sees the upstream's original bytes, `bytes_out` counts what was sent, and the operator gets the same rewriting.
 
-| Client path | Upstream |
+### Routing to providers
+
+Routing replaces `/v1` with the provider's base path and keeps the query string. The path decides the capability, and the capability decides which models can answer:
+
+| Client path | Capability |
 |---|---|
-| `/v1/audio/speech` | TTS |
-| `/v1/audio/transcriptions`, `/v1/audio/translations` | STT |
-| `/v1/images`, `/v1/images/*` (generations, edits, variations) | Image |
-| All other proxied `/v1/*` routes (chat completions, completions, embeddings, moderations, responses, realtime) | LLM |
+| `/v1/audio/speech` | `speech` |
+| `/v1/audio/transcriptions`, `/v1/audio/translations` | `transcription` |
+| `/v1/images`, `/v1/images/*` (generations, edits, variations) | `image` |
+| All other proxied `/v1/*` routes (chat completions, completions, embeddings, moderations, responses, realtime) | `chat` |
 
 `/v1/models`, `/v1/keys`, `/v1/account`, `/v1/plans`, and `/v1/signup` are handled locally and are never proxied. Other paths return `404 unknown_url`, and a wrong method returns `405 method_not_allowed` with an `Allow` header.
 
+For each request the server:
+
+1. Identifies the caller (see [Anonymous access and caller classes](#anonymous-access-and-caller-classes)).
+2. Resolves the model by id or alias, or takes the default of the capability and tier. An unknown, disabled, or disallowed model is `404 model_not_found`, a model of another capability is `400 unsupported_model`, no model and no default is `400 model_required`, and a paid model for an anonymous caller is `401 api_key_required`.
+3. Admits it: a free model passes the free-tier limits, a paid model passes the key's limits and holds its worst-case cost.
+4. Picks a route (see [Failover](#failover)), rewrites `model` to the route's upstream name, and forwards.
+
 ### Models
 
-`GET /v1/models` lists the catalog in the OpenAI format. It needs a key, is not metered, and returns `402 insufficient_quota` when the balance is empty. The list never shows upstream names, URLs, keys, or raw prices. Disabled entries and models the key may not use are hidden, and aliases are not listed.
+`GET /v1/models` lists the catalog in the OpenAI format. It does not need a key and is not metered. Anonymous callers see free models only. With a key, the list holds the free models and the paid models the key may use, and it returns `402 insufficient_quota` when the balance is empty and no free model exists. The list never shows upstream names, provider ids, URLs, keys, or raw prices. Disabled entries and models the key may not use are hidden, and aliases are not listed. Pricing, when `show_pricing` is on for a paid model, uses the caller's effective markup.
 
-```toml
-[[models]]
-id = "assistant"
-upstream = "vendor/large-model-2026"
-aliases = ["gpt-4o"]
-name = "Assistant"
-context_length = 128000
-show_pricing = true
+```sh
+curl http://localhost:56787/v1/models
 ```
 
-With a catalog, a client model is resolved by id or alias and rewritten to `upstream`. An unknown, disabled, or disallowed model returns `404 model_not_found`. Filled and forced models skip this step. Without a catalog, the list shows the configured route models. Pricing, when shown, uses the caller's effective markup.
+### Choosing a model
 
-### Model and voice policies
+- A client model is matched against ids and aliases without regard to case and rewritten to the route's upstream name.
+- Omitting `model` uses the default entry of the endpoint's capability: the paid default for a keyed caller (else the free one), the free default for an anonymous caller. Without a default the answer is `400 model_required`.
+- The operator credential may name any model.
+- Speech requests that name no `voice` get the model's `voice`.
 
-- `default`: omit `model` to use the configured `[llm].model`. A client value is kept.
-- `passthrough`: forwards the client's value unchanged. A wrong model fails upstream.
-- `force`: always uses the configured model.
-
-The same policy governs the multipart `model` field on uploads. `force` replaces it, and `default` fills it only when it is missing. The audio payload still streams without buffering. WebSocket connections apply the policy to the `?model=` query parameter before admission and forwarding.
-
-Fallbacks apply only when the final model equals the route's configured model.
+For uploads, the provider is chosen before the file streams. The server buffers the start of the multipart body (bounded by `max_json_body_bytes`) until the `model` part completes, resolves the route, and then streams the rest without buffering. A request with no `model` part by the end of that prefix uses the capability default. A later `model` part that differs is `400 model_must_precede_file`, so **send `model` before the file**. WebSocket connections resolve the `?model=` query parameter before admission and forwarding. Uploads and WebSocket sessions get a single attempt.
 
 ### Image requests
 
@@ -603,7 +732,7 @@ curl http://localhost:56787/v1/images \
        "input_references":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]}'
 ```
 
-JSON requests apply model and voice policies. Chat requests stream usage reporting. Multipart uploads stream with bounded size, and only the `model` form field is rewritten by the policy.
+The `model` of a JSON request is resolved against the catalog and rewritten for the route. Chat requests stream usage reporting. Multipart uploads stream with bounded size, and only the `model` form field is rewritten.
 
 ### Reasoning effort
 
@@ -611,7 +740,7 @@ Clients set the reasoning level as `reasoning_effort` (Chat Completions) or `rea
 
 ```toml
 [reasoning]
-free_effort = "low"      # cap for free accounts; "" disables
+free_effort = "low"      # cap for requests to free models; "" disables
 
 [reasoning.models."deepseek/deepseek-v4.1-flash-1017"]
 efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -628,21 +757,23 @@ efforts = []             # no reasoning control: the parameter is removed
 | Configured model, no level | `default`, if set |
 | Model configured with `efforts = []` | The parameter is removed |
 | Model not configured | The client's value, unchanged |
-| Fallback model | The original level, or the nearest lower level the fallback supports (never a 400) |
+| Another route (failover) | The original level, or the nearest lower level that route's model supports (never a 400) |
 
-**Free accounts** have no active subscription and no spendable credit beyond signup trial credit. They are capped at `free_effort` (default `"low"`): a higher level is lowered to the highest supported level at or below the cap, and a configured reasoning model gets that level even when the request names none. For an unconfigured model, only an explicitly higher level is lowered. Operator and anonymous requests are not capped.
+**Free models** are capped at `free_effort` (default `"low"`) for every caller: a higher level is lowered to the highest supported level at or below the cap, and a configured reasoning model gets that level even when the request names none. For an unconfigured model, only an explicitly higher level is lowered. Requests to paid models and operator requests are not capped. The settings are keyed by the **upstream** model name of a route.
 
 Levels are ordered `none < minimal < low < medium < high < xhigh < max`. Configure each model's real levels: OpenRouter, for example, accepts all seven for DeepSeek models and answers others with a 400. A model-name suffix such as `model#low` is not used. Suffixes would split one model into several names for prices, allowlists, fallbacks, and `/v1/models`, while clients already have a standard field for the level.
 
-### Fallbacks
+### Failover
 
-- Fallbacks apply only to JSON requests that use the configured model, and only before forwarding response headers.
-- Availability errors (`400`, `402`, `404`, `408`, `429`, and `5xx`) and connection or timeout failures can trigger the next model.
-- Fallback models must also be allowed by the key.
-- Client-selected models are not replaced by fallbacks.
-- Multipart uploads get a single forward attempt.
-- Redirects are not followed.
-- Hop-by-hop headers and local credentials are removed before forwarding.
+Each model lists its routes, and the router keeps in-memory health and budget state for every provider and route. See [docs/routing.md](docs/routing.md) for the full model.
+
+- A route is a candidate when its provider is enabled and not cooling down, the route is not cooling down, its circuit is closed (or half open with no probe in flight), every configured budget has room, and concurrency is below the caps.
+- `ordered` takes the first candidate. `balanced` takes the candidate with the best score, `weight * headroom * success rate / (1 + in flight)`.
+- A failed attempt moves to the next route while attempts remain (`routing.max_attempts`). Only JSON bodies that the server holds in memory are replayed, so multipart uploads and WebSocket sessions get a single attempt.
+- `400`, `401`, `402`, `403`, `404`, `408`, `409`, `429`, and `5xx` responses and connection or timeout errors move on to the next route. A `429` cools the route down until the upstream's own hint (`Retry-After`, `retry-after-ms`, `x-ratelimit-*`, or Google's `retryDelay`), else `routing.cooldown_seconds`. A `401`, `402`, or `403`, or an upstream `insufficient_quota`, cools the whole provider down for `routing.max_cooldown_seconds`. A `404` (model not found at that provider) cools the route down for `routing.cooldown_seconds` without counting toward the circuit breaker. A `400` that a later route then serves cools the refusing route down the same way, since some providers answer an unknown model with `400`. A `5xx`, a timeout, or a connection error counts toward the circuit breaker, and a `400` does not.
+- When no route is available the caller gets `503 capacity_exhausted` with `Retry-After` and `retry-after-ms` set to the time until the soonest route is. Requests never wait for capacity.
+- Redirects are not followed. Hop-by-hop headers and local credentials are removed before forwarding.
+- Each request records its `tier` and the number of `attempts`. The provider and the upstream model that answered are visible to administrators only.
 
 ### Response headers
 
@@ -651,7 +782,8 @@ Levels are ordered `none < minimal < low < medium < high < xhigh < max`. Configu
 | `X-Request-Id` | Request identifier |
 | `X-Key-Prefix` | Prefix of the key used |
 | `X-Account-Balance-USD` | Balance before the request (pre-request snapshot) |
-| `X-Model-Fallback` | Set when a fallback model answered |
+
+Free responses add `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, and `x-ratelimit-reset-requests` (the per-minute window, or the daily one when there is no per-minute limit), and the IETF draft fields `RateLimit-Policy` and `RateLimit` that list every window, for example `RateLimit-Policy: "free";q=10;w=60, "free-day";q=300;w=86400` and `RateLimit: "free";a=9;w=12, "free-day";a=299;w=40000`. Errors from the free tier carry the same headers plus `Retry-After` and `retry-after-ms`.
 
 ### Proxy errors
 
@@ -659,15 +791,65 @@ Failures use the OpenAI shape `{ "error": { "message": "...", "type": "...", "pa
 
 | Status | Codes |
 |---|---|
-| 401 | `missing_api_key`, `invalid_api_key`, `key_revoked`, `key_blocked`, `key_expired`, `dashboard_token_not_allowed` |
+| 400 | `invalid_request`, `unsupported_model` (the model cannot serve this endpoint), `model_required` (no model and no default), `model_must_precede_file` (a multipart `model` part came after the file or changed), `unsupported_reasoning_effort` |
+| 401 | `missing_api_key` (free access is off), `invalid_api_key`, `api_key_required` (a paid model without a key), `key_revoked`, `key_blocked`, `key_expired`, `dashboard_token_not_allowed` |
 | 403 | `account_suspended` |
 | 404 | `model_not_found`, `unknown_url` |
 | 405 | `method_not_allowed` |
-| 413 | Body too large |
+| 413 | `request_too_large`: the body is too big (free requests have the smaller `free.max_body_bytes`) |
 | 402 | `insufficient_quota`: the balance is empty or smaller than the request's hold (lower `max_tokens` or top up) |
-| 429 | Limits and throttles, always with `Retry-After` (see [Rate limits](#rate-limits)) |
+| 429 | Limits and throttles, always with `Retry-After` (see [Rate limits](#rate-limits)). Free-tier codes are `rate_limit_exceeded`, `concurrency_limit_exceeded`, and `free_quota_exceeded` (daily, with `x-should-retry: false`). |
 | 502, 504 | Upstream failure |
-| 503 | `proxy_configuration_error` when the route's upstream has no API key |
+| 503 | `capacity_exhausted`: no route or free slot has room, with `Retry-After` and `retry-after-ms`. `proxy_configuration_error`: the route's provider has no API key. |
+
+## Free tier
+
+The free tier lets anyone call `tier = "free"` models with no key. It is meant for trying the service and for light use, and it costs the operator nothing extra when the free models are backed by free upstream plans (see the provider list in [docs/routing.md](docs/routing.md)).
+
+```toml
+[[providers]]
+id = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key = "${GEMINI_API_KEY:-}"   # read from the environment, disabled when unset
+
+[[providers]]
+id = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${OPENROUTER_API_KEY:-}"
+
+[[models]]
+id = "free"
+tier = "free"
+capability = "chat"
+default = true
+
+[[models.routes]]
+provider = "gemini"
+model = "gemini-3.5-flash-lite"
+weight = 2
+
+[[models.routes]]
+provider = "openrouter"
+model = "baidu/ernie-5.5-flash-preview:free"
+limits = { rpm = 20 }                 # the upstream's free-model budget
+
+[free]
+enabled = true
+rpm = 10
+rpd = 300
+```
+
+How it behaves:
+
+- **No key needed.** A free model answers without a credential, or with any placeholder that is not an `sk-res-` or `dash_` value. Paid models answer `401 api_key_required`. Free models are never billed and never need a balance.
+- **Limits per client.** `free.rpm`, `free.rpd`, `free.tpd` (tokens, charged after the request), `free.max_concurrent` per client and `free.max_concurrent_total` overall. Clients are grouped by IPv4 address, IPv6 `/64` prefix (`free.ipv6_prefix`), or the account for paying and trusted accounts. See [Anonymous access and caller classes](#anonymous-access-and-caller-classes).
+- **Bounded requests.** `max_tokens`, `max_completion_tokens`, and `max_output_tokens` are lowered to `free.max_output_tokens`, and the cap is injected when a chat, responses, or completions request has none. Reasoning models spend output tokens on reasoning, so a very small cap can yield empty answers. JSON bodies over `free.max_body_bytes` answer `413`. Reasoning effort is capped by `reasoning.free_effort`.
+- **Fail fast.** Over-limit requests are never held open or queued. They answer at once with `429` (rate, concurrency, or the daily allowance) or `503 capacity_exhausted`, each with `Retry-After` and `retry-after-ms`. The OpenAI SDKs honor both and retry on their own. `free_quota_exceeded` carries `x-should-retry: false` because waiting seconds will not help.
+- **Headers.** Every free response, including errors, reports the remaining allowance in `x-ratelimit-*-requests` and the IETF `RateLimit-Policy` and `RateLimit` fields (see [Response headers](#response-headers)).
+- **The model list.** `GET /v1/models` without a key lists the free models, and the landing and docs pages show a keyless quick start when at least one is enabled.
+- **Turning it off.** `free.enabled = false` makes anonymous requests answer `401 missing_api_key`. Keys still use free models.
+
+Free upstream tiers often forbid reselling, may train on prompts, or may change without notice. Read each provider's terms before you route anonymous traffic to it, and tell your users that free-model prompts leave your server.
 
 ## MCP
 
@@ -678,7 +860,7 @@ Agents can use the service through the Model Context Protocol. There are two way
 
 **Connect with OAuth.** Add `https://HOST/mcp` as a remote MCP server in Claude, ChatGPT, Cursor, or VS Code. The client registers itself (RFC 7591), and a browser page on this server asks you to sign in with an API key or dashboard token (or create an account) and to allow the connection. It uses PKCE `S256`, resource indicators, one-hour access tokens (`mcp_at_...`), and rotating refresh tokens that expire after 90 days idle. Tokens are bound to your key, stop working when the key does, and are valid on `/mcp` only. Customers revoke apps in the dashboard. `[mcp].oauth = false` turns this off. **Static bearer alternative:** send an API key or dashboard token as `Authorization: Bearer ...`. The administrator token works for generation tools only.
 
-Generation tools go through the same admission, limits, metering, and model policy as the HTTP API. Set `[mcp].enabled = false` to turn the endpoint off. It then answers `404 mcp_disabled`.
+Generation tools go through the same admission, limits, metering, and model routing as the HTTP API. Set `[mcp].enabled = false` to turn the endpoint off. It then answers `404 mcp_disabled`.
 
 ```sh
 # Remote with a static key (clients without OAuth support). OAuth clients just need the URL.
@@ -707,7 +889,7 @@ All routes live under `/admin/api`. They require the administrator token, sent a
 | `POST` | `/keys/:id/revoke` | Revoke a key |
 | `GET` | `/accounts?q=&status=&sort=&dir=&limit=&offset=` | List accounts with balance, `debt_usd`, `billed_usd`, `usage_30d_usd`, and key counts. `sort` is `created`, `contact`, `status`, `balance`, `keys`, `spend`, or `usage`. |
 | `GET` | `/accounts/:id?key_limit=&key_offset=&key_sort=&key_dir=` | One account with a page of its keys and 30-day usage |
-| `PATCH` | `/accounts/:id` | Update status, contact, note, `markup_pct`, or `can_create_keys` (trusted: skips the daily key budget and the signup allowance) |
+| `PATCH` | `/accounts/:id` | Update status, contact, note, `markup_pct`, or `can_create_keys` (trusted: skips the daily key budget and gets its own free-tier allowance) |
 | `POST` | `/accounts/:id/keys` | Create a key with a name and limits (bypasses creation guards) |
 | `POST` | `/accounts/:id/credits` | Add credit: `amount_usd`, `source`, optional `expires_at` and `note`. Requires an `Idempotency-Key` header (see below) |
 | `POST` | `/accounts/:id/subscriptions` | Grant a plan (`plan_code`): a subscription starting now, or a top-up. Requires an `Idempotency-Key` header |
@@ -724,10 +906,34 @@ All routes live under `/admin/api`. They require the administrator token, sent a
 | `POST` | `/payments/:id/complete` | Mark a pending or expired order as paid (grants once) |
 | `GET` | `/payroof` | Payroof configuration, catalog, and webhooks |
 | `POST` | `/payroof/webhook` | Register `{public_url}/webhooks/payroof` |
-| `GET` | `/requests` | Request log with `key_name`, `key_prefix`, and `account_contact`, filtered by `q`, `model`, `kind`, `status`, `path`, `ip`, `method`, `key`, `account`, `hour`, `limit`, and `offset` |
-| `GET` | `/requests/groups?field=model` | Group requests by `model`, `ip`, `status`, `kind`, `path`, `key`, or `hour` |
+| `GET` | `/routing` | Live router state: `providers` and `routes` with in-flight counts, circuit state, cooldowns, remaining budgets, latency, success rate, and 24-hour request log totals, plus the free tier's in-flight count and tracked clients (see [Routing endpoint](#routing-endpoint)) |
+| `GET` | `/requests` | Request log. Each row has `model` (the upstream model that answered), `public_model`, `provider`, `tier`, `attempts`, `key_name`, `key_prefix`, and `account_contact`. Filtered by `q`, `model`, `kind`, `status`, `path`, `ip`, `method`, `key`, `account`, `hour`, `limit`, and `offset` |
+| `GET` | `/requests/groups?field=model` | Group requests by `model`, `provider`, `tier`, `ip`, `status`, `kind`, `path`, `key`, or `hour` |
 | `GET` | `/settings` | Redacted configuration |
 | `PATCH` | `/settings` | Validated partial configuration update |
+
+### Routing endpoint
+
+`GET /admin/api/routing` returns the state the router keeps in memory, joined with the last 24 hours of the request log. The Routing tab of the admin console renders it.
+
+```json
+{
+  "providers": [{"id": "gemini", "enabled": true, "in_flight": 1, "cooldown_until": null,
+    "limits": {"rpm": {"limit": 20, "remaining": 14, "reset_seconds": 31}},
+    "usage_24h": {"requests": 120, "failures": 2, "rate_limited": 5, "tokens": 90000,
+                  "upstream_cost_usd": "0.000000", "avg_latency_ms": 840, "free_requests": 118}}],
+  "routes": [{"provider": "gemini", "model": "gemini-3.5-flash-lite", "models": ["free"], "in_flight": 1,
+    "circuit": "closed", "failures": 0, "cooldown_until": null, "latency_ms": 790, "success_rate": 0.987,
+    "limits": {}, "usage_24h": {}}],
+  "free": {"in_flight": 3, "subjects": 41}
+}
+```
+
+- `circuit` is `closed`, `open`, or `half_open`. `cooldown_until` is Unix seconds or `null`.
+- `limits` lists each configured window with its `limit`, `remaining`, and `reset_seconds`, and a `concurrent` entry with its `limit`.
+- `latency_ms` and `success_rate` are moving averages. `usage_24h.avg_latency_ms` is the mean over the last 24 hours of the log.
+- `free.subjects` counts clients with a live free-tier window.
+- The state is per process and starts fresh after a restart. Daily budgets are re-seeded from the log at boot (see [docs/routing.md](docs/routing.md)).
 
 **Idempotent grants.** `POST /accounts/:id/credits` and `POST /accounts/:id/subscriptions` require an `Idempotency-Key` header: 1 to 255 visible ASCII characters, unique per intended grant (a UUID works). Send the same key when retrying after a timeout or network error.
 
@@ -840,7 +1046,7 @@ A new database starts with these plans (all editable in **Admin > Plans**):
 
 No top-ups are seeded. Create them in **Admin > Plans** (`kind = "topup"`) when you want to offer extra usage, for example as App Store consumables.
 
-Customers see quotas and trial credit as approximate request counts, not dollar amounts. For example, $20 per month is shown as "~20,000 requests per month" with the default `billing.request_estimate_usd` of `"0.001"`. Set this to the typical billed cost of one request with your models and markup. Counts are rounded to two significant digits and shown as one figure (`~50`), never as a range. Plan prices and the administrator console stay in USD.
+Customers see quotas as approximate request counts, not dollar amounts. For example, $20 per month is shown as "~20,000 requests per month" with the default `billing.request_estimate_usd` of `"0.001"`. Set this to the typical billed cost of one request with your models and markup. Counts are rounded to two significant digits and shown as one figure (`~50`), never as a range. Plan prices and the administrator console stay in USD.
 
 Quota is billed usage at the caller's markup, so a fully used quota still earns `markup_pct` over upstream cost.
 
@@ -849,7 +1055,7 @@ Where plans come from:
 - **Card and crypto.** A subscription bought by card or crypto is prepaid for its whole term and does not renew automatically. The customer buys again when it ends.
 - **App Store and Google Play.** Subscriptions bought in the native apps renew through the store. Each renewal starts a new paid period with a fresh monthly quota.
 - **Administrators.** Administrators can grant plans, add credit, or issue single-use credit or plan codes. Credit from a code never expires.
-- **Trial credit.** Signup trial credit is promotional and expires after `signup.free_credit_expiry_days`.
+- **Free models.** Free models are never billed and do not touch quota or balance (see [Free tier](#free-tier)). New accounts start with no credit.
 
 Monthly quota lots are granted when an account is used or viewed, and every minute for all accounts. Months that pass without activity are skipped, since their quota would already have expired.
 
@@ -988,7 +1194,7 @@ Apple and Google decide refunds, not the customer, and the usage behind a refund
 
 - **Daily cap for new accounts.** For the first `rate_limits.new_account_hours` (48) hours, an account may spend at most `rate_limits.new_account_daily_spend_pct` (20%) of its paid allowance per rolling 24 hours. The allowance is the monthly quota of its active subscriptions plus its purchased top-ups. Requests over the cap get `429 new_account_daily_limit`.
 
-  20% per day means at most about 40% of a month's allowance can be used before the window closes. That is still far more than a typical day (a uniform month uses about 3.3% per day), so honest new customers rarely hit it. It also keeps a buy-burn-refund evening well below a full allowance. Accounts with only trial credit are already bounded by that credit.
+  20% per day means at most about 40% of a month's allowance can be used before the window closes. That is still far more than a typical day (a uniform month uses about 3.3% per day), so honest new customers rarely hit it. It also keeps a buy-burn-refund evening well below a full allowance. Free models are never billed, so they are outside this cap.
 - **Refund or voided purchase.** The following happens at once:
   - every credit lot is zeroed
   - subscriptions end
@@ -1001,7 +1207,7 @@ Apple and Google decide refunds, not the customer, and the usage behind a refund
   - `customerConsented: true`
   - `consumptionPercentage`, the share of the purchase used in thousandths of a percent (omitted for auto-renewable subscriptions, as Apple requires)
   - `deliveryStatus: "DELIVERED"`
-  - `sampleContentProvided`, true when signup grants trial credit
+  - `sampleContentProvided`, true when the operator offers a free tier (`free.enabled` and at least one enabled free model)
   - `refundPreference`: `GRANT_FULL` when nothing was used, `DECLINE` from `billing.refund_decline_pct` (50%) used, and `GRANT_PRORATED` in between.
 
   Apple accepts consumption data only with the customer's consent. The server answers only for accounts with `consumption_consent` set.
@@ -1023,7 +1229,9 @@ Known limitations:
 - **Health:** `GET /healthz` checks liveness. `GET /readyz` runs `SELECT 1`. `reseller healthcheck` probes `/readyz` for containers.
 - **Backups:** `reseller backup ./backup.db` takes an online snapshot that includes committed WAL data. To restore, stop the server and replace the database file. Backups contain upstream and payment secrets, so store them as credentials.
 - **Retention:** request logs are pruned every minute to `log_retention_days` (30) and `max_log_entries` (5000). Usage aggregates are kept for up to 367 days. Spent proof-of-work records are purged after their challenges expire.
-- **Single instance:** do not share one database between running server instances. Rate-limiter state is in memory and per process.
+- **Single instance:** do not share one database between running server instances. Rate-limiter, free-tier, and router state (circuits, cooldowns, in-flight counts) is in memory and per process. After a restart, daily provider and route budgets are re-seeded from the last 24 hours of the request log, while circuits and per-client free allowances start fresh.
+- **Routing health:** watch the Routing tab (or `GET /admin/api/routing`) for open circuits, cooling providers, and routes whose remaining budget is near zero. A route whose `rpd` keeps reaching zero needs a second provider key or a lower per-client `free.rpd`. See [docs/routing.md](docs/routing.md) for capacity planning.
+- **Behind a proxy:** set `trust_proxy` only when the app is reachable exclusively through your proxy, or every anonymous caller shares one free-tier allowance (or can forge many).
 - **Schema:** the schema is created automatically on first start.
 - **Shutdown:** SIGTERM or Ctrl-C drains connections and billing tasks. Allow up to the upstream timeout.
 - **Crashes:** an abrupt process or machine failure can lose usage that an upstream has not yet reported. Interrupted requests remain identifiable in the database.
@@ -1043,7 +1251,8 @@ cargo test --locked
 | `main.rs` | CLI: `serve`, `init`, `doctor`, `token`, `reset-admin`, `backup`, `healthcheck`, `mcp`, and `config export` or `import` |
 | `web.rs` | Router, security headers, CORS, static assets, rate-limit gating, and top-level dispatch |
 | `theme.rs` | Branded page template, generated theme CSS, and theme-directory files |
-| `proxy/` | Upstream transport: JSON policies and fallbacks (`mod.rs`), streamed uploads (`multipart.rs`), usage inspection (`inspect.rs`), and realtime relay (`websocket.rs`) |
+| `proxy/` | Upstream transport: model resolution (`models.rs`), JSON requests with failover (`mod.rs`), streamed uploads (`multipart.rs`), usage inspection (`inspect.rs`), reasoning effort (`reasoning.rs`), and realtime relay (`websocket.rs`) |
+| `router/` | Route selection and health (`mod.rs`), free-tier admission (`free.rs`), and upstream rate-limit hint parsing (`hints.rs`) |
 | `meter.rs` | Admission with per-request holds (status, balance, RPM, usage windows, new-account cap), pricing (`Usage::cost`), and exactly-once settlement |
 | `api/` | Customer workspace (`customer.rs`) and administrator console (`admin.rs`) JSON APIs |
 | `mcp/` | `POST /mcp` server (`mod.rs`, `tools.rs`, `generate.rs`) and the stdio bridge (`bridge.rs`) |
@@ -1052,7 +1261,7 @@ cargo test --locked
 | `billing.rs`, `money.rs` | Credit ledger, subscriptions with monthly quotas, top-ups, idempotent grants, refund blocks, redeem codes, and micro-USD arithmetic |
 | `payments/` | Checkout and store orders (`mod.rs`), Stripe Checkout (`stripe.rs`), Payroof quotes, rates, and webhooks (`payroof.rs`), and App Store and Google Play purchases and notifications (`store/`) |
 | `stats.rs` | Overview, usage series, and log retention |
-| `config/` | Settings (`mod.rs`), `branding.rs`, `billing.rs`, `payments.rs`, `stores.rs`, `signup.rs`, `keys.rs`, `rate_limits.rs`, and `mcp.rs` |
+| `config/` | Settings (`mod.rs`), `providers.rs`, `models.rs`, `routing.rs`, `free.rs`, `branding.rs`, `billing.rs`, `payments.rs`, `stores.rs`, `signup.rs`, `keys.rs`, `rate_limits.rs`, `reasoning.rs`, and `mcp.rs` |
 | `db.rs`, `error.rs` | SQLite access and the API error type |
 
 The embedded UI (`assets/`) is plain HTML, CSS, and JavaScript, served under a strict Content-Security-Policy. There is no frontend build step. Integration tests in `tests/` drive the real router against mock upstreams.

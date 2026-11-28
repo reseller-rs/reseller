@@ -2,7 +2,7 @@
 
 reseller speaks the [Model Context Protocol](https://modelcontextprotocol.io). An agent can generate text, speech, transcripts, and images, check its balance, and top up. A human does not need to write any HTTP client code.
 
-Every generation is billed to the account like a normal `/v1` request. Both connection methods use the same admission, limits, metering, model policy, and prices as the HTTP API.
+Every generation is handled like a normal `/v1` request: free models stay unbilled, and paid models are billed to the account. Both connection methods use the same admission, limits, metering, model routing, and prices as the HTTP API.
 
 ## Contents
 
@@ -244,7 +244,7 @@ The bridge adds these local tools. The remote server answers signed-in callers o
 
 | Tool | Inputs | Result and effects |
 |---|---|---|
-| `signup` | `name?` (up to 80 characters), `contact?` (up to 200 characters) | Fetches the challenge, solves it locally, creates the account with free trial credit, and saves the credentials. Returns the server, account ID, key prefix, credential file path, and limits. Returns **no secrets**. Fails with `already_signed_in` if the server already has stored credentials. Call `logout` first. |
+| `signup` | `name?` (up to 80 characters), `contact?` (up to 200 characters) | Fetches the challenge, solves it locally, creates the account (with no credit, free models need none), and saves the credentials. Returns the server, account ID, key prefix, credential file path, and limits. Returns **no secrets**. Fails with `already_signed_in` if the server already has stored credentials. Call `logout` first. |
 | `login` | `api_key?` (`sk-res-` plus 64 hex), `dashboard_token?` (`dash_` plus 64 hex). At least one is required. | Checks the credentials with the server (`GET /v1/account`). Both must belong to the same account. Then stores them. Prefer `--token` or `RESELLER_TOKEN`, so secrets never pass through the conversation. |
 | `logout` | None | Deletes the stored credentials for this server. The account and its keys are not affected. |
 | `whoami` | None | Server, credential type and source, key prefix, account ID, and balance |
@@ -295,7 +295,7 @@ Signing up through MCP tools is gone: with OAuth, signup happens on the browser 
 
 1. The agent calls `whoami`, or any tool. Before signup, the response shows `signed_in: false` and the error code `not_signed_in`.
 2. The agent calls `signup`, optionally with `name` and `contact`. The bridge fetches `GET /v1/signup/challenge`, finds the proof-of-work number locally, posts to `POST /v1/signup`, and writes the credential file. The result shows only the account ID and key prefix.
-3. The agent calls `whoami` to see the trial balance, then uses `generate_text` and the other tools.
+3. The agent calls `whoami` to see the empty balance, then uses `generate_text` with a free model. Paid models need a plan or a top-up.
 4. When credit runs out (`insufficient_quota`), the agent calls `list_plans` and `start_checkout`. Alternatively, the user redeems a code with `redeem_code`.
 5. To use an existing account, either set `RESELLER_TOKEN` before starting the bridge, or call `login`. Supply the credentials outside the transcript where possible.
 
@@ -303,7 +303,7 @@ Signing up through MCP tools is gone: with OAuth, signup happens on the browser 
 
 1. Add `https://HOST/mcp` to the client. It opens the consent page in the browser.
 2. On the page, sign in with an existing key, or create an account (the page solves the proof of work). Self-service signup can be disabled (`403 signup_disabled`). In that case, ask the operator for a key.
-3. Allow the connection. The client now works with the account, and the trial credit applies.
+3. Allow the connection. The client now works with the account. Free models work at once, and paid models need a plan or a top-up.
 
 ## Error reference
 
@@ -354,7 +354,7 @@ A tool error has `isError: true`. The text reads `<message> (error code: <code>)
 | `insufficient_quota` (402) | Out of credit, or the request may cost more than the balance (lower `max_tokens`). Use `list_plans` and `start_checkout`, or `redeem_code`. |
 | `model_not_found` (404) | The model is unknown or the key's allowlist excludes it. Omit `model`, or use `list_models`. |
 | `rate_limit_exceeded`, `request_limit_exceeded`, `token_limit_exceeded`, `spend_limit_exceeded`, `concurrency_limit_exceeded` | Wait `retry_after_seconds` when it is given. |
-| `signup_cooldown`, `ip_signup_limit`, and other key or signup guards | Wait, then retry. See the README rate-limit table. |
+| `signup_cooldown` and other key or signup guards | Wait, then retry. See the README rate-limit table. |
 | `pow_required`, `pow_invalid`, `pow_replayed` | The signup proof of work is missing, wrong or expired, or already used (bridge `signup`). Fetch a new challenge. |
 | `upstream_error` | The provider returned a non-2xx response. The message includes its status, detail, and request ID. |
 | `invalid_upstream_response` | The provider's reply was not usable (invalid JSON, or no audio or images) |

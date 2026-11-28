@@ -101,6 +101,8 @@ pub async fn handle(app: &App, req: Request<Body>, ip: &str) -> Result<Value> {
         (["requests"], "GET") => requests(app, None, &q, false).await,
         (["requests", "groups"], "GET") => requests(app, None, &q, true).await,
 
+        (["routing"], "GET") => routing(app).await,
+
         (["settings"], "GET") => Ok(json!({"settings": app.config().await.redacted()})),
         (["settings"], "PATCH") => update_settings(app, object(req).await?).await,
 
@@ -532,18 +534,13 @@ async fn list_payments(app: &App, q: &Query) -> Result<Value> {
 }
 
 /// Map-valued settings that a patch replaces wholesale. This lets a patch
-/// remove entries.
-const REPLACED_MAPS: [&str; 10] = [
+/// remove entries. Lists (`providers`, `models`) are always replaced wholesale.
+const REPLACED_MAPS: [&str; 5] = [
     "/prices",
-    "/signup/ip_overrides",
     "/keys/default_limits",
     "/branding/css_vars",
     "/payroof/rate_ids",
     "/payroof/native_rates_usd",
-    "/llm/headers",
-    "/tts/headers",
-    "/stt/headers",
-    "/image/headers",
 ];
 
 /// Recursively merges a settings patch. Blank secrets keep the current value.
@@ -575,14 +572,90 @@ async fn update_settings(app: &App, patch: Value) -> Result<Value> {
     let mut config = app.config_mut().await;
     let mut merged = serde_json::to_value(&*config)?;
     merge(&mut merged, patch, "");
-    let updated: Config = serde_json::from_value(merged)?;
+    let mut updated: Config = serde_json::from_value(merged)?;
+    // A blank provider key keeps the stored key of the provider with that id.
+    updated.keep_provider_keys(&config);
     updated
         .validate()
         .map_err(|e| Error::bad(format!("{e:#}")))?;
     db::save_settings(&app.db, &updated).await?;
+    app.router.retain(&updated);
     *config = updated;
     Ok(json!({
         "settings": config.redacted(),
         "notice": "Saved. CORS changes take effect after restart.",
     }))
+}
+
+/// `GET /admin/api/routing`: the live state of every provider and route (in
+/// flight, circuit, cooldown, remaining budgets, latency and success rate),
+/// the last 24 hours of `route_usage` per route and provider, and the free
+/// tier's totals.
+///
+/// Shape: `{"providers": [{id, enabled, in_flight, cooldown_until, limits,
+/// usage_24h}], "routes": [{provider, model, models, in_flight, circuit,
+/// failures, cooldown_until, latency_ms, success_rate, limits, usage_24h}],
+/// "free": {in_flight, subjects}}`.
+async fn routing(app: &App) -> Result<Value> {
+    let config = app.config().await;
+    let mut out = app.router.snapshot(&config);
+    let rows = sqlx::query(
+        "SELECT provider,model,\
+           SUM(requests) AS requests,SUM(failures) AS failures,SUM(rate_limited) AS rate_limited,\
+           SUM(tokens) AS tokens,SUM(upstream_micro) AS upstream_micro,\
+           SUM(latency_ms_sum) AS latency_ms_sum,\
+           SUM(CASE WHEN tier='free' THEN requests ELSE 0 END) AS free_requests \
+         FROM route_usage WHERE hour>=? GROUP BY provider,model",
+    )
+    .bind((now() - DAY) / 3600 * 3600)
+    .fetch_all(&app.db)
+    .await?;
+    // (requests, failures, rate_limited, tokens, upstream_micro, latency_ms, free_requests)
+    type Totals = [i64; 7];
+    let mut per_route: std::collections::HashMap<(String, String), Totals> = Default::default();
+    let mut per_provider: std::collections::HashMap<String, Totals> = Default::default();
+    for r in &rows {
+        let totals: Totals = [
+            r.get("requests"),
+            r.get("failures"),
+            r.get("rate_limited"),
+            r.get("tokens"),
+            r.get("upstream_micro"),
+            r.get("latency_ms_sum"),
+            r.get("free_requests"),
+        ];
+        let provider: String = r.get("provider");
+        for (slot, value) in per_provider
+            .entry(provider.clone())
+            .or_default()
+            .iter_mut()
+            .zip(totals)
+        {
+            *slot += value;
+        }
+        per_route.insert((provider, r.get("model")), totals);
+    }
+    let usage = |t: Totals| {
+        json!({
+            "requests": t[0],
+            "failures": t[1],
+            "rate_limited": t[2],
+            "tokens": t[3],
+            "upstream_cost_usd": money::display(t[4]),
+            "avg_latency_ms": if t[0] > 0 { t[5] / t[0] } else { 0 },
+            "free_requests": t[6],
+        })
+    };
+    for provider in out["providers"].as_array_mut().into_iter().flatten() {
+        let id = provider["id"].as_str().unwrap_or_default().to_owned();
+        provider["usage_24h"] = usage(per_provider.get(&id).copied().unwrap_or_default());
+    }
+    for route in out["routes"].as_array_mut().into_iter().flatten() {
+        let key = (
+            route["provider"].as_str().unwrap_or_default().to_owned(),
+            route["model"].as_str().unwrap_or_default().to_owned(),
+        );
+        route["usage_24h"] = usage(per_route.get(&key).copied().unwrap_or_default());
+    }
+    Ok(out)
 }

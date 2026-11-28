@@ -110,20 +110,71 @@ pub fn is_admin_token(config: &Config, presented: &str) -> bool {
 const ADMIN_NOT_CUSTOMER: &str = "The administrator token cannot manage a customer account. \
      Use /admin/api, or a customer API key";
 
-/// Resolves the request credential into an [`Identity`].
+/// Who is calling the proxy. One lives per request, so the size of the key
+/// variant does not matter.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum Caller {
+    /// No credential, or a token that is not one of ours (documented: any
+    /// placeholder such as `free` works for SDKs that insist on a key). May
+    /// use free models within the free-tier limits.
+    Anonymous,
+    /// The administrator token: everything allowed, nothing billed, no free
+    /// tier limits.
+    Operator,
+    /// A valid API key.
+    Key(Identity),
+}
+
+impl Caller {
+    /// The key identity, if the caller presented a key.
+    pub fn identity(&self) -> Option<&Identity> {
+        match self {
+            Self::Key(identity) => Some(identity),
+            _ => None,
+        }
+    }
+}
+
+/// Prefix of API keys (the proxy credential).
+pub const KEY_PREFIX: &str = "sk-res-";
+/// Prefix of dashboard tokens.
+pub const DASHBOARD_PREFIX: &str = "dash_";
+
+/// Resolves the credential of a proxy request.
 ///
-/// Returns `Ok(None)` for anonymous access. The caller decides whether that
-/// is acceptable. Anonymous access happens in these cases:
+/// - No credential, or a token that does not start with `sk-res-` or
+///   `dash_` and is not the administrator token: [`Caller::Anonymous`].
+/// - The administrator token: [`Caller::Operator`].
+/// - An unknown `sk-res-` or `dash_` token: `invalid_api_key`. A dashboard
+///   token on the proxy is refused with `dashboard_token_not_allowed`.
 ///
-/// - A proxy route with `require_key` disabled and no credential sent.
-/// - A proxy route with `require_key` disabled, `accept_any_token` set, and an
-///   unknown credential.
-/// - A proxy route called with the administrator token (an operator: never
-///   billed, no limits, even when `require_key` is on).
-/// - A management route with no credential sent.
-///
-/// The administrator token on a management route is refused with
-/// `admin_token_not_customer` (not counted as an authentication failure).
+/// A [`Preauth`] extension (an OAuth access token on `/mcp`) wins.
+pub async fn caller(app: &App, headers: &HeaderMap, extensions: &Extensions) -> Result<Caller> {
+    match extensions.get::<Preauth>() {
+        Some(Preauth(identity)) if identity.dashboard => return Err(dashboard_not_allowed()),
+        Some(Preauth(identity)) => return Ok(Caller::Key(identity.clone())),
+        None => {}
+    }
+    let Some(token) = token(headers) else {
+        return Ok(Caller::Anonymous);
+    };
+    let config = app.config().await;
+    if is_admin_token(&config, token) {
+        return Ok(Caller::Operator);
+    }
+    if !token.starts_with(KEY_PREFIX) && !token.starts_with(DASHBOARD_PREFIX) {
+        return Ok(Caller::Anonymous);
+    }
+    credential(app, &config, token, Scope::Proxy)
+        .await
+        .map(Caller::Key)
+}
+
+/// Resolves the request credential of a management route into an
+/// [`Identity`], or `None` when no credential was sent. The administrator
+/// token is refused with `admin_token_not_customer` (not counted as an
+/// authentication failure).
 pub async fn authenticate(
     app: &App,
     headers: &HeaderMap,
@@ -131,45 +182,31 @@ pub async fn authenticate(
 ) -> Result<Option<Identity>> {
     let config = app.config().await;
     match token(headers) {
-        Some(token) => credential(app, &config, token, scope).await,
-        None if scope == Scope::Proxy && config.require_key => Err(missing_credential()),
+        Some(token) => credential(app, &config, token, scope).await.map(Some),
         None => Ok(None),
     }
 }
 
-/// [`authenticate`], but a [`Preauth`] extension on the request wins.
-pub async fn authenticate_request(
+/// [`authenticate`] with [`Scope::Manage`], but a [`Preauth`] extension on
+/// the request wins.
+async fn authenticate_request(
     app: &App,
     headers: &HeaderMap,
     extensions: &Extensions,
-    scope: Scope,
 ) -> Result<Option<Identity>> {
     match extensions.get::<Preauth>() {
-        Some(Preauth(identity)) if scope == Scope::Proxy && identity.dashboard => {
-            Err(dashboard_not_allowed())
-        }
         Some(Preauth(identity)) => Ok(Some(identity.clone())),
-        None => authenticate(app, headers, scope).await,
+        None => authenticate(app, headers, Scope::Manage).await,
     }
 }
 
 /// Resolves one presented credential string (API key or dashboard token).
-pub async fn credential(
-    app: &App,
-    config: &Config,
-    token: &str,
-    scope: Scope,
-) -> Result<Option<Identity>> {
-    let proxy = scope == Scope::Proxy;
+pub async fn credential(app: &App, config: &Config, token: &str, scope: Scope) -> Result<Identity> {
     if is_admin_token(config, token) {
-        return if proxy {
-            Ok(None)
-        } else {
-            Err(Error::forbidden(
-                "admin_token_not_customer",
-                ADMIN_NOT_CUSTOMER,
-            ))
-        };
+        return Err(Error::forbidden(
+            "admin_token_not_customer",
+            ADMIN_NOT_CUSTOMER,
+        ));
     }
     let digest = hash(&config.key_pepper, token);
     let row = sqlx::query(
@@ -180,16 +217,10 @@ pub async fn credential(
     .bind(&digest)
     .bind(&digest)
     .fetch_optional(&app.db)
-    .await?;
-    let Some(row) = row else {
-        return if proxy && !config.require_key && config.accept_any_token {
-            Ok(None)
-        } else {
-            Err(Error::unauthorized("invalid_api_key", "Invalid API key"))
-        };
-    };
+    .await?
+    .ok_or_else(|| Error::unauthorized("invalid_api_key", "Invalid API key"))?;
     let dashboard = row.get::<String, _>("dash_hash") == digest;
-    identity_of(config, &row, dashboard, scope).map(Some)
+    identity_of(config, &row, dashboard, scope)
 }
 
 /// The identity of an active key by id, with the checks of a proxy call
@@ -270,12 +301,13 @@ pub async fn required_request(
     headers: &HeaderMap,
     extensions: &Extensions,
 ) -> Result<Identity> {
-    authenticate_request(app, headers, extensions, Scope::Manage)
+    authenticate_request(app, headers, extensions)
         .await?
         .ok_or_else(missing_credential)
 }
 
-fn missing_credential() -> Error {
+/// 401 `missing_api_key`.
+pub fn missing_credential() -> Error {
     Error::unauthorized("missing_api_key", "Missing bearer authentication in header")
 }
 

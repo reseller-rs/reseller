@@ -10,10 +10,12 @@
 #
 #  WHAT TO EDIT
 #  ------------
-#  Set [llm].api_key (and base_url and model if you do not use OpenAI).
+#  Export the API keys of the providers you use (see PROVIDERS, the file reads
+#  them from the environment) or write them in place. Providers without a key
+#  stay disabled.
 #  Everything else has a working default and is commented out. Remove the
 #  leading "#" to activate a setting. Uncommenting a table header such as
-#  [tts] activates the whole block, so uncomment its keys too.
+#  [free] activates the whole block, so uncomment its keys too.
 #
 #  BOOTSTRAP ENVIRONMENT VARIABLES (first start only)
 #  --------------------------------------------------
@@ -24,7 +26,8 @@
 #  TTS_BASE_URL TTS_API_KEY TTS_MODEL TTS_MODEL_FALLBACKS TTS_VOICE
 #  STT_BASE_URL STT_API_KEY STT_MODEL STT_MODEL_FALLBACKS
 #  IMG_BASE_URL IMG_API_KEY IMG_MODEL IMG_MODEL_FALLBACKS
-#  ADMIN_TOKEN KEY_PEPPER MARKUP_PCT FREE_CREDIT_USD PUBLIC_URL BRAND_NAME
+#  (each creates a provider and one paid model with the fallbacks as routes)
+#  ADMIN_TOKEN KEY_PEPPER MARKUP_PCT PUBLIC_URL BRAND_NAME
 #  STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET
 #  PAYROOF_API_URL PAYROOF_PROJECT PAYROOF_TOKEN PAYROOF_WEBHOOK_SECRET
 #
@@ -68,22 +71,6 @@ public_url = "http://localhost:56787"
 # unredeemed code.
 # key_pepper = ""
 
-# --- request rewriting policies ----------------------------------------------
-
-# How the model field is handled for LLM requests, and the voice field for TTS.
-# The multipart model field on uploads (for example STT) follows the same
-# policy, while the audio payload streams through unchanged.
-#   "default"     fill the value from the upstream config only when the
-#                 client omits it
-#   "force"       always overwrite the value the client sent
-#   "passthrough" never modify the client's value
-# Default: "default".
-# model_policy = "default"
-
-# Same options as model_policy, applied to the TTS voice field.
-# Default: "default".
-# voice_policy = "default"
-
 # --- billing -----------------------------------------------------------------
 
 # Markup over upstream cost, as a percentage decimal string. The resolution
@@ -91,19 +78,11 @@ public_url = "http://localhost:56787"
 # cost. Default: "30".
 # markup_pct = "30"
 
-# --- access control ----------------------------------------------------------
-
-# Require a valid API key on proxy routes. When false, requests without
-# credentials are served anonymously and are not billed. Default: true.
-# require_key = true
-
-# Only meaningful with require_key = false. Treat any non-empty token as an
-# anonymous request instead of rejecting unknown credentials. Default: false.
-# accept_any_token = false
-
 # Trust CF-Connecting-IP, or else the last X-Forwarded-For entry, for client
-# IPs, key allowances, and request logs. Enable this only when the app is
-# reachable exclusively through a proxy that sets these headers.
+# IPs, key allowances, free-tier limits, and request logs. Enable this only
+# when the app is reachable exclusively through a proxy that sets these
+# headers. Behind a proxy without it, every anonymous caller shares the
+# proxy's address and one free-tier allowance.
 # Default: false.
 # trust_proxy = false
 
@@ -122,7 +101,7 @@ public_url = "http://localhost:56787"
 # (536870912). Maximum: 2 GiB.
 # max_stream_body_bytes = 536870912
 
-# Upstream request timeout in seconds. Used when an upstream sets no
+# Upstream request timeout in seconds. Used when a provider sets no
 # timeout_seconds of its own. Must be greater than 0. Default: 300.
 # upstream_timeout_seconds = 300
 
@@ -143,25 +122,6 @@ public_url = "http://localhost:56787"
 
 # Offer anonymous account creation. Default: true.
 # enabled = true
-
-# Trial credit in USD, as a decimal string. "0" grants no credit.
-# Default: "0.10".
-# free_credit_usd = "0.10"
-
-# Halve the trial credit for each further signup from the same IP in the same
-# calendar month: with ip_limit_per_month = 4 and free_credit_usd = "0.1" the
-# signups get 0.1, 0.05, 0.025, and 0.0125 USD. Default: true.
-# free_credit_halving = true
-
-# Days the trial credit stays spendable. 0 means it never expires. Maximum:
-# 3650. Default: 30.
-# free_credit_expiry_days = 30
-
-# New accounts (signups) per source IP per calendar month, for example a
-# household sharing one connection. Keys created on an existing account never
-# count, and neither do accounts that pay or that the operator trusts.
-# Default: 4.
-# ip_limit_per_month = 4
 
 # Minimum seconds between two signups from one IP. Default: 30.
 # cooldown_seconds = 30
@@ -192,11 +152,6 @@ public_url = "http://localhost:56787"
 # Minutes after the last failure at which an IP's difficulty resets. 1 to
 # 1440. Default: 30.
 # adaptive_pow_reset_minutes = 30
-
-# Per-IP replacements for ip_limit_per_month. 0 means unlimited.
-# [signup.ip_overrides]
-# "203.0.113.7" = 10
-# "198.51.100.9" = 0
 
 # =============================================================================
 #  KEY POLICY
@@ -284,8 +239,7 @@ public_url = "http://localhost:56787"
 
 # [reasoning]
 
-# Highest level for free accounts (trial credit only, no subscription or paid
-# credit). Higher requested levels are lowered to it, and configured reasoning
+# Highest level for requests to free models. Higher requested levels are lowered to it, and configured reasoning
 # models get it when a request names none. "" disables the cap. Default: "low".
 # free_effort = "low"
 
@@ -324,7 +278,7 @@ public_url = "http://localhost:56787"
 # refund_decline_pct = 50
 
 # Typical billed cost of one API request, in USD. Used only to show customers
-# their trial credit and monthly quota as approximate request counts (for
+# their balance and monthly quota as approximate request counts (for
 # example "~20,000 requests per month"). Default: "0.001".
 # request_estimate_usd = "0.001"
 
@@ -349,99 +303,278 @@ public_url = "http://localhost:56787"
 # max_media_bytes = 16777216
 
 # =============================================================================
-#  MODEL CATALOG
-#  GET /v1/models lists these entries. Clients may use the id or an alias. The
-#  request is rewritten to upstream. Without any [[models]] the configured
-#  route models are listed. Upstream names, URLs, and raw prices are never shown.
+#  PROVIDERS
+#  One [[providers]] entry per upstream API key. base_url must be an http(s)
+#  URL without credentials, query, or fragment. A blank api_key in an import
+#  or settings patch keeps the stored key of the provider with the same id.
+#
+#  ENVIRONMENT REFERENCES
+#  String values may reference environment variables, so this file can stay
+#  free of credentials (for example with `docker run --env-file .env`):
+#    "${NAME}"           the value of NAME. An unset variable is an error.
+#    "${NAME:-fallback}" the value of NAME, or fallback when NAME is unset or
+#                        empty. "${NAME:-}" falls back to an empty string.
+#    "$${"               a literal "${".
+#  A provider whose api_key references variables that are unset or empty is
+#  loaded disabled, and models without an enabled provider are hidden. Set
+#  only the keys you have and the rest of the catalog adapts. References are
+#  expanded when the file is read (first start and `reseller config import`).
+#
+#  Check each provider's current terms and limits before use. Free tiers
+#  change without notice. Many forbid reselling or sublicensing access, some
+#  use free-tier prompts for training, and some allow prototyping only.
+#  Confirm that the terms allow you to serve third parties, and tell your
+#  users where their prompts go. See docs/routing.md for the comparison.
+#  Limits are your own safety margin, so the router stops sending traffic
+#  before the upstream refuses it. Without limits the router learns from the
+#  upstream's 429 answers and rate-limit headers, but each refusal costs a try.
 # =============================================================================
 
-# [[models]]
-# id = "assistant"                  # Name clients see. Required.
-# upstream = "vendor/large-model"   # Name sent upstream. Default: id.
-# aliases = ["gpt-4o"]              # Other names that resolve to this entry.
-# enabled = true                    # false hides and rejects it. Default: true.
-# name = "Assistant"                # Display name. Default: none.
-# description = "General purpose chat"
-# owned_by = "Example"              # Default: branding.name.
-# created = 1735689600              # Unix seconds. Default: 0.
-# context_length = 128000
-# input_modalities = ["text", "image"]  # Default: derived from the upstream
-# output_modalities = ["text"]          # route that serves it (chat, tts, stt, image).
-# show_pricing = false              # Show prices with your markup. Default: false.
+# OpenRouter. Models whose id ends in ":free" cost nothing. Limits depend on
+# the account: about 20 requests per minute on free models, and 50 per day
+# without purchased credits (1000 per day after a $10 top-up). A negative
+# balance gives 402 even for free models, which cools the whole provider down.
+[[providers]]
+id = "openrouter"                   # 1-32 characters of a-z, 0-9, _ and -.
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${OPENROUTER_API_KEY:-}"
 
-# =============================================================================
-#  UPSTREAMS
-#  Each upstream is configured independently. base_url must be an http(s) URL
-#  without credentials, query, or fragment. fallbacks are ordered model names
-#  tried after availability errors (400, 402, 404, 408, 429, or any 5xx) for
-#  JSON requests. At most 10 fallbacks are allowed, and each fallback must also
-#  pass the key's allowed_models list.
-# =============================================================================
-
-# Language models. Required for /v1/chat/completions and other JSON routes.
-[llm]
-base_url = "https://api.openai.com/v1"
-api_key = "sk-replace-with-your-upstream-key"
-
-# Model sent when the client omits one, and always with model_policy = "force".
-# An empty string requires clients to choose a model. Default: "".
-# model = "gpt-4o-mini"
-
-# Ordered fallback models, for example ["gpt-4o", "gpt-4o-mini"]. Default: [].
-# fallbacks = []
+# Disabled providers are never picked. Default: true.
+# enabled = true
 
 # Upstream timeout in seconds. 0 uses upstream_timeout_seconds. Maximum: 3600.
 # Default: 0.
 # timeout_seconds = 0
 
-# Extra request headers for this upstream. At most 20 entries. Authorization,
+# Extra request headers for this provider. At most 20 entries. Authorization,
 # Host, Content-Type, Content-Length, Transfer-Encoding, Connection, Upgrade,
-# Accept-Encoding, and TE cannot be set. Every upstream section accepts
-# timeout_seconds and headers. Default: none.
+# Accept-Encoding, and TE cannot be set. OpenRouter uses these two for app
+# attribution. Default: none.
 # headers = { "HTTP-Referer" = "https://api.example.com", "X-Title" = "My API" }
 
-# Text-to-speech. Required only for /v1/audio/speech.
-# [tts]
-# base_url = "https://api.openai.com/v1"
-# api_key = "sk-replace-with-your-upstream-key"
+# Account-wide budget of this key, shared by every route on it. 0 means
+# unlimited: rpm and rpd are requests per minute and per day, tpm and tpd are
+# tokens per minute and per day, concurrent is requests in flight. The rates
+# are GCRA allowances: the full rpd may be used at once, then it refills
+# continuously at rpd per 24 hours (up to about twice rpd in any 24 hours).
+# OpenRouter's free-model limits apply to ":free" models only, so they belong
+# on those routes (see [[models.routes]]), not here where they would also
+# throttle paid models.
+# limits = { rpm = 0, rpd = 0, tpm = 0, tpd = 0, concurrent = 0 }
 
-# Model sent when the client omits one. Default: "".
-# model = "gpt-4o-mini-tts"
+# A second key of the same service is simply another provider. The router
+# balances between both keys and keeps their budgets apart.
+[[providers]]
+id = "openrouter-2"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${OPENROUTER2_API_KEY:-}"
 
-# Voice sent when the client omits one, and always with voice_policy = "force".
-# Default: "".
-# voice = ""
+# Google Gemini API (AI Studio key), OpenAI-compatible endpoint. Permanent free
+# tier with per-project, per-model limits (requests per minute, tokens per
+# minute, requests per day, reset at midnight Pacific). Copy the numbers from
+# Google's rate-limit page into the route limits. Free-tier prompts are used
+# to improve Google's products.
+[[providers]]
+id = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key = "${GEMINI_API_KEY:-}"
 
-# Ordered fallback models. Default: [].
-# fallbacks = []
+# NVIDIA NIM (build.nvidia.com). Free for NVIDIA Developer Program members for
+# prototyping. Production use needs an NVIDIA AI Enterprise license. About 40
+# requests per minute.
+[[providers]]
+id = "nvidia"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key = "${NVIDIA_API_KEY:-}"
+limits = { rpm = 40 }
 
-# Speech-to-text. Required only for /v1/audio/transcriptions and
-# /v1/audio/translations. With model_policy = "force", or "default" plus a
-# configured model, the multipart model field is rewritten to this value.
-# [stt]
-# base_url = "https://api.openai.com/v1"
-# api_key = "sk-replace-with-your-upstream-key"
+# Groq. Free tier with per-model limits (requests and tokens per minute and per
+# day) shown on your account's limits page. Groq refuses some networks with
+# 403 "Access denied", which cools the provider down like an invalid key.
+[[providers]]
+id = "groq"
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY:-}"
 
-# Model used for transcription and translation. Default: "".
-# model = "whisper-1"
+# Cloudflare Workers AI. 10000 Neurons per day free. Neurons are not tokens, so
+# the router relies on the upstream's 429 answers. Use an API token with
+# Workers AI access and your account id.
+[[providers]]
+id = "cloudflare"
+base_url = "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID:-}/ai/v1"
+api_key = "${CLOUDFLARE_AUTH_TOKEN:-}"
 
-# Ordered fallback models. Default: [].
-# fallbacks = []
+# A local OpenAI-compatible server (Ollama, vLLM, llama.cpp). An empty api_key
+# sends no Authorization header.
+# [[providers]]
+# id = "local"
+# base_url = "http://127.0.0.1:11434/v1"
+# api_key = ""
 
-# Image generation and editing. Required only for /v1/images,
-# /v1/images/generations, /v1/images/edits, and /v1/images/variations. JSON
-# requests follow model_policy. Reference images travel inline, for example
-# "input_references": [{"type":"image_url","image_url":{"url":"data:..."}}].
-# Multipart edits stream like other uploads.
-# [image]
-# base_url = "https://openrouter.ai/api/v1"
-# api_key = "sk-or-replace-with-your-upstream-key"
+# =============================================================================
+#  MODEL CATALOG
+#  The only way to serve a model. GET /v1/models lists these entries, and
+#  clients use the id or an alias. Upstream names, provider ids, URLs, and raw
+#  prices are never shown. tier "free" models need no API key and are never
+#  billed, tier "paid" models need a key and a balance. At most one servable
+#  default (enabled, with an enabled provider) per capability and tier: it
+#  serves requests that name no model. A model the OPENAI_MODEL (TTS_, STT_,
+#  IMG_) bootstrap adds becomes the default only when this file has none.
+# =============================================================================
 
-# Model used for image generation. Default: "".
-# model = "meta/muse-image"
+# Free model: no API key needed, never billed, balanced across every free
+# upstream whose key is set. Route models default to the values below and can
+# be overridden from the environment.
+[[models]]
+id = "free"                         # Name clients see. Required.
+tier = "free"                       # "free" or "paid". Default: "paid".
+capability = "chat"                 # Required: chat, speech, transcription or image.
+default = true                      # Used when a request names no model.
+strategy = "balanced"               # "balanced" or "ordered". Default: "balanced".
+name = "Free"                       # Display name. Default: none.
+description = "Rate-limited, no API key needed"
 
-# Ordered fallback models. Default: [].
-# fallbacks = []
+# voice = ""                        # Speech only: voice sent when the client names none.
+# aliases = ["free-chat"]           # Other names that resolve to this entry.
+# enabled = true                    # false hides and rejects it. Default: true.
+# owned_by = "Example"              # Default: branding.name.
+# created = 1735689600              # Unix seconds. Default: 0.
+# context_length = 128000
+# input_modalities = ["text", "image"]  # Default: derived from the capability.
+# output_modalities = ["text"]
+
+# One or more routes (at most 20). Each names a provider and the upstream model
+# to send. weight (1-100) is the share of the balanced strategy, and limits is
+# the budget of this provider and model pair (see [[providers]]).
+[[models.routes]]
+provider = "openrouter"
+model = "${OPENROUTER_MODEL:-baidu/ernie-5.5-flash-preview:free}"
+# weight = 1
+limits = { rpm = 20 }
+# A last resort, tried in listed order only after every other route is
+# unavailable or has failed the request. It gets its own attempts beyond
+# routing.max_attempts. Default: false.
+# fallback = false
+
+[[models.routes]]
+provider = "openrouter-2"
+model = "${OPENROUTER2_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}"
+limits = { rpm = 20 }
+
+[[models.routes]]
+provider = "gemini"
+model = "${GEMINI_MODEL:-gemini-3.5-flash-lite}"
+weight = 2
+
+[[models.routes]]
+provider = "nvidia"
+model = "${NVIDIA_MODEL:-minimaxai/minimax-m3.1-flash}"
+
+[[models.routes]]
+provider = "groq"
+model = "${GROQ_MODEL:-qwen/qwen3.8-27b}"
+
+[[models.routes]]
+provider = "cloudflare"
+model = "${CLOUDFLARE_MODEL:-@cf/google/gemma-4-26b-a4b-it}"
+
+# Paid fallback for the free model: an inexpensive model (about $0.035 per
+# million input and $0.14 per million output tokens on OpenRouter) that answers
+# only when every free route is unavailable or has failed. Free requests stay
+# unbilled for the caller, so you pay for these. The daily token budget caps
+# that cost (1000000 tokens is at most about $0.14 per key and day). It is
+# listed on both keys, so one key's cooldown does not remove it.
+[[models.routes]]
+provider = "openrouter"
+model = "tencent/hy4-flash"
+fallback = true
+limits = { tpd = 1000000 }
+
+[[models.routes]]
+provider = "openrouter-2"
+model = "tencent/hy4-flash"
+fallback = true
+limits = { tpd = 1000000 }
+
+# Paid model. With strategy "ordered" the first route is preferred and the
+# others are fallbacks. Billing follows the provider's reported cost (or the
+# price table) plus your markup.
+[[models]]
+id = "gpt-6-luna"
+capability = "chat"
+default = true
+strategy = "ordered"
+name = "GPT-6 Luna"
+# show_pricing = false              # Show prices with your markup (paid only). Default: false.
+
+[[models.routes]]
+provider = "openrouter"
+model = "openai/gpt-6-luna"
+
+[[models.routes]]
+provider = "openrouter-2"
+model = "openai/gpt-6-luna"
+
+# =============================================================================
+#  ROUTING
+#  Failover between the routes of a model.
+# =============================================================================
+
+# [routing]
+
+# Routes tried per request, 1 to 10. Only JSON requests are retried.
+# Default: 3.
+# max_attempts = 3
+
+# Consecutive failures (5xx, timeouts, connection errors) that open a route's
+# circuit. Default: 3.
+# failure_threshold = 3
+
+# First circuit-open cooldown in seconds. It doubles on every reopen, with
+# +/-20% jitter. Also the cooldown after a 429 without a retry hint.
+# Default: 30.
+# cooldown_seconds = 30
+
+# Cap of every cooldown, also used for provider-wide auth and credit failures
+# (401, 402, 403). Default: 600.
+# max_cooldown_seconds = 600
+
+# =============================================================================
+#  FREE TIER
+#  Keyless access to models with tier = "free". Limits apply per client: an
+#  IPv4 address, an IPv6 prefix, or a paying account. 0 disables each limit.
+# =============================================================================
+
+# [free]
+
+# Serve free models without an API key. Default: true.
+# enabled = true
+
+# IPv6 clients are grouped by this prefix length, 32 to 128. Default: 64.
+# ipv6_prefix = 64
+
+# Requests per minute and per day, per client. Defaults: 10, 300. Both are
+# GCRA allowances: a client may use the full rpd at once, then it refills
+# continuously at rpd per 24 hours, so over any 24 hours it can use at most
+# about twice rpd. Retry-After gives the exact wait.
+# rpm = 10
+# rpd = 300
+
+# Tokens per day, per client, with the same GCRA behavior as rpd.
+# Default: 300000.
+# tpd = 300000
+
+# Requests in flight per client, and across all clients. Defaults: 2, 64.
+# max_concurrent = 2
+# max_concurrent_total = 64
+
+# Cap on max_tokens, max_completion_tokens and max_output_tokens, injected when
+# a request has none. Reasoning models spend output tokens on reasoning, so a
+# very small cap can yield empty answers. Default: 4096.
+# max_output_tokens = 4096
+
+# Largest JSON body of a free request, in bytes. Default: 1048576.
+# max_body_bytes = 1048576
 
 # =============================================================================
 #  PRICE TABLE

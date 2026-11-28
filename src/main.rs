@@ -211,7 +211,9 @@ async fn import(pool: &sqlx::SqlitePool, current: &Config, file: &Path) -> anyho
             *slot = kept.clone();
         }
     }
-    let imported: Config = serde_json::from_value(merged)?;
+    let mut imported: Config = serde_json::from_value(merged)?;
+    // A blank provider key keeps the stored key of the provider with that id.
+    imported.keep_provider_keys(current);
     imported
         .validate()
         .with_context(|| format!("{} is invalid", file.display()))?;
@@ -253,7 +255,7 @@ fn init(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("creating {}", path.display()))?;
     file.write_all(include_bytes!("../reseller.example.toml"))?;
     println!(
-        "Created {} with every option documented. Set [llm].api_key, then run reseller.",
+        "Created {} with every option documented. Add a [[providers]] entry and a [[models]] entry, then run reseller.",
         path.display()
     );
     Ok(())
@@ -294,23 +296,51 @@ fn doctor(cli: &Cli, config: &Config) {
         "Administrator authentication: {}",
         state(!config.admin_token.is_empty(), "missing")
     );
-    for (name, upstream) in config.upstreams() {
-        let model = if upstream.model.is_empty() {
-            "client-selected model".to_owned()
-        } else {
-            format!("model {}", upstream.model)
-        };
-        if upstream.api_key.is_empty() {
-            let hint = if name == "llm" {
-                "missing key, configure before proxying"
-            } else {
-                "disabled (no API key)"
-            };
-            println!("Upstream {name}: {hint}");
-        } else {
-            println!("Upstream {name}: {} ({model})", upstream.base_url);
-        }
+    if config.providers.is_empty() {
+        println!("Providers: none (add a [[providers]] entry before proxying)");
     }
+    for provider in &config.providers {
+        let key = if provider.api_key.is_empty() {
+            "no API key"
+        } else {
+            "key configured"
+        };
+        let state = if provider.enabled { "" } else { ", disabled" };
+        println!(
+            "Provider {}: {} ({key}{state})",
+            provider.id, provider.base_url
+        );
+    }
+    for model in &config.models {
+        let routes: Vec<String> = model
+            .routes
+            .iter()
+            .map(|r| format!("{}/{}", r.provider, r.model))
+            .collect();
+        println!(
+            "Model {} [{}, {}{}{}]: {}",
+            model.id,
+            model.tier.as_str(),
+            model.capability().as_str(),
+            if model.default { ", default" } else { "" },
+            if model.enabled { "" } else { ", disabled" },
+            routes.join(", ")
+        );
+    }
+    if config.models.is_empty() {
+        println!("Models: none (add a [[models]] entry; nothing is served without one)");
+    }
+    println!(
+        "Free tier: {}",
+        match (config.free.enabled, config.offers_free_tier()) {
+            (false, _) => "disabled (anonymous requests are refused)".to_owned(),
+            (true, false) => "enabled, but no model has tier = \"free\"".to_owned(),
+            (true, true) => format!(
+                "keyless access ({} requests per minute, {} per day per client)",
+                config.free.rpm, config.free.rpd
+            ),
+        }
+    );
     println!(
         "Signup: {}",
         match (config.signup.enabled, config.signup.pow_max_number) {
@@ -344,6 +374,12 @@ async fn serve(cli: &Cli, app: App) -> anyhow::Result<()> {
             "closed requests interrupted by the previous shutdown"
         );
     }
+    // A restart must not hand every daily upstream budget back.
+    let config = app.config().await;
+    if let Err(e) = app.router.warm_start(&app.db, &config).await {
+        tracing::warn!(error = %e, "could not restore route budgets from usage");
+    }
+    drop(config);
     let router = web::router(app.clone()).await;
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(cli.host, cli.port))
         .await
