@@ -2,6 +2,7 @@
 //! dispatch to the management APIs, payment webhooks, and the upstream proxy.
 use crate::{
     App, api,
+    config::ClientIp,
     error::{Error, Result},
     identity, mcp, oauth, payments, proxy, security, stats, theme,
 };
@@ -156,8 +157,8 @@ async fn oauth_public(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response {
-    let trust_proxy = app.config().await.trust_proxy;
-    let ip = client_ip(peer, req.headers(), trust_proxy).to_string();
+    let source = app.config().await.client_ip;
+    let ip = client_ip(peer, req.headers(), source).to_string();
     crate::oauth::serve_public(&app, req, &ip).await
 }
 
@@ -298,25 +299,26 @@ async fn ready(State(app): State<App>) -> Result<Json<serde_json::Value>> {
 /// Client address. Behind a trusted proxy, `CF-Connecting-IP` wins, then the
 /// rightmost `X-Forwarded-For` entry, the one the proxy itself appends.
 /// Entries further left are client-controlled.
-fn client_ip(peer: SocketAddr, headers: &HeaderMap, trust_proxy: bool) -> IpAddr {
-    if !trust_proxy {
-        return peer.ip();
-    }
+/// The client address from the one configured source, falling back to the
+/// TCP peer when that header is missing or malformed. Other forwarding
+/// headers are never read, so clients cannot choose their address.
+fn client_ip(peer: SocketAddr, headers: &HeaderMap, source: ClientIp) -> IpAddr {
     let parse = |v: &str| v.trim().parse::<IpAddr>().ok();
-    headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse)
-        .or_else(|| {
-            headers
-                .get_all("x-forwarded-for")
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .flat_map(|v| v.split(','))
-                .last()
-                .and_then(parse)
-        })
-        .unwrap_or_else(|| peer.ip())
+    match source {
+        ClientIp::Peer => None,
+        ClientIp::XForwardedFor => headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .last()
+            .and_then(parse),
+        ClientIp::CfConnectingIp => headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse),
+    }
+    .unwrap_or_else(|| peer.ip())
 }
 
 async fn dispatch(
@@ -332,7 +334,7 @@ async fn dispatch(
 async fn route(app: App, peer: SocketAddr, req: Request<Body>) -> Result<Response> {
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
-    let ip = client_ip(peer, req.headers(), app.config().await.trust_proxy).to_string();
+    let ip = client_ip(peer, req.headers(), app.config().await.client_ip).to_string();
     let is_api = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
 
     if method == Method::POST
@@ -542,23 +544,32 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_ignores_spoofable_forwarded_entries() {
+    fn client_ip_reads_only_the_configured_source() {
         let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-        let spoofed = headers(&[("x-forwarded-for", "1.1.1.1, 203.0.113.9")]);
-        assert_eq!(client_ip(peer, &spoofed, false), peer.ip());
-        assert_eq!(
-            client_ip(peer, &spoofed, true),
-            "203.0.113.9".parse::<IpAddr>().unwrap()
-        );
-        let cloudflare = headers(&[
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let spoofed = headers(&[
+            ("x-forwarded-for", "1.1.1.1, 203.0.113.9"),
             ("cf-connecting-ip", "198.51.100.4"),
-            ("x-forwarded-for", "1.1.1.1"),
         ]);
+        assert_eq!(client_ip(peer, &spoofed, ClientIp::Peer), peer.ip());
+        // Behind a proxy that appends the address: the last entry, never the
+        // client-sent CF-Connecting-IP or earlier entries.
         assert_eq!(
-            client_ip(peer, &cloudflare, true),
-            "198.51.100.4".parse::<IpAddr>().unwrap()
+            client_ip(peer, &spoofed, ClientIp::XForwardedFor),
+            ip("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(peer, &spoofed, ClientIp::CfConnectingIp),
+            ip("198.51.100.4")
         );
         let garbage = headers(&[("x-forwarded-for", "not-an-ip")]);
-        assert_eq!(client_ip(peer, &garbage, true), peer.ip());
+        assert_eq!(
+            client_ip(peer, &garbage, ClientIp::XForwardedFor),
+            peer.ip()
+        );
+        assert_eq!(
+            client_ip(peer, &garbage, ClientIp::CfConnectingIp),
+            peer.ip()
+        );
     }
 }

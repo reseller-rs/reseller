@@ -78,13 +78,17 @@ public_url = "http://localhost:56787"
 # cost. Default: "30".
 # markup_pct = "30"
 
-# Trust CF-Connecting-IP, or else the last X-Forwarded-For entry, for client
-# IPs, key allowances, free-tier limits, and request logs. Enable this only
-# when the app is reachable exclusively through a proxy that sets these
-# headers. Behind a proxy without it, every anonymous caller shares the
-# proxy's address and one free-tier allowance.
-# Default: false.
-# trust_proxy = false
+# Where the client address comes from, for free-tier limits, signup guards,
+# lockouts, and request logs. Trust only the header your own proxy sets, and
+# block direct access to the app: any other header is chosen by the client,
+# who could then claim a fresh address (and free allowance) per request.
+#   "peer"              the TCP peer address (clients connect directly)
+#   "x-forwarded-for"   the last X-Forwarded-For entry, appended by your proxy
+#                       (Caddy, nginx, Traefik, a load balancer)
+#   "cf-connecting-ip"  set by Cloudflare, only behind Cloudflare
+# Behind a proxy with "peer", every caller shares the proxy's address and one
+# free-tier allowance. Default: "peer".
+# client_ip = "peer"
 
 # CORS for browser clients. "" disables CORS, "*" allows any origin, and any
 # other value is used as the allowed origin (for example

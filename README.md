@@ -212,7 +212,7 @@ Defaults appear in parentheses.
 
 | Section | Purpose |
 |---|---|
-| Top level | `public_url` (`http://localhost:56787`), `admin_token`, `key_pepper` (both at least 24 characters, generated if unset), `markup_pct` (`30`), `trust_proxy` (`false`), `cors_origin` (empty), `max_json_body_bytes` (50 MiB), `max_stream_body_bytes` (512 MiB), `upstream_timeout_seconds` (300), `log_retention_days` (30), `max_log_entries` (5000) |
+| Top level | `public_url` (`http://localhost:56787`), `admin_token`, `key_pepper` (both at least 24 characters, generated if unset), `markup_pct` (`30`), `client_ip` (`"peer"`), `cors_origin` (empty), `max_json_body_bytes` (50 MiB), `max_stream_body_bytes` (512 MiB), `upstream_timeout_seconds` (300), `log_retention_days` (30), `max_log_entries` (5000) |
 | `[branding]` | White-label name, copy, logos, colours, and CSS (see [Branding and themes](#branding-and-themes)) |
 | `[[providers]]` | Upstream connections, one per API key: `id`, `base_url`, `api_key`, `enabled` (`true`), `timeout_seconds` (0 uses `upstream_timeout_seconds`, max 3600), `headers` (max 20, credential and framing headers are refused), and `limits` (see [Providers, models, and routing](#providers-models-and-routing)) |
 | `[[models]]` | Public model catalog and the routes that serve each model (see [Providers, models, and routing](#providers-models-and-routing)) |
@@ -465,7 +465,7 @@ A key of any other account is counted under its client address like an anonymous
 
 **Admission order.** A free request is checked before the database is touched: free requests in flight overall (`503 capacity_exhausted`), then in flight for the client (`429 concurrency_limit_exceeded`), then requests per minute (`429 rate_limit_exceeded`), requests per day, and tokens per day (`429 free_quota_exceeded`). The rate limits (`rpm`, `rpd`, `tpd`) are GCRA allowances, not strict rolling counts: a client may use the full `rpd` at once, then the allowance refills continuously at `rpd` per 24 hours, so over any 24 hours it can use at most about twice `rpd`, and `Retry-After` gives the exact wait. Nothing waits in a queue.
 
-**`trust_proxy` matters here.** The client address is the TCP peer unless `trust_proxy` is on (see [Behind a proxy](#behind-a-proxy)). Without it behind a reverse proxy, every anonymous caller shares the proxy's address and one allowance. With it on and the app reachable directly, callers can forge the address and get unlimited free allowance.
+**`client_ip` matters here.** The client address is the TCP peer unless `client_ip` names the header your proxy sets (see [Behind a proxy](#behind-a-proxy)). Behind a reverse proxy with `"peer"`, every anonymous caller shares the proxy's address and one allowance. With a header your proxy does not set (for example `"cf-connecting-ip"` without Cloudflare), clients choose their own address and evade the limits.
 
 ### Signup with proof of work
 
@@ -583,10 +583,10 @@ When the budget is exhausted, **every request from that IP that carries a creden
 
 Place a TLS reverse proxy in front of public deployments.
 
-- `trust_proxy` defaults to off. The TCP peer address is then the client IP.
-- Enable it **only** when direct access to the application is blocked and your edge overwrites incoming forwarding headers. It trusts `CF-Connecting-IP`, then the **last** `X-Forwarded-For` address. Earlier entries are controlled by the client.
-- If `trust_proxy` is enabled wrongly, clients can spoof their IP and evade every per-IP limit, including the free-tier limits.
-- If it is disabled behind a proxy, all users share one IP. The per-IP limits (free-tier allowance, signup cooldown, and lockout) then apply to everyone at once.
+- `client_ip` names the one source of the client address: `"peer"` (the TCP peer, the default), `"x-forwarded-for"` (the **last** `X-Forwarded-For` entry, which your proxy appended, for Caddy, nginx, Traefik, or a load balancer), or `"cf-connecting-ip"` (only behind Cloudflare). No other header is read.
+- Choose a header only when direct access to the application is blocked and your proxy sets that header. Earlier `X-Forwarded-For` entries, and a `CF-Connecting-IP` that no Cloudflare edge set, come from the client.
+- With the wrong source, clients can spoof their IP and evade every per-IP limit, including the free-tier limits. For example, `"cf-connecting-ip"` behind a proxy other than Cloudflare lets any client claim a new address per request.
+- With `"peer"` behind a proxy, all users share one IP. The per-IP limits (free-tier allowance, signup cooldown, and lockout) then apply to everyone at once.
 
 ### Database secrets
 
@@ -1231,7 +1231,7 @@ Known limitations:
 - **Retention:** request logs are pruned every minute to `log_retention_days` (30) and `max_log_entries` (5000). Usage aggregates are kept for up to 367 days. Spent proof-of-work records are purged after their challenges expire.
 - **Single instance:** do not share one database between running server instances. Rate-limiter, free-tier, and router state (circuits, cooldowns, in-flight counts) is in memory and per process. After a restart, daily provider and route budgets are re-seeded from the last 24 hours of the request log, while circuits and per-client free allowances start fresh.
 - **Routing health:** watch the Routing tab (or `GET /admin/api/routing`) for open circuits, cooling providers, and routes whose remaining budget is near zero. A route whose `rpd` keeps reaching zero needs a second provider key or a lower per-client `free.rpd`. See [docs/routing.md](docs/routing.md) for capacity planning.
-- **Behind a proxy:** set `trust_proxy` only when the app is reachable exclusively through your proxy, or every anonymous caller shares one free-tier allowance (or can forge many).
+- **Behind a proxy:** set `client_ip` to the header your proxy sets (`"x-forwarded-for"` for Caddy or nginx, `"cf-connecting-ip"` for Cloudflare) and block direct access to the app. Otherwise every anonymous caller shares one free-tier allowance, or clients can forge many.
 - **Schema:** the schema is created automatically on first start.
 - **Shutdown:** SIGTERM or Ctrl-C drains connections and billing tasks. Allow up to the upstream timeout.
 - **Crashes:** an abrupt process or machine failure can lose usage that an upstream has not yet reported. Interrupted requests remain identifiable in the database.

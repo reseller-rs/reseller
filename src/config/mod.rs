@@ -59,6 +59,24 @@ pub const SECRET_PATHS: [&str; 8] = [
     "/google/service_account_json",
 ];
 
+/// The source of the client address used for per-IP limits (free tier,
+/// signup, lockouts) and request logs. Only the header that the operator's
+/// own proxy sets may be trusted: any other header is controlled by clients.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientIp {
+    /// The TCP peer address. Use it when clients connect directly.
+    #[default]
+    Peer,
+    /// The last `X-Forwarded-For` entry, which the nearest proxy appended
+    /// (Caddy, nginx, Traefik, a load balancer). Earlier entries come from
+    /// clients and are ignored.
+    XForwardedFor,
+    /// `CF-Connecting-IP`, set by Cloudflare. Only behind Cloudflare, with
+    /// direct access to the origin blocked.
+    CfConnectingIp,
+}
+
 /// Upstream price in USD (decimal strings).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -130,7 +148,8 @@ pub struct Config {
     /// Price table keyed by upstream model name (case-insensitive) plus
     /// `default`.
     pub prices: BTreeMap<String, Price>,
-    pub trust_proxy: bool,
+    /// Where the client address comes from. See [`ClientIp`].
+    pub client_ip: ClientIp,
     pub cors_origin: String,
     pub max_json_body_bytes: usize,
     pub max_stream_body_bytes: usize,
@@ -164,7 +183,7 @@ impl Default for Config {
             routing: Routing::default(),
             free: Free::default(),
             prices: BTreeMap::from([("default".into(), Price::default())]),
-            trust_proxy: false,
+            client_ip: ClientIp::Peer,
             cors_origin: String::new(),
             max_json_body_bytes: 50 * 1024 * 1024,
             max_stream_body_bytes: 512 * 1024 * 1024,

@@ -50,7 +50,7 @@ With `free.enabled = false`, an anonymous request answers `401 missing_api_key`.
 - an IPv6 prefix of `free.ipv6_prefix` bits, `/64` by default (`ip:2001:db8:1:2::/64`),
 - the account, for a key whose account has a paid order, an active subscription, a spendable balance, or `can_create_keys` (`acct:<id>`).
 
-A key of any other account uses its client address. Opening more accounts therefore adds no free allowance, and a household or an office behind one address shares one allowance until someone pays. The client address is the TCP peer unless `trust_proxy` is on. Behind a reverse proxy without it, all anonymous callers share the proxy's address. With it on and the app reachable directly, callers can forge addresses.
+A key of any other account uses its client address. Opening more accounts therefore adds no free allowance, and a household or an office behind one address shares one allowance until someone pays. The client address is the TCP peer unless `client_ip` names the header your own proxy sets (`"x-forwarded-for"` behind Caddy or nginx, `"cf-connecting-ip"` behind Cloudflare). Never name a header your proxy does not set: clients would choose their own address and get a fresh allowance per request.
 
 ## Free-tier admission
 
@@ -302,7 +302,7 @@ Tune from data: the Routing tab shows remaining daily budgets per provider and r
 
 - [ ] Every free route has `limits` copied from the provider's current documentation.
 - [ ] You read each free provider's terms about serving third parties and about training on prompts.
-- [ ] `trust_proxy` matches your deployment (on only behind a proxy that overwrites the forwarding headers).
+- [ ] `client_ip` names the header your own proxy sets (`"x-forwarded-for"` behind Caddy or nginx, `"cf-connecting-ip"` behind Cloudflare), and direct access to the app is blocked.
 - [ ] Free and paid models use different providers, or you accept shared budgets.
 - [ ] `free.max_concurrent_total`, `free.rpd`, and `free.tpd` fit the pool's real capacity.
 - [ ] `free.max_output_tokens` and `reasoning.free_effort` bound the cost of one free request.

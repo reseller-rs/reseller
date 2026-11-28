@@ -1259,7 +1259,7 @@ fn starter_config_documents_every_option_and_validates() {
         "pubsub_audience",
         "refund_review",
         "max_media_bytes",
-        "trust_proxy",
+        "client_ip",
         "cors_origin",
         "max_json_body_bytes",
         "max_stream_body_bytes",
